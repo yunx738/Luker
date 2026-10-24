@@ -312,12 +312,71 @@ function pruneLegacyCharacterConnections() {
     }
 }
 
+// Per-tick lookup index for characters and dedicated persona bindings.
+// Persona list rendering was O(personas * characters^2): every persona scanned
+// all characters, and each scan did a linear characters.find(). The index is
+// built lazily and dropped on the next microtask (or when bindings change),
+// so it never serves stale data across async boundaries.
+let characterLookupIndex = null;
+let characterLookupIndexResetQueued = false;
+
+function invalidateCharacterLookupIndex() {
+    characterLookupIndex = null;
+}
+
+function getCharacterLookupIndex() {
+    if (characterLookupIndex && characterLookupIndex.source === characters && characterLookupIndex.length === characters.length) {
+        return characterLookupIndex;
+    }
+    const byAvatar = new Map();
+    for (let i = 0; i < characters.length; i++) {
+        const avatar = characters[i]?.avatar;
+        if (avatar && !byAvatar.has(avatar)) {
+            byAvatar.set(avatar, i);
+        }
+    }
+    const personaToCharacters = new Map();
+    for (const [avatar, i] of byAvatar) {
+        const character = characters[i];
+        const seen = new Set();
+        for (const entry of getDedicatedPersonaEntriesFromCharacter(character)) {
+            const personaAvatar = String(entry?.avatar ?? '').trim();
+            if (!personaAvatar || seen.has(personaAvatar)) {
+                continue;
+            }
+            seen.add(personaAvatar);
+            let list = personaToCharacters.get(personaAvatar);
+            if (!list) {
+                list = [];
+                personaToCharacters.set(personaAvatar, list);
+            }
+            list.push(avatar);
+        }
+    }
+    characterLookupIndex = { source: characters, length: characters.length, byAvatar, personaToCharacters };
+    if (!characterLookupIndexResetQueued) {
+        characterLookupIndexResetQueued = true;
+        queueMicrotask(() => {
+            characterLookupIndexResetQueued = false;
+            characterLookupIndex = null;
+        });
+    }
+    return characterLookupIndex;
+}
+
 function getCharacterByAvatar(avatarId) {
     if (!avatarId) {
         return null;
     }
 
-    return characters.find(character => character?.avatar === avatarId) ?? null;
+    const index = getCharacterLookupIndex().byAvatar.get(avatarId);
+    const character = index === undefined ? null : characters[index];
+    if (character?.avatar === avatarId) {
+        return character;
+    }
+    // Array was mutated in place within this tick; fall back to a fresh scan.
+    invalidateCharacterLookupIndex();
+    return characters.find(c => c?.avatar === avatarId) ?? null;
 }
 
 function isPlainObject(value) {
@@ -483,10 +542,8 @@ function getCharacterAvatarsConnectedToPersona(personaAvatarId) {
         return [];
     }
 
-    return characters
-        .filter(character => getCharacterDedicatedPersonaAvatarIds(character?.avatar).includes(personaAvatarId))
-        .map(character => character.avatar)
-        .filter(Boolean);
+    const connected = getCharacterLookupIndex().personaToCharacters.get(personaAvatarId);
+    return connected ? [...connected] : [];
 }
 
 function isPersonaDedicatedToCharacter(personaAvatarId, characterAvatarId) {
@@ -870,6 +927,7 @@ export async function setCharacterDedicatedPersonaEntries(characterAvatar, entri
 
     character.data = character.data || {};
     character.data.extensions = nextExtensions;
+    invalidateCharacterLookupIndex();
     syncCharacterDedicatedPersonasJsonData(character.avatar, nextDedicatedPersonas);
 
     const currentByAvatar = new Map(

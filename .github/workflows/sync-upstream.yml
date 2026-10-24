@@ -1,0 +1,84 @@
+name: Sync upstream (non-conflicting)
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'yunx738/Luker'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: funnycups/Luker
+      BRANCH: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          # A PAT with `repo` + `workflow` scopes is required when upstream
+          # changes files under .github/workflows; GITHUB_TOKEN cannot push those.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$BRANCH"
+          if git merge-base --is-ancestor "upstream/$BRANCH" HEAD; then
+            echo 'Already up to date.'
+            echo 'result=uptodate' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git merge --no-edit -m "Merge upstream ${UPSTREAM_REPO}@$(git rev-parse --short upstream/$BRANCH)" "upstream/$BRANCH"; then
+            echo 'result=merged' >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort
+            echo 'result=conflict' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Syntax check changed JS
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          git diff --name-only --diff-filter=AM ORIG_HEAD HEAD -- '*.js' '*.mjs' | while read -r f; do
+            node --check "$f" || { echo "::error file=$f::syntax error after merge"; exit 1; }
+          done
+
+      - name: Push
+        if: steps.merge.outputs.result == 'merged'
+        run: git push origin "HEAD:$BRANCH"
+
+      - name: Report conflict
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.readFileSync('/tmp/conflicts.txt', 'utf8').trim();
+            const title = 'Upstream sync blocked by merge conflict';
+            const body = [
+              `Automatic merge of \`${process.env.UPSTREAM_REPO}@${process.env.BRANCH}\` stopped; nothing was pushed.`,
+              '', 'Conflicting files:', '```', files || '(unknown)', '```',
+              '', 'Resolve locally: `git fetch upstream && git merge upstream/release`, then push.',
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n');
+            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: 'open', labels: 'upstream-sync' });
+            const existing = open.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ ...context.repo, title, body, labels: ['upstream-sync'] });
+            }
+            core.warning('Merge conflict with upstream; see issue.');
