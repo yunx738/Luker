@@ -16000,7 +16000,9 @@ export async function getSettings(options = {}) {
         }
     }
     await validateDisabledSamplers();
-    rememberSettingsSnapshot(buildSettingsPayload());
+    const initialSettings = buildSettingsNode(getSettingsPayloadSource(), undefined, undefined, false, SETTINGS_DIFF_DEPTH);
+    rememberSettingsSnapshot(initialSettings.value);
+    rememberSettingsSectionCache(initialSettings.value, initialSettings.entry);
     settingsReady = true;
     await eventSource.emit(event_types.SETTINGS_LOADED);
 
@@ -16079,8 +16081,8 @@ export function requestAsyncDiffForNextSettingsSave() {
     }, 5000);
 }
 
-function buildSettingsPayload() {
-    return normalizeJsonObject({
+function getSettingsPayloadSource() {
+    return {
         firstRun: firstRun,
         accountStorage: accountStorage.getState(),
         currentVersion: currentVersion,
@@ -16105,7 +16107,95 @@ function buildSettingsPayload() {
         background: background_settings,
         proxies: proxies,
         selected_proxy: selected_proxy,
+    };
+}
+// Incremental settings diff. Each save used to JSON round-trip the whole
+// settings tree, deep-clone both trees again inside compare(), and clone the
+// previous tree once more to attach test ops -- several full passes over a
+// multi-MB object on the main thread. Now each section is serialized once,
+// unchanged sections reuse the previously parsed value (detected by string
+// equality against the last save), and only changed leaves are diffed.
+const SETTINGS_DIFF_DEPTH = 4;
+let settingsSectionCache = null;
+
+function escapeSettingsPointerSegment(segment) {
+    return String(segment).replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+function prefixPatchOperations(operations, prefix) {
+    if (!prefix) {
+        return operations;
+    }
+    return operations.map(operation => {
+        const next = { ...operation, path: prefix + operation.path };
+        if (typeof operation.from === 'string') {
+            next.from = prefix + operation.from;
+        }
+        return next;
     });
+}
+
+function buildSettingsNode(value, prev, prevEntry, hasPrev, depth) {
+    if (depth > 0 && isPlainObject(value) && typeof value.toJSON !== 'function') {
+        const canReuse = hasPrev && prevEntry instanceof Map && isPlainObject(prev);
+        const entry = new Map();
+        const out = {};
+        const removes = [];
+        const ops = [];
+        for (const key of Object.keys(value)) {
+            const childHasPrev = canReuse && Object.hasOwn(prev, key) && prevEntry.has(key);
+            const child = buildSettingsNode(value[key], childHasPrev ? prev[key] : undefined, childHasPrev ? prevEntry.get(key) : undefined, childHasPrev, depth - 1);
+            if (child.value === undefined) {
+                continue;
+            }
+            entry.set(key, child.entry);
+            out[key] = child.value;
+            if (!canReuse) {
+                continue;
+            }
+            const path = '/' + escapeSettingsPointerSegment(key);
+            if (!childHasPrev) {
+                ops.push({ op: 'add', path, value: child.value });
+            } else if (child.ops.length > 0) {
+                ops.push(...prefixPatchOperations(child.ops, path));
+            }
+        }
+        if (canReuse) {
+            for (const key of Object.keys(prev)) {
+                if (!Object.hasOwn(out, key)) {
+                    const path = '/' + escapeSettingsPointerSegment(key);
+                    removes.push({ op: 'test', path, value: prev[key] }, { op: 'remove', path });
+                }
+            }
+        } else if (hasPrev) {
+            return { value: out, entry, ops: diffSettingsLeaf(prev, out) };
+        }
+        return { value: out, entry, ops: removes.concat(ops) };
+    }
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+        return { value: undefined, entry: undefined, ops: [] };
+    }
+    if (hasPrev && prevEntry === serialized) {
+        return { value: prev, entry: serialized, ops: [] };
+    }
+    const next = JSON.parse(serialized);
+    return { value: next, entry: serialized, ops: hasPrev ? diffSettingsLeaf(prev, next) : [] };
+}
+
+function diffSettingsLeaf(prev, next) {
+    return attachObjectPatchTests(prev, compareJsonPatch(prev, next));
+}
+
+function buildSettingsPayloadWithDiff() {
+    const snapshot = getSettingsSnapshot();
+    const cache = settingsSectionCache && settingsSectionCache.payload === snapshot ? settingsSectionCache : null;
+    const built = buildSettingsNode(getSettingsPayloadSource(), cache?.payload, cache?.entry, !!cache, SETTINGS_DIFF_DEPTH);
+    return { payload: built.value, entry: built.entry, operations: cache ? built.ops : null };
+}
+
+function rememberSettingsSectionCache(payload, entry) {
+    settingsSectionCache = isPlainObject(payload) && entry instanceof Map ? { payload, entry } : null;
 }
 
 //MARK: saveSettings()
@@ -16128,14 +16218,19 @@ async function saveSettingsInternal(loopCounter = 0, options = {}) {
     }
 
     try {
-        const payload = buildSettingsPayload();
+        const incremental = buildSettingsPayloadWithDiff();
+        const payload = incremental.payload;
         let saved = false;
         const previousSnapshot = getSettingsSnapshot();
-
         if (!options.directSave && isPlainObject(previousSnapshot)) {
-            const operations = options.asyncDiff
-                ? await buildObjectPatchOperationsAsync(previousSnapshot, payload, { maxOperations: 4000 })
-                : buildObjectPatchOperations(previousSnapshot, payload, { maxOperations: 4000 });
+            let operations = incremental.operations;
+            if (!operations) {
+                operations = options.asyncDiff
+                    ? await buildObjectPatchOperationsAsync(previousSnapshot, payload, { maxOperations: 4000 })
+                    : buildObjectPatchOperations(previousSnapshot, payload, { maxOperations: 4000 });
+            } else if (operations.length > 4000) {
+                operations = [{ op: 'replace', path: '', value: payload }];
+            }
             if (operations.length === 0) {
                 saved = true;
             } else if (shouldUseSettingsPatch(operations)) {
@@ -16169,6 +16264,7 @@ async function saveSettingsInternal(loopCounter = 0, options = {}) {
         invalidateSettingsGetResponseCache();
         settings = payload;
         rememberSettingsSnapshot(payload);
+        rememberSettingsSectionCache(payload, incremental.entry);
         await eventSource.emit(event_types.SETTINGS_UPDATED);
     } catch (error) {
         console.error('Error saving settings:', error);
