@@ -83,6 +83,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Fixed the extraction retry message contradicting the validator.
 - Added the **Concurrent extraction** mode, which extracts per active node type in parallel.
 - Added a configuration studio that edits the schema, extraction and recall prompts, node-type text, and behavior parameters through reviewable AI proposals; character-scoped parameter writes now store only values that differ from the global settings.
+- Fixed regenerating a turn during its Memory Graph extraction leaving the extraction processing the deleted content.
 
 ### Iteration Studio
 
@@ -90,6 +91,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ### Regex
 
+- Added a **Performance detection** switch to the regex settings, enabled by default.
 - **Plugin Messages** rewrites both the text going into a plugin request and the assistant text a plugin request returns. The scope options are independent switches and can be combined freely.
 - Fixed the **Allow anyway** choice in the slow-regex warning not applying to the current message and being forgotten after toggling the script; the choice is now saved on the regex and applies immediately.
 - Fixed plugin-registered regex rules with a capture group and no trim strings aborting the entire regex pass.
@@ -121,6 +123,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Fixed a spurious "Chat save aborted" alert appearing when Luker opens.
 - Fixed the update check never reporting an available update on Android and HarmonyOS.
 - Fixed state replay dropping full-replacement patches, which could lose stored extension data when a large change was saved.
+- Fixed the **Auth & Limits** admin tab rendering its fields centered and misaligned.
 
 ## v2.8.0 (2026-10-01)
 
