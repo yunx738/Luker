@@ -13,6 +13,7 @@ import { SECRET_KEYS } from '../../../endpoints/secrets.js';
 import { convertXAIMessages, getPromptNames } from '../../../prompt-converters.js';
 import { pipeResponseBodyToEmit } from '../../response-stream.js';
 import { normalizeReasoningToken } from './reasoning-params.js';
+import { normalizeProviderBaseUrl } from '../../../util/base-url.js';
 
 const API_XAI = 'https://api.x.ai/v1';
 
@@ -42,7 +43,8 @@ export async function dispatchXai(ctx) {
 
     let apiUrl;
     try {
-        apiUrl = new URL(body.reverse_proxy || body.base_url || API_XAI).toString();
+        apiUrl = normalizeProviderBaseUrl('xai', body.reverse_proxy || body.base_url || API_XAI);
+        new URL(apiUrl);
     } catch (parseErr) {
         const err = new Error(`xAI upstream URL invalid: ${parseErr?.message || parseErr}`);
         ctx.inspection.fail(err, 400);
@@ -69,9 +71,10 @@ export async function dispatchXai(ctx) {
 
         const xaiToken = normalizeReasoningToken(body.reasoning_effort);
         if (xaiToken !== 'auto' && xaiToken !== 'off') {
-            // xAI only accepts 'high' or 'low'; every lower bucket collapses to
-            // 'low' and 'xhigh' collapses to 'high'.
-            bodyParams.reasoning_effort = xaiToken === 'high' || xaiToken === 'xhigh' ? 'high' : 'low';
+            // xAI accepts low/medium/high/xhigh; grok-4.5 treats xhigh as high.
+            // Minimal has no equivalent and max is represented by the highest level.
+            const xaiEffort = { minimal: 'low', max: 'xhigh' }[xaiToken] ?? xaiToken;
+            bodyParams.reasoning_effort = xaiEffort;
         }
 
         if (body.json_schema) {

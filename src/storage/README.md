@@ -68,7 +68,7 @@ router.post('/something', async function (req, res) {
 
 ### Still on direct `fs.*` access
 
-- **Chats**: `/recent` (in-memory cached index — keeps parity with SqliteEngine's indexed scan), `/meta`, `/meta/patch`, `/get-delta`, `/export`, `/import`, `/search`, `/group/*` (all `/api/chats/group/*` group-chat handlers).
+- **Chats**: `/recent` (in-memory cached index — keeps parity with SqliteEngine's indexed scan), `/meta`, `/meta/patch`, `/export`, `/import`, `/search`, `/group/*` (all `/api/chats/group/*` group-chat handlers).
 - **Settings snapshot endpoints**: `/get-snapshots`, `/load-snapshot`, `/make-snapshot`, `/restore-snapshot` — covered by the engine-level snapshot API once they migrate.
 - **Presets**: `/restore` (reads from `getDefaultPresets`/`getDefaultPresetFile` content-manager, not user data).
 - **Secrets, user accounts, admin settings, announcements**: `src/endpoints/secrets.js`, `src/endpoints/users-private.js`, `src/endpoints/users-admin.js`, `src/admin-settings.js`, `src/announcements.js`. Secrets has ~20 external callers (`readSecret(directories, ...)` across `src/additional-headers.js`, `src/endpoints/{azure,novelai,translate,...}.js`, `src/users.js`); migrating to the handle-based API is a separate per-caller pass. User accounts / admin settings / announcements live in `node-persist` (`<dataRoot>/_storage/`), not user files, and would need a `NodePersistEngine` to share the Engine contract.
@@ -186,7 +186,7 @@ One table per resource kind (`chats`, `chat_states`, `settings`, `presets`, `pre
 
 ## Dependencies and install gotchas
 
-- Native dep: `better-sqlite3`. Pulled in automatically by `npm install`.
+- Native dep: `better-sqlite3`. Dependency install scripts stay disabled, so run `npm run storage:install-sqlite` after `npm install` when the SQLite backend is needed. The Docker image and start scripts run it during setup.
 - SQLite version requirement: ≥ 3.31 (for `STORED GENERATED COLUMN` support in the `chats` table). better-sqlite3 bundles a recent SQLite, so this is satisfied out of the box.
 - macOS install gotcha: Homebrew Python 3.14.6 ships a broken `pyexpat`, which makes node-gyp's setup crash before better-sqlite3 can build. Workaround: rerun the install with `npm rebuild better-sqlite3 --python=/usr/bin/python3` (system Python) or set `PYTHON=/usr/bin/python3` for the install command.
 
@@ -263,7 +263,7 @@ Reads `./config.yaml` from the CWD (so the script assumes you ran it from the re
 
 ### Admin panel UI
 
-`public/scripts/templates/admin.html` + `public/scripts/user.js`:
+`public/scripts/account-admin.js` + `public/scripts/user.js`:
 
 - "Storage Backend" tab in the admin panel.
 - Shows current mode, the read-only flag, and the last-migration timestamp returned by `/api/users/storage/status`.

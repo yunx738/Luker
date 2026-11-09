@@ -37,6 +37,7 @@ import {
     mergeObjectWithYaml,
     modelIdMatchesFamily,
 } from '../../../util.js';
+import { normalizeProviderBaseUrl } from '../../../util/base-url.js';
 
 const API_CLAUDE = 'https://api.anthropic.com/v1';
 
@@ -122,7 +123,8 @@ export async function dispatchClaude(ctx) {
 
     let apiUrl;
     try {
-        apiUrl = new URL(body.reverse_proxy || body.base_url || API_CLAUDE).toString();
+        apiUrl = normalizeProviderBaseUrl('claude', body.reverse_proxy || body.base_url || API_CLAUDE);
+        new URL(apiUrl);
     } catch (parseErr) {
         const err = new Error(`Claude upstream URL invalid: ${parseErr?.message || parseErr}`);
         ctx.inspection.fail(err, 400);
@@ -270,14 +272,8 @@ export async function dispatchClaude(ctx) {
         const includeReasoning = Boolean(body.include_reasoning);
         const isAlwaysThinking = modelIdMatchesFamily(body.model, /^claude-(fable-5|mythos-5|mythos-preview|opus-5-5)/);
         const canDisable = modelIdMatchesFamily(body.model, /^claude-(sonnet-5|opus-5|haiku-5-5|sonnet-5-5|opus-4-6|sonnet-4-6|opus-4-7|opus-4-8|opus-4-5|sonnet-4-5|haiku-4-5)/);
-        const effortClampHigh = modelIdMatchesFamily(body.model, /^claude-(opus-5|haiku-5-5|sonnet-5-5)/);
 
-        let effectiveToken = reasoningToken;
-        if (effortClampHigh && (effectiveToken === 'xhigh' || effectiveToken === 'max')) {
-            effectiveToken = 'high';
-        }
-
-        const budgetTokens = calculateClaudeBudgetTokens(requestBody.max_tokens, effectiveToken, requestBody.stream, isAdaptiveModel);
+        const budgetTokens = calculateClaudeBudgetTokens(requestBody.max_tokens, reasoningToken, requestBody.stream, isAdaptiveModel);
 
         if (reasoningToken === 'off' && canDisable && !isAlwaysThinking) {
             if (modelIdMatchesFamily(body.model, /^claude-sonnet-5-5/)) {

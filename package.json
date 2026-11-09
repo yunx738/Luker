@@ -3,6 +3,7 @@
         "@adobe/css-tools": "^4.4.4",
         "@agnai/sentencepiece-js": "^1.1.1",
         "@agnai/web-tokenizers": "^0.1.3",
+        "@aws-sdk/client-s3": "^3.1146.0",
         "@codemirror/autocomplete": "^6.20.1",
         "@codemirror/commands": "^6.10.3",
         "@codemirror/lang-css": "^6.3.1",
@@ -41,6 +42,7 @@
         "@jimp/wasm-jpeg": "^1.6.0",
         "@jimp/wasm-png": "^1.6.0",
         "@jimp/wasm-webp": "^1.6.0",
+        "@lezer/json": "^1.0.3",
         "@mozilla/readability": "^0.6.0",
         "@npmcli/arborist": "9.9.2",
         "@popperjs/core": "^2.11.8",
@@ -133,6 +135,9 @@
             "whatwg-url": "^14.0.0"
         }
     },
+    "allowScripts": {
+        "better-sqlite3": true
+    },
     "name": "luker",
     "type": "module",
     "license": "AGPL-3.0",
@@ -140,7 +145,7 @@
         "type": "git",
         "url": "https://github.com/funnycups/Luker.git"
     },
-    "version": "2.8.0",
+    "version": "2.9.0-rc.1",
     "scripts": {
         "init": "node src/server-init.js",
         "start": "node server.js",
@@ -155,6 +160,7 @@
         "lint:plugin-imports": "node scripts/check-plugin-imports.js",
         "plugins:update": "node plugins update",
         "plugins:install": "node plugins install",
+        "storage:install-sqlite": "npm rebuild better-sqlite3 --ignore-scripts=false",
         "storage:migrate": "node scripts/storage-migrate.js",
         "storage:audit-names": "node scripts/audit-storage-names.js"
     },

@@ -65,6 +65,18 @@ const inspectorLedger = new ByteBudgetLedger(REQUEST_INSPECTOR_BYTE_BUDGET_BYTES
 /** @type {Map<string, InspectorEntry[]>} handle -> entries */
 const buffers = new Map();
 
+/**
+ * AbortControllers for request types that do not run through the generation
+ * job runner (embedding / rerank). Chat, text and image requests carry a
+ * `generationJobId` and are aborted through the job's own controller.
+ *
+ * Keyed by inspector entry id. Entries are removed on completion, failure,
+ * eviction, or abort so a long-lived server never accumulates controllers.
+ *
+ * @type {Map<string, AbortController>}
+ */
+const inspectionAbortControllers = new Map();
+
 function getBuffer(handle) {
     if (!buffers.has(handle)) {
         buffers.set(handle, []);
@@ -108,8 +120,27 @@ function removeEntry(handle, entry) {
 
     buffer.splice(index, 1);
     inspectorLedger.untrack(entry);
+    releaseInspectionAbortController(entry);
     if (buffer.length === 0) buffers.delete(handle);
     return true;
+}
+
+/**
+ * Drop the per-entry AbortController. If the entry is still running when it
+ * is evicted (TTL / byte budget), abort the controller first so the upstream
+ * request does not keep running with no record left to stop it.
+ *
+ * @param {object} entry
+ */
+function releaseInspectionAbortController(entry) {
+    const id = String(entry?.id || '');
+    if (!id) return;
+    const controller = inspectionAbortControllers.get(id);
+    if (!controller) return;
+    inspectionAbortControllers.delete(id);
+    if (entry.status === 'running' && !controller.signal.aborted) {
+        try { controller.abort('inspection entry evicted'); } catch { /* ignore */ }
+    }
 }
 
 /**
@@ -286,6 +317,10 @@ export function startInspection(request) {
         type: 'chat',
         handle,
         timestamp: Date.now(),
+        // Set by the runner before dispatch starts. The inspector abort
+        // endpoint uses it to cancel the generation job (and its upstream
+        // fetch) without accepting an arbitrary job id from the client.
+        generationJobId: String(request?.lukerGenerationJob?.id || ''),
         source: String(body.chat_completion_source || body.api_type || 'unknown'),
         model: String(body.model || ''),
         stream: Boolean(body.stream),
@@ -368,6 +403,101 @@ export function findEntry(request) {
         if (buf[i].id === id) return buf[i];
     }
     return null;
+}
+
+/**
+ * Abort signal for the current inspector entry, if the request type uses a
+ * per-entry controller (embedding / rerank). Chat, text and image requests
+ * return null — they are aborted through their generation job instead.
+ *
+ * @param {import('express').Request} request
+ * @returns {AbortSignal|null}
+ */
+export function getInspectionAbortSignal(request) {
+    const signal = request?.__inspectorAbortController?.signal;
+    return signal || null;
+}
+
+/**
+ * Mark a running entry as aborted. Keeps the original start timestamp so the
+ * duration reflects the time the request actually ran before the abort.
+ *
+ * @param {object} entry
+ * @param {string} reason
+ * @returns {boolean}
+ */
+function markEntryAborted(entry, reason) {
+    if (!entry || entry.status !== 'running') return false;
+    entry.status = 'aborted';
+    entry.durationMs = Date.now() - entry.timestamp;
+    entry.error = String(reason || '');
+    return true;
+}
+
+/**
+ * Abort the inspector entry that belongs to a generation job. Called by the
+ * generation-control abort endpoint after it has verified job ownership.
+ *
+ * @param {string} handle
+ * @param {string} jobId
+ * @param {string} [reason]
+ * @returns {object|null} the aborted entry, or null when no running entry matches
+ */
+export function abortInspectionByJobId(handle, jobId, reason = 'Aborted from request inspector') {
+    const h = String(handle || '');
+    const id = String(jobId || '');
+    if (!h || !id) return null;
+    const buf = buffers.get(h);
+    if (!buf) return null;
+    for (let i = buf.length - 1; i >= 0; i--) {
+        const entry = buf[i];
+        if (entry.generationJobId === id && markEntryAborted(entry, reason)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+/**
+ * Abort a non-job inspector entry (embedding / rerank) through its own
+ * AbortController. The pending HTTP request then fails with an AbortError,
+ * which the route translates into a 499 response.
+ *
+ * @param {string} handle
+ * @param {string} entryId
+ * @param {string} [reason]
+ * @returns {object|null} the aborted entry, or null when not abortable
+ */
+export function abortInspectionEntry(handle, entryId, reason = 'Aborted from request inspector') {
+    const h = String(handle || '');
+    const id = String(entryId || '');
+    if (!h || !id) return null;
+    const buf = buffers.get(h);
+    if (!buf) return null;
+    const entry = buf.find(e => e.id === id);
+    if (!entry || entry.status !== 'running') return null;
+    const controller = inspectionAbortControllers.get(id);
+    if (!controller) return null;
+    if (!markEntryAborted(entry, reason)) return null;
+    inspectionAbortControllers.delete(id);
+    try { controller.abort(reason); } catch { /* already aborted */ }
+    return entry;
+}
+
+/**
+ * How the inspector UI should abort this entry:
+ *   - 'job'     — cancel the generation job (chat / text / image)
+ *   - 'request' — abort the entry's own controller (embedding / rerank)
+ *   - ''        — not abortable
+ *
+ * @param {object} entry
+ * @returns {'job'|'request'|''}
+ */
+export function getAbortKind(entry) {
+    if (!entry || entry.status !== 'running') return '';
+    if (entry.generationJobId) return 'job';
+    if (inspectionAbortControllers.has(entry.id)) return 'request';
+    return '';
 }
 
 // ---- Usage extraction helpers ----
@@ -1297,6 +1427,9 @@ function extractPartsFromPayload(payload, source, rawApiResponse) {
 export function completeInspection(request, payload, rawApiResponse) {
     const entry = findEntry(request);
     if (!entry) return;
+    // An inspector abort may race the dispatch's completion callback. The
+    // abort wins: never overwrite an explicit user-visible abort with success.
+    if (entry.status === 'aborted') return;
 
     entry.status = 'success';
     entry.durationMs = Date.now() - entry.timestamp;
@@ -1363,6 +1496,7 @@ export function completeInspection(request, payload, rawApiResponse) {
 export function completeInspectionFromStream(request, events, accumulatedText) {
     const entry = findEntry(request);
     if (!entry) return;
+    if (entry.status === 'aborted') return;
 
     entry.status = 'success';
     entry.durationMs = Date.now() - entry.timestamp;
@@ -1410,6 +1544,7 @@ export function completeInspectionFromStream(request, events, accumulatedText) {
 export function failInspection(request, errorMessage, httpStatus) {
     const entry = findEntry(request);
     if (!entry) return;
+    if (entry.status === 'aborted') return;
 
     entry.status = 'error';
     entry.durationMs = Date.now() - entry.timestamp;
@@ -1428,10 +1563,7 @@ export function failInspection(request, errorMessage, httpStatus) {
 export function abortInspection(request) {
     const entry = findEntry(request);
     if (!entry) return;
-    if (entry.status !== 'running') return;
-
-    entry.status = 'aborted';
-    entry.durationMs = Date.now() - entry.timestamp;
+    markEntryAborted(entry, 'Aborted');
 }
 
 // ---- ComfyUI Workflow Parsing ----
@@ -1451,8 +1583,17 @@ function parseComfyWorkflow(promptData) {
     }
     if (!workflow || typeof workflow !== 'object') return result;
 
-    const nodes = Object.values(workflow);
-    for (const node of nodes) {
+    // The client posts `body.prompt` verbatim to ComfyUI's /prompt route, so
+    // the node graph is nested under `prompt` (with an optional client_id
+    // sibling). Accept a bare node graph as well.
+    if (workflow.prompt && typeof workflow.prompt === 'object' && !Array.isArray(workflow.prompt)) {
+        workflow = workflow.prompt;
+    }
+
+    const textByNodeId = new Map();
+    let samplerInputs = null;
+
+    for (const [nodeId, node] of Object.entries(workflow)) {
         const cls = node?.class_type;
         const inputs = node?.inputs;
         if (!cls || !inputs) continue;
@@ -1462,14 +1603,12 @@ function parseComfyWorkflow(promptData) {
             result.cfgScale = inputs.cfg ?? result.cfgScale;
             result.seed = inputs.seed ?? inputs.noise_seed ?? result.seed;
             result.sampler = inputs.sampler_name ?? result.sampler;
-        } else if (cls === 'CLIPTextEncode') {
-            const text = typeof inputs.text === 'string' ? inputs.text : '';
-            // Heuristic: shorter CLIP texts or ones with "negative" in node title are negative prompts
-            if (!result.prompt) {
-                result.prompt = text;
-            } else if (!result.negativePrompt && text.length < result.prompt.length) {
-                result.negativePrompt = text;
-            }
+            if (!samplerInputs && inputs.positive && inputs.negative) samplerInputs = inputs;
+        } else if (cls === 'CLIPTextEncode' || cls === 'CLIPTextEncodeSDXL') {
+            const text = typeof inputs.text === 'string'
+                ? inputs.text
+                : (typeof inputs.text_g === 'string' ? inputs.text_g : '');
+            if (text) textByNodeId.set(String(nodeId), text);
         } else if (cls === 'CheckpointLoaderSimple' || cls === 'CheckpointLoader') {
             result.model = inputs.ckpt_name ?? result.model;
         } else if (cls === 'EmptyLatentImage') {
@@ -1477,10 +1616,43 @@ function parseComfyWorkflow(promptData) {
             result.height = inputs.height ?? result.height;
         }
     }
+
+    const linkedText = (link) => {
+        if (!Array.isArray(link)) return '';
+        return textByNodeId.get(String(link[0])) ?? '';
+    };
+
+    if (samplerInputs) {
+        result.prompt = linkedText(samplerInputs.positive);
+        result.negativePrompt = linkedText(samplerInputs.negative);
+    }
+
+    // Fallback for workflows whose sampler does not link straight to text
+    // nodes: first remaining text is the prompt, a shorter one is negative.
+    if (!result.prompt || !result.negativePrompt) {
+        const remaining = [...textByNodeId.values()].filter(text => text !== result.prompt);
+        if (!result.prompt) result.prompt = remaining.shift() ?? '';
+        if (!result.negativePrompt && remaining.length) {
+            result.negativePrompt = remaining.find(text => text.length < result.prompt.length) ?? remaining[0];
+        }
+    }
+
     return result;
 }
 
 // ---- Image Inspection ----
+
+/**
+ * Parse a `WxH` size string into numeric dimensions.
+ * @param {*} size
+ * @returns {{width: number, height: number}|null}
+ */
+function parseSizeDimensions(size) {
+    if (typeof size !== 'string') return null;
+    const [width, height] = size.toLowerCase().split('x').map(Number);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+    return { width, height };
+}
 
 /**
  * Extract normalized image generation metadata from various backend request bodies.
@@ -1523,6 +1695,7 @@ export function extractImageMeta(source, body) {
         case 'sd_cpp':
             meta.prompt = body.prompt || '';
             meta.negativePrompt = body.negative_prompt || '';
+            meta.model = body.model || '';
             meta.width = body.width ?? null;
             meta.height = body.height ?? null;
             meta.steps = body.steps ?? null;
@@ -1558,16 +1731,15 @@ export function extractImageMeta(source, body) {
             break;
         case 'stability':
             meta.prompt = body.payload?.prompt || '';
+            meta.negativePrompt = body.payload?.negative_prompt || '';
             meta.model = body.model || '';
             meta.seed = body.payload?.seed ?? null;
             break;
         case 'electronhub': {
             meta.prompt = body.prompt || '';
             meta.model = body.model || '';
-            if (typeof body.size === 'string' && body.size.includes('x')) {
-                const [w, h] = body.size.split('x').map(Number);
-                if (w && h) { meta.width = w; meta.height = h; }
-            }
+            const dims = parseSizeDimensions(body.size);
+            if (dims) { meta.width = dims.width; meta.height = dims.height; }
             break;
         }
         case 'chutes':
@@ -1577,7 +1749,7 @@ export function extractImageMeta(source, body) {
             meta.width = body.width ?? null;
             meta.height = body.height ?? null;
             meta.steps = body.steps ?? null;
-            meta.cfgScale = body.guidance ?? null;
+            meta.cfgScale = body.guidance_scale ?? body.guidance ?? null;
             meta.seed = body.seed ?? null;
             break;
         case 'bfl':
@@ -1591,6 +1763,7 @@ export function extractImageMeta(source, body) {
             break;
         case 'falai':
             meta.prompt = body.prompt || '';
+            meta.negativePrompt = body.negative_prompt || '';
             meta.model = body.model || '';
             meta.width = body.width ?? null;
             meta.height = body.height ?? null;
@@ -1598,14 +1771,63 @@ export function extractImageMeta(source, body) {
             meta.cfgScale = body.guidance ?? null;
             meta.seed = body.seed ?? null;
             break;
+        case 'nanogpt':
+            meta.prompt = body.prompt || '';
+            meta.negativePrompt = body.negative_prompt || '';
+            meta.model = body.model || '';
+            meta.width = body.width ?? null;
+            meta.height = body.height ?? null;
+            meta.steps = body.num_steps ?? null;
+            meta.cfgScale = body.scale ?? null;
+            break;
+        case 'aimlapi': {
+            meta.prompt = body.prompt || '';
+            meta.model = body.model || '';
+            meta.width = body.width ?? null;
+            meta.height = body.height ?? null;
+            meta.steps = body.steps ?? null;
+            meta.cfgScale = body.guidance ?? null;
+            meta.seed = body.seed ?? null;
+            const dims = parseSizeDimensions(body.size);
+            if (dims) { meta.width = dims.width; meta.height = dims.height; }
+            break;
+        }
+        case 'workersai':
+            meta.prompt = body.prompt || '';
+            meta.negativePrompt = body.negative_prompt || '';
+            meta.model = body.model || '';
+            meta.width = body.width ?? null;
+            meta.height = body.height ?? null;
+            meta.steps = body.steps ?? null;
+            meta.cfgScale = body.scale ?? null;
+            meta.seed = body.seed ?? null;
+            break;
+        case 'zai': {
+            meta.prompt = body.prompt || '';
+            meta.model = body.model || '';
+            const dims = parseSizeDimensions(body.size);
+            if (dims) { meta.width = dims.width; meta.height = dims.height; }
+            break;
+        }
         default:
-            // huggingface, nanogpt, xai, and any future backends
+            // huggingface, xai, and any future backends
             meta.prompt = body.prompt || body.inputs || '';
             meta.model = body.model || '';
             break;
     }
 
     return meta;
+}
+
+/**
+ * Mime type for an image file extension captured from the upstream output.
+ * @param {string|null} format
+ * @returns {string}
+ */
+function imageMimeFromFormat(format) {
+    const f = String(format || '').toLowerCase();
+    if (!f) return '';
+    return f === 'jpg' ? 'image/jpeg' : `image/${f}`;
 }
 
 /**
@@ -1622,6 +1844,7 @@ export function startImageInspection(request, meta) {
         type: 'image',
         handle,
         timestamp: Date.now(),
+        generationJobId: String(request?.lukerGenerationJob?.id || ''),
         source: String(meta.source || 'unknown'),
         prompt: String(meta.prompt || ''),
         negativePrompt: String(meta.negativePrompt || ''),
@@ -1640,6 +1863,7 @@ export function startImageInspection(request, meta) {
         error: '',
         outputFormat: null,
         outputSizeBytes: null,
+        outputImage: null,
     };
 
     pushEntry(handle, entry);
@@ -1650,19 +1874,34 @@ export function startImageInspection(request, meta) {
 /**
  * Complete an image inspection with success.
  * @param {import('express').Request} request
- * @param {object} [resultMeta] - { format, sizeBytes }
+ * @param {object} [resultMeta] - { format, sizeBytes, data, mime }
  */
 export function completeImageInspection(request, resultMeta) {
     const entry = findEntry(request);
     if (!entry) return;
+    if (entry.status === 'aborted') return;
 
     entry.status = 'success';
     entry.durationMs = Date.now() - entry.timestamp;
     entry.httpStatus = 200;
     if (resultMeta) {
+        const data = typeof resultMeta.data === 'string' ? resultMeta.data : '';
         entry.outputFormat = resultMeta.format || null;
-        entry.outputSizeBytes = resultMeta.sizeBytes ?? null;
+        entry.outputSizeBytes = resultMeta.sizeBytes
+            ?? (data ? Buffer.byteLength(data, 'base64') : null);
+        if (data) {
+            entry.outputImage = {
+                type: 'image',
+                mime: String(resultMeta.mime || imageMimeFromFormat(entry.outputFormat)),
+                data,
+            };
+        }
     }
+
+    // The generated image can be several megabytes — re-estimate and evict
+    // before returning.
+    inspectorLedger.retouch(entry);
+    enforceByteBudget();
 }
 
 /**
@@ -1674,6 +1913,7 @@ export function completeImageInspection(request, resultMeta) {
 export function failImageInspection(request, errorMessage, httpStatus) {
     const entry = findEntry(request);
     if (!entry) return;
+    if (entry.status === 'aborted') return;
 
     entry.status = 'error';
     entry.durationMs = Date.now() - entry.timestamp;
@@ -1809,6 +2049,7 @@ export function startEmbeddingInspection(request, meta) {
         type: 'embedding',
         handle,
         timestamp: Date.now(),
+        generationJobId: '',
         source: String(meta.source || 'unknown'),
         operation: meta.operation === 'rerank' ? 'rerank' : 'embed',
         routeKind: String(meta.routeKind || ''),
@@ -1834,6 +2075,9 @@ export function startEmbeddingInspection(request, meta) {
     };
 
     pushEntry(handle, entry);
+    const abortController = new AbortController();
+    inspectionAbortControllers.set(entry.id, abortController);
+    request.__inspectorAbortController = abortController;
     request.__inspectorId = entry.id;
     request.__inspectorTimestamp = entry.timestamp;
 }
@@ -1853,6 +2097,8 @@ export function startEmbeddingInspection(request, meta) {
 export function completeEmbeddingInspection(request, resultMeta) {
     const entry = findEntry(request);
     if (!entry) return;
+    if (entry.status === 'aborted') return;
+    releaseInspectionAbortController(entry);
 
     entry.status = 'success';
     entry.durationMs = Date.now() - entry.timestamp;
@@ -1873,6 +2119,8 @@ export function completeEmbeddingInspection(request, resultMeta) {
 export function failEmbeddingInspection(request, errorMessage, httpStatus) {
     const entry = findEntry(request);
     if (!entry) return;
+    if (entry.status === 'aborted') return;
+    releaseInspectionAbortController(entry);
 
     entry.status = 'error';
     entry.durationMs = Date.now() - entry.timestamp;
@@ -1936,6 +2184,8 @@ router.get('/list', (req, res) => {
             status: e.status,
             httpStatus: e.httpStatus,
             error: e.error,
+            generationJobId: e.generationJobId || '',
+            abortKind: getAbortKind(e),
             searchText: buildSearchSnippet(e),
         };
         if (e.type === 'image') {
@@ -1969,6 +2219,30 @@ router.get('/list', (req, res) => {
     return res.json(summaries);
 });
 
+router.post('/:id/abort', (req, res) => {
+    const handle = String(req?.user?.profile?.handle || '');
+    if (!handle) return res.status(401).send({ error: 'Unauthorized' });
+
+    const buf = getBuffer(handle);
+    const entry = buf.find(e => e.id === req.params.id);
+    if (!entry) return res.status(404).send({ error: 'Not found' });
+    if (entry.status !== 'running') {
+        return res.status(409).json({ aborted: false, error: 'not_running' });
+    }
+    if (entry.generationJobId) {
+        // Job-backed entries are aborted through the generation-control
+        // endpoint so the job's AbortController and WS terminal frame are
+        // handled in one place.
+        return res.status(409).json({ aborted: false, error: 'use_generation_abort' });
+    }
+
+    const aborted = abortInspectionEntry(handle, entry.id, 'Aborted from request inspector');
+    if (!aborted) {
+        return res.status(409).json({ aborted: false, error: 'not_abortable' });
+    }
+    return res.json({ aborted: true });
+});
+
 router.get('/:id', (req, res) => {
     const handle = String(req?.user?.profile?.handle || '');
     if (!handle) return res.status(401).send({ error: 'Unauthorized' });
@@ -1977,7 +2251,7 @@ router.get('/:id', (req, res) => {
     const entry = buf.find(e => e.id === req.params.id);
     if (!entry) return res.status(404).send({ error: 'Not found' });
 
-    return res.json(entry);
+    return res.json({ ...entry, abortKind: getAbortKind(entry) });
 });
 
 router.get('/:id/export', (req, res) => {

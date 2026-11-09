@@ -2,7 +2,7 @@
  * CardApp Context - builds the ctx object passed to CardApp's init() function.
  */
 
-import { getScriptsByType, saveScriptsByType, SCRIPT_TYPES } from '../regex/engine.js';
+import { getScriptsByType, normalizePluginScriptRecord, omitLegacyPluginScope, saveScriptsByType, SCRIPT_TYPES } from '../regex/engine.js';
 
 const __ctx = Luker.getContext();
 const eventSource = __ctx.eventSource;
@@ -27,6 +27,8 @@ const lukerSetVariable = __ctx.setVariable;
 const getContext = Luker.getContext;
 const extension_settings = __ctx.extensionSettings;
 const lukerGetCharacterState = __ctx.getCharacterState;
+const listPresetDocuments = __ctx.listPresetDocuments;
+const readPresetDocument = __ctx.readPresetDocument;
 const lukerSetCharacterState = __ctx.setCharacterState;
 const lukerUpdateCharacterState = __ctx.updateCharacterState;
 const lukerDeleteCharacterState = __ctx.deleteCharacterState;
@@ -89,6 +91,8 @@ export function buildContext(container, charId, config) {
     let renderer = null;
 
     const ctx = {
+        listPresetDocuments,
+        readPresetDocument,
         /** @type {HTMLElement} The CardApp container element */
         container,
 
@@ -992,18 +996,18 @@ export function buildContext(container, charId, config) {
          *   duplicating a rule the user already has globally) — ctx never
          *   *writes* to global state.
          *
-         * Returns the raw script records — each one has at least `id`,
+         * Returns normalized script records — each one has at least `id`,
          * `scriptName`, `findRegex`, `replaceString`, `placement` (number[]),
          * plus the boolean gating fields (`disabled`, `markdownOnly`,
-         * `promptOnly`, `pluginOnly`, `runOnEdit`). Empty array if nothing is
-         * stored at that scope.
+         * `promptOnly`, `runOnEdit`) and `pluginLanes` (array of `'request'`
+         * and/or `'reply'`). Empty array if nothing is stored at that scope.
          *
          * @param {'character'|'global'} [scope='character']
          * @returns {Array<object>}
          */
         getRegexScripts(scope = 'character') {
             const scriptType = regexScopeToScriptType(scope);
-            return getScriptsByType(scriptType);
+            return getScriptsByType(scriptType).map(normalizePluginScriptRecord);
         },
 
         /**
@@ -1024,11 +1028,14 @@ export function buildContext(container, charId, config) {
          * - `id`: auto-generated UUID (any caller-supplied id is ignored)
          * - `scriptName`/`findRegex`/`replaceString`: empty string
          * - `trimStrings`: []
-         * - `placement`: [] (script will not fire until at least one
-         *   placement is set — see Luker's `regex_placement` enum:
+         * - `placement`: [] (the script will not fire on a message type
+         *   until at least one placement is set, unless it has the reply
+         *   plugin lane — see Luker's `regex_placement` enum:
          *   1=USER_INPUT, 2=AI_OUTPUT, 3=SLASH_COMMAND, 5=WORLD_INFO,
          *   6=REASONING)
-         * - `disabled`/`markdownOnly`/`promptOnly`/`pluginOnly`/`runOnEdit`: false
+         * - `disabled`/`markdownOnly`/`promptOnly`/`runOnEdit`: false
+         * - `pluginLanes`: [] (select `'request'` for plugin request text,
+         *   `'reply'` for the assistant text a plugin request returns)
          * - `substituteRegex`: 0 (NONE; 1=RAW macro substitution, 2=ESCAPED)
          * - `minDepth`/`maxDepth`: null (no depth gate)
          *
@@ -1038,7 +1045,8 @@ export function buildContext(container, charId, config) {
         async createRegexScript(fields = {}) {
             const scriptType = SCRIPT_TYPES.SCOPED;
             const current = getScriptsByType(scriptType);
-            const { id: _ignoredId, ...userFields } = (fields && typeof fields === 'object') ? fields : {};
+            const source = (fields && typeof fields === 'object') ? fields : {};
+            const { id: _ignoredId, ...userFields } = omitLegacyPluginScope(source);
             const newScript = {
                 scriptName: '',
                 findRegex: '',
@@ -1048,7 +1056,7 @@ export function buildContext(container, charId, config) {
                 disabled: false,
                 markdownOnly: false,
                 promptOnly: false,
-                pluginOnly: false,
+                pluginLanes: [],
                 runOnEdit: false,
                 substituteRegex: 0,
                 minDepth: null,
@@ -1079,11 +1087,12 @@ export function buildContext(container, charId, config) {
             const current = getScriptsByType(scriptType);
             const idx = current.findIndex((s) => String(s?.id || '') === idStr);
             if (idx < 0) throw new Error(`[CardApp] Regex script "${idStr}" not found on this character`);
-            const updated = { ...current[idx], ...(patch || {}), id: idStr };
+            const safePatch = (patch && typeof patch === 'object') ? omitLegacyPluginScope(patch) : {};
+            const updated = { ...normalizePluginScriptRecord(current[idx]), ...safePatch, id: idStr };
             const next = current.slice();
             next[idx] = updated;
             await saveScriptsByType(next, scriptType);
-            return updated;
+            return normalizePluginScriptRecord(updated);
         },
 
         /**

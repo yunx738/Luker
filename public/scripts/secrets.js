@@ -1,5 +1,5 @@
 import { DOMPurify, moment, sha256 } from '../lib.js';
-import { event_types, eventSource, getRequestHeaders, isRunningInLukerHarmonyApp, saveSettings } from '../script.js';
+import { event_types, eventSource, getRequestHeaders, isRunningInLukerAndroidApp, isRunningInLukerHarmonyApp, saveSettings } from '../script.js';
 import { t } from './i18n.js';
 import { chat_completion_sources } from './openai.js';
 import { callGenericPopup, Popup, POPUP_RESULT, POPUP_TYPE } from './popup.js';
@@ -63,6 +63,7 @@ export const SECRET_KEYS = {
     COMFY_RUNPOD: 'api_key_comfy_runpod',
     GENERIC: 'api_key_generic',
     DEEPSEEK: 'api_key_deepseek',
+    DEEPSEEK_SEARCH: 'api_key_deepseek_search',
     SERPER: 'api_key_serper',
     BRAVE_SEARCH: 'api_key_brave_search',
     EXA: 'api_key_exa',
@@ -76,6 +77,7 @@ export const SECRET_KEYS = {
     MOONSHOT: 'api_key_moonshot',
     COMETAPI: 'api_key_cometapi',
     ZAI: 'api_key_zai',
+    ZAI_SEARCH: 'api_key_zai_search',
     SILICONFLOW: 'api_key_siliconflow',
     ELEVENLABS: 'api_key_elevenlabs',
     POLLINATIONS: 'api_key_pollinations',
@@ -118,6 +120,7 @@ const FRIENDLY_NAMES = {
     [SECRET_KEYS.NANOGPT]: 'NanoGPT',
     [SECRET_KEYS.GENERIC]: 'Generic (OpenAI-compatible)',
     [SECRET_KEYS.DEEPSEEK]: 'DeepSeek',
+    [SECRET_KEYS.DEEPSEEK_SEARCH]: 'DeepSeek Search',
     [SECRET_KEYS.XAI]: 'xAI (Grok)',
     [SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT]: 'Google Vertex AI (Service Account)',
     [SECRET_KEYS.STABILITY]: 'Stability AI',
@@ -145,6 +148,7 @@ const FRIENDLY_NAMES = {
     [SECRET_KEYS.COMETAPI]: 'CometAPI',
     [SECRET_KEYS.AZURE_OPENAI]: 'Azure OpenAI',
     [SECRET_KEYS.ZAI]: 'Z.AI',
+    [SECRET_KEYS.ZAI_SEARCH]: 'Z.AI Search',
     [SECRET_KEYS.SILICONFLOW]: 'SiliconFlow',
     [SECRET_KEYS.ELEVENLABS]: 'ElevenLabs TTS',
     [SECRET_KEYS.POLLINATIONS]: 'Pollinations',
@@ -649,10 +653,11 @@ export async function checkOpenRouterAuth() {
  * Updates the input data lists for secret keys for autocomplete functionality.
  */
 function updateInputDataLists() {
-    // The HarmonyOS WebView draws datalist suggestions as a full-screen list of
+    // The native app shells draw datalist suggestions as a full-screen list of
     // opaque secret ids that covers the input. Skip the autosuggest there; saved
-    // keys are picked from the key manager dialog instead.
-    if (isRunningInLukerHarmonyApp()) {
+    // keys are picked from the key manager dialog instead. Mobile web browsers
+    // keep it.
+    if (isRunningInLukerAndroidApp() || isRunningInLukerHarmonyApp()) {
         return;
     }
 

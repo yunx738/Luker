@@ -5,6 +5,7 @@ import { notificationManager } from '@kit.NotificationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ImmersiveManager } from './ImmersiveManager';
 import { ExternalLinkSettings } from './ExternalLinkPolicy';
+import { RuntimeNotification } from './RuntimeNotification';
 
 const TAG: string = 'luker.keepalive';
 const DOMAIN: number = 0xE1EC;
@@ -120,6 +121,7 @@ export class KeepAliveManager {
       info.reason, info.detailedReason ?? -1);
     KeepAliveManager.clearTaskState();
     KeepAliveManager.cancelledForGeneration = true;
+    RuntimeNotification.setKeepAliveActive(false);
   };
 
   private static onTaskSuspended = (info: backgroundTaskManager.ContinuousTaskSuspendInfo): void => {
@@ -156,6 +158,7 @@ export class KeepAliveManager {
       KeepAliveManager.continuousTaskId = res.continuousTaskId ?? -1;
       hilog.info(DOMAIN, TAG, 'task started: id=%{public}d notification=%{public}d',
         KeepAliveManager.continuousTaskId, KeepAliveManager.notificationId);
+      RuntimeNotification.setKeepAliveActive(true);
       KeepAliveManager.publishProgress();
       KeepAliveManager.refreshTimer = setInterval(() => KeepAliveManager.publishProgress(), PROGRESS_REFRESH_MS);
     } catch (e) {
@@ -184,6 +187,7 @@ export class KeepAliveManager {
     } finally {
       KeepAliveManager.taskPending = false;
     }
+    RuntimeNotification.setKeepAliveActive(false);
     KeepAliveManager.reconcile();
   }
 
@@ -250,6 +254,9 @@ function formatElapsed(ms: number): string {
  * Object exposed to the page as `window.LukerHarmony`.
  */
 export class LukerHarmonyBridge {
+  onOpenEndpointSettings: (() => void) | null = null;
+  onReloadWebView: (() => void) | null = null;
+
   setGenerationActive(active: boolean): void {
     KeepAliveManager.setGenerationActive(active === true);
   }
@@ -274,5 +281,13 @@ export class LukerHarmonyBridge {
     KeepAliveManager.getAbilityContext().startAbility(want).catch((err: BusinessError) => {
       hilog.error(DOMAIN, TAG, 'openExternalUrl failed: %{public}d %{public}s', err.code, err.message);
     });
+  }
+
+  openEndpointSettings(): void {
+    this.onOpenEndpointSettings?.();
+  }
+
+  reloadWebView(): void {
+    this.onReloadWebView?.();
   }
 }
