@@ -24,10 +24,34 @@ final class ViewController: UIViewController {
     private var bootGeneration = 0
     private var navigationFailureAlertShown = false
     private var downloadShareViewController: UIViewController?
+
+    // MARK: - HTTP authentication state
+
+    private struct PendingHttpAuthChallenge {
+        let key: String
+        let host: String
+        let port: Int
+        let realm: String
+        let prefill: LukerHttpAuthCredentials?
+        let completionHandler: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    }
+
+    private static let httpAuthMethods: Set<String> = [
+        NSURLAuthenticationMethodHTTPBasic,
+        NSURLAuthenticationMethodHTTPDigest,
+    ]
+    private static let httpAuthDialogRetryInterval: TimeInterval = 0.5
+    private static let httpAuthDialogRetryLimit = 20
+
+    private var recentHttpAuthAttempts: [String: LukerHttpAuthCredentials] = [:]
+    private var pendingHttpAuthChallenges: [PendingHttpAuthChallenge] = []
+    private var httpAuthDialogVisible = false
+    private var httpAuthDialogRetries = 0
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
     private var safeModeTripped = false
     private var safeModeBanner: UIView?
     private var pendingCrashShown = false
+    private var pendingCrashRetryCount = 0
     private var isExportingDiagnostics = false
     #if DEBUG
     private var didHandleLaunchEndpointArgument = false
@@ -93,6 +117,9 @@ final class ViewController: UIViewController {
         if LukerDeepLinkRouter.shared.consumePendingEndpointSettings() {
             presentEndpointSettings()
         }
+        // Do not wait for the WebView: a crash loop that never reaches the
+        // home page must still show the previous run's report and export path.
+        showPendingCrashIfNeeded()
     }
 
     private func configureConstraints() {
@@ -151,6 +178,10 @@ final class ViewController: UIViewController {
         if armWatchdog {
             let watchdog = LukerBootWatchdog.shared.detectAndArm(dataRoot: runtime.dataRootURL)
             safeModeTripped = watchdog.tripped
+            LukerDebugTrail.shared.append(
+                category: "native",
+                text: "boot watchdog armed tripped=\(watchdog.tripped) streak=\(watchdog.failedStreak)"
+            )
         }
 
         startLocalRuntimeAndWait(generation: generation)
@@ -164,10 +195,13 @@ final class ViewController: UIViewController {
                 guard let result else { return }
                 guard generation == self.bootGeneration else { return }
                 if result.ok {
+                    LukerDebugTrail.shared.append(category: "native", text: "runtime start ok; waiting for server")
                     self.setBootState(.waitingForServer)
                     self.waitForServer(generation: generation)
                 } else {
-                    self.setBootState(.failed(reason: result.error ?? NSLocalizedString("runtime_failure_reason_unknown_error", comment: "")))
+                    let reason = result.error ?? NSLocalizedString("runtime_failure_reason_unknown_error", comment: "")
+                    LukerDebugTrail.shared.append(category: "native", text: "runtime start failed: \(reason)")
+                    self.setBootState(.failed(reason: reason))
                 }
             }
         }
@@ -182,6 +216,10 @@ final class ViewController: UIViewController {
                 if self.runtime.isServerReady() {
                     DispatchQueue.main.async { [weak self] in
                         guard let self, generation == self.bootGeneration else { return }
+                        LukerDebugTrail.shared.append(
+                            category: "native",
+                            text: "server ready after \(String(format: "%.1f", Date().timeIntervalSince(startedAt)))s"
+                        )
                         LukerBootWatchdog.shared.markBootSucceeded()
                         self.setBootState(.ready)
                         if self.safeModeTripped {
@@ -210,6 +248,7 @@ final class ViewController: UIViewController {
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self, generation == self.bootGeneration else { return }
+                LukerDebugTrail.shared.append(category: "native", text: "server ready timeout")
                 self.setBootState(.failed(reason: NSLocalizedString("loading_failed_timeout", comment: "")))
             }
         }
@@ -258,6 +297,7 @@ final class ViewController: UIViewController {
             spinner.stopAnimating()
             statusStack.isHidden = true
             webView?.isHidden = false
+            LukerDebugTrail.shared.append(category: "native", text: "interface ready")
             loadCurrentEndpoint()
             showPendingCrashIfNeeded()
         }
@@ -369,6 +409,15 @@ final class ViewController: UIViewController {
 
     private func showPendingCrashIfNeeded() {
         guard !pendingCrashShown else { return }
+        guard view.window != nil else { return }
+        guard presentedViewController == nil else {
+            guard pendingCrashRetryCount < 20 else { return }
+            pendingCrashRetryCount += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.showPendingCrashIfNeeded()
+            }
+            return
+        }
         guard let crash = LukerDiagnosticsCenter.shared.takePendingCrash() else { return }
         pendingCrashShown = true
         let summary = String(crash.report.prefix(4000))
@@ -519,6 +568,176 @@ final class ViewController: UIViewController {
                 guard let self, generation == self.bootGeneration else { return }
                 self.loadCurrentEndpoint()
             }
+        }
+    }
+
+    // MARK: - HTTP authentication
+
+    /// Answers an HTTP authentication challenge. Stored credentials are reused
+    /// until the server rejects them; after a rejection the store is cleared
+    /// and the dialog prefills the rejected pair, so the user can correct it.
+    private func handleHttpAuthChallenge(
+        _ challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let space = challenge.protectionSpace
+        guard Self.httpAuthMethods.contains(space.authenticationMethod) else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        let host = space.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let realm = (space.realm ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        let key = LukerHttpAuthStore.storageKey(host: host, port: space.port, realm: realm)
+        let stored = LukerHttpAuthStore.shared.load(host: host, port: space.port, realm: realm)
+        let lastAttempted = recentHttpAuthAttempts[key]
+
+        if let stored, stored != lastAttempted {
+            recentHttpAuthAttempts[key] = stored
+            LukerDebugTrail.shared.append(
+                category: "native",
+                text: "http auth using stored credentials host=\(host) port=\(space.port) realm=\(realm)"
+            )
+            completionHandler(
+                .useCredential,
+                URLCredential(user: stored.username, password: stored.password, persistence: .none)
+            )
+            return
+        }
+        if let stored, stored == lastAttempted {
+            LukerHttpAuthStore.shared.clear(host: host, port: space.port, realm: realm)
+            LukerDebugTrail.shared.append(
+                category: "native",
+                text: "http auth stored credentials rejected host=\(host) port=\(space.port) realm=\(realm)"
+            )
+        }
+        pendingHttpAuthChallenges.append(PendingHttpAuthChallenge(
+            key: key,
+            host: host,
+            port: space.port,
+            realm: realm,
+            prefill: lastAttempted ?? stored,
+            completionHandler: completionHandler
+        ))
+        presentNextHttpAuthDialog()
+    }
+
+    private func presentNextHttpAuthDialog() {
+        guard !httpAuthDialogVisible, !pendingHttpAuthChallenges.isEmpty else { return }
+        guard view.window != nil, presentedViewController == nil else {
+            guard httpAuthDialogRetries < Self.httpAuthDialogRetryLimit else {
+                LukerDebugTrail.shared.append(
+                    category: "native",
+                    text: "http auth dialog skipped: another dialog stayed open"
+                )
+                cancelPendingHttpAuthChallenges()
+                return
+            }
+            httpAuthDialogRetries += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.httpAuthDialogRetryInterval) { [weak self] in
+                self?.presentNextHttpAuthDialog()
+            }
+            return
+        }
+        httpAuthDialogRetries = 0
+        httpAuthDialogVisible = true
+        let pending = pendingHttpAuthChallenges.removeFirst()
+
+        var lines = [NSLocalizedString("http_auth_dialog_message", comment: "")]
+        lines.append(String(
+            format: NSLocalizedString("http_auth_dialog_host", comment: ""),
+            "\(pending.host):\(pending.port)"
+        ))
+        if !pending.realm.isEmpty {
+            lines.append(String(
+                format: NSLocalizedString("http_auth_dialog_realm", comment: ""),
+                pending.realm
+            ))
+        }
+
+        let alert = UIAlertController(
+            title: NSLocalizedString("http_auth_dialog_title", comment: ""),
+            message: lines.joined(separator: "\n\n"),
+            preferredStyle: .alert
+        )
+        alert.addTextField { field in
+            field.placeholder = NSLocalizedString("http_auth_dialog_username_hint", comment: "")
+            field.text = pending.prefill?.username ?? ""
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addTextField { field in
+            field.placeholder = NSLocalizedString("http_auth_dialog_password_hint", comment: "")
+            field.text = pending.prefill?.password ?? ""
+            field.isSecureTextEntry = true
+        }
+        alert.addAction(UIAlertAction(
+            title: NSLocalizedString("http_auth_dialog_login", comment: ""),
+            style: .default
+        ) { [weak self, weak alert] _ in
+            guard let self else { return }
+            self.httpAuthDialogVisible = false
+            let credentials = LukerHttpAuthCredentials(
+                username: alert?.textFields?.first?.text ?? "",
+                password: alert?.textFields?.last?.text ?? ""
+            )
+            LukerHttpAuthStore.shared.save(
+                host: pending.host,
+                port: pending.port,
+                realm: pending.realm,
+                credentials: credentials
+            )
+            self.recentHttpAuthAttempts[pending.key] = credentials
+            LukerDebugTrail.shared.append(
+                category: "native",
+                text: "http auth credentials submitted host=\(pending.host) port=\(pending.port) realm=\(pending.realm)"
+            )
+            pending.completionHandler(
+                .useCredential,
+                URLCredential(user: credentials.username, password: credentials.password, persistence: .none)
+            )
+            self.resolveQueuedHttpAuthChallenges(key: pending.key, credentials: credentials)
+            self.presentNextHttpAuthDialog()
+        })
+        alert.addAction(UIAlertAction(
+            title: NSLocalizedString("cancel", comment: ""),
+            style: .cancel
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.httpAuthDialogVisible = false
+            pending.completionHandler(.cancelAuthenticationChallenge, nil)
+            self.cancelPendingHttpAuthChallenges()
+            LukerDebugTrail.shared.append(
+                category: "native",
+                text: "http auth cancelled by the user host=\(pending.host) port=\(pending.port) realm=\(pending.realm)"
+            )
+        })
+        present(alert, animated: true)
+    }
+
+    private func resolveQueuedHttpAuthChallenges(key: String, credentials: LukerHttpAuthCredentials) {
+        var remaining: [PendingHttpAuthChallenge] = []
+        for item in pendingHttpAuthChallenges {
+            if item.key == key {
+                item.completionHandler(
+                    .useCredential,
+                    URLCredential(user: credentials.username, password: credentials.password, persistence: .none)
+                )
+            } else {
+                remaining.append(item)
+            }
+        }
+        pendingHttpAuthChallenges = remaining
+    }
+
+    private func cancelPendingHttpAuthChallenges() {
+        let pending = pendingHttpAuthChallenges
+        pendingHttpAuthChallenges.removeAll()
+        for item in pending {
+            item.completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
 
@@ -682,12 +901,23 @@ extension ViewController: WKNavigationDelegate {
         present(alert, animated: true)
     }
 
+    func webView(
+        _ webView: WKWebView,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        handleHttpAuthChallenge(challenge, completionHandler: completionHandler)
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         navigationFailureAlertShown = false
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         navigationFailureAlertShown = false
+        // A finished page proves the accepted credentials work; the next
+        // navigation may reuse them without treating them as a failed attempt.
+        recentHttpAuthAttempts.removeAll()
         LukerDebugTrail.shared.append(category: "native", text: "navigation finished url=\(webView.url?.absoluteString ?? "<none>")")
         if case .navigationFailed = currentBootState {
             statusStack.isHidden = true

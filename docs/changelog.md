@@ -2,6 +2,23 @@
 
 This changelog covers every Luker release, from v1.0.0 to the current development version.
 
+## Unreleased
+
+### Connections & Models
+
+- Additional Parameters now applies to every chat completion source.
+
+### Client Apps
+
+- Added a **Check for pre-release updates** switch to User Settings, on by default.
+- Fixed the iOS, HarmonyOS and desktop apps not prompting for HTTP Basic authentication when the endpoint requires it.
+- Added a data directory setting that moves existing data and restarts the app when changed.
+
+### iOS App
+
+- Added a startup-failure report on the next launch.
+- Fixed the missing scene configuration.
+
 ## v2.9.0-rc.1 (2026-11-09)
 
 ### Server Plugins
