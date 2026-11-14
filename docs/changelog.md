@@ -4,10 +4,46 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ## Unreleased
 
+### Image generation
+
+- Fixed AI Illustration settings labels being squeezed into vertical text.
+
+### Character Cards
+
+- Fixed character card replacement failing when importing tags.
+- Fixed reading and editing character cards whose filenames retain leading spaces or punctuation.
+- Fixed reading empty-named root properties from character cards.
+
+### CardApp
+
+- Fixed CardApp failing to list and read preset documents.
+
 ### Fixes
 
 - Fixed Memory Graph LLM recall not drilling into always-inject event rollups.
 - Fixed Memory Graph RAG recall filtering always-inject nodes after the per-type quota.
+- Fixed the Diagnostics menu overflowing the right edge on narrow screens.
+
+### Storage & Sync
+
+- Fixed character card field edits bypassing sync locking and account storage quotas.
+- Fixed reading SQL settings strings starting with quotes and extension keys containing control characters.
+- Fixed sync status checks failing immediately on an interrupted request or alerting accounts without configured sync backends.
+
+### Client Apps
+
+- Optimized first-launch startup speed and storage usage in the iOS, HarmonyOS, and Android apps.
+- Fixed the app failing to start when local service preparation was interrupted in the iOS and Android apps.
+- Fixed app updates wiping installed server plugins and third-party extensions in the HarmonyOS app.
+- Added retry and diagnostics export actions to the startup failure screen in the HarmonyOS app.
+- Added a crash recovery screen with reload and diagnostics export actions when the HarmonyOS app web page exits abnormally.
+- Preserved partial performance recordings when the renderer exits or reloads in the HarmonyOS and Android apps.
+- Included the newest performance trace in HarmonyOS and Android diagnostics bundles.
+
+### iOS App
+
+- Fixed full-screen pages and custom themes overlapping the status bar and bottom area in the iOS app.
+- Synced the iOS status bar and bottom area separately to the rendered top and bottom bar colors.
 
 ## v2.9.0-rc.2 (2026-11-11)
 

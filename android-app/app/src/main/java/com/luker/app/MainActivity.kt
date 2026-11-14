@@ -510,11 +510,20 @@ class MainActivity : AppCompatActivity() {
                     endpointFailureDialog?.dismiss()
                 }
                 endpointFailureDialogShown = false
-                // A navigation tears the CDP session down: the renderer that
-                // owned the tracing connection is replaced. Finalize the
-                // recording instead of leaving a dangling socket behind.
-                if (LukerCdpCapture.abortTrace()) {
-                    notifyDebugCapture("onCaptureFailed", "trace", "The page navigated while recording.")
+                // A navigation replaces the document being traced. Finalize off the
+                // UI thread so the trace is flushed and sealed on disk without
+                // blocking WebView callbacks.
+                if (LukerCdpCapture.isTraceRecording()) {
+                    startCaptureThread("luker-trace-finalize") {
+                        val saved = LukerCdpCapture.finalizeTrace()
+                        LukerDebugTrail.append(
+                            "native",
+                            "cdp-capture state=trace-nav-finalize file=${saved?.name ?: "<none>"}",
+                        )
+                        if (saved != null) {
+                            notifyDebugCapture("onCaptureReady", "trace")
+                        }
+                    }
                 }
             }
 
@@ -549,6 +558,7 @@ class MainActivity : AppCompatActivity() {
                 recentHttpAuthAttempts.clear()
                 installBlobDownloadBridge()
                 loadingOverlay.visibility = View.GONE
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
@@ -565,29 +575,32 @@ class MainActivity : AppCompatActivity() {
                     view?.destroy()
                 }
                 LukerDebugTrail.append("native", "renderProcessGone didCrash=$crashed url=$url")
-                if (LukerCdpCapture.abortTrace()) {
-                    notifyDebugCapture("onCaptureFailed", "trace", "The renderer process exited while recording.")
-                }
-                val crash = LukerCrashCapture.captureWebViewCrash(
-                    context = applicationContext,
-                    webViewUrl = url,
-                    didCrash = crashed,
-                    rendererPriorityAtExit = rendererPriority,
-                )
-                val cdpSnapshot = LukerCdpCollector.harvestForCrash(applicationContext)
-                // Go through the shared enrichment helper instead of
-                // duplicating debug-trail + logcat + cdp-snapshot append
-                // logic here — the two paths were drifting.
-                val enriched = LukerCrashCapture.enrichCrashReport(
-                    applicationContext,
-                    crash,
-                    cdpSnapshot?.absolutePath,
-                )
-                window.decorView.post {
-                    if (isFinishing || isDestroyed) {
-                        return@post
+                startCaptureThread("luker-webview-crash") {
+                    val savedTrace = LukerCdpCapture.finalizeTrace()
+                    if (savedTrace != null) {
+                        LukerDebugTrail.append("native", "cdp-capture state=trace-crash-finalize file=${savedTrace.name}")
                     }
-                    showWebViewCrashDialog(enriched.report, enriched.reportFile)
+                    val crash = LukerCrashCapture.captureWebViewCrash(
+                        context = applicationContext,
+                        webViewUrl = url,
+                        didCrash = crashed,
+                        rendererPriorityAtExit = rendererPriority,
+                    )
+                    val cdpSnapshot = LukerCdpCollector.harvestForCrash(applicationContext)
+                    // Go through the shared enrichment helper instead of
+                    // duplicating debug-trail + logcat + cdp-snapshot append
+                    // logic here — the two paths were drifting.
+                    val enriched = LukerCrashCapture.enrichCrashReport(
+                        applicationContext,
+                        crash,
+                        cdpSnapshot?.absolutePath,
+                    )
+                    window.decorView.post {
+                        if (isFinishing || isDestroyed) {
+                            return@post
+                        }
+                        showWebViewCrashDialog(enriched.report, enriched.reportFile)
+                    }
                 }
                 return true
             }
@@ -2685,6 +2698,7 @@ class MainActivity : AppCompatActivity() {
         val bootstrapToken = bootstrapSequence.incrementAndGet()
         runtimeFailureDialogShown = false
         loadingOverlay.visibility = View.VISIBLE
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         LukerEndpointStatusNotification.sync(applicationContext, selection)
 
         if (!selection.usesDefaultLocalRuntime) {
@@ -2724,7 +2738,18 @@ class MainActivity : AppCompatActivity() {
                 if (!isBootstrapCurrent(bootstrapToken)) {
                     return@Thread
                 }
-                val result = LukerRuntimeManager.startIfNeeded(applicationContext)
+                var lastDisplayedPercent = -1
+                val result = LukerRuntimeManager.startIfNeeded(applicationContext) { processed, total ->
+                    if (total <= 0L) return@startIfNeeded
+                    val percent = ((processed * 100L) / total).toInt().coerceIn(0, 100)
+                    if (percent == lastDisplayedPercent) return@startIfNeeded
+                    lastDisplayedPercent = percent
+                    runOnUiThread {
+                        if (isBootstrapCurrent(bootstrapToken) && !isFinishing && !isDestroyed) {
+                            loadingText.text = getString(R.string.loading_runtime_progress, percent)
+                        }
+                    }
+                }
                 if (!result.ok) {
                     if (!isBootstrapCurrent(bootstrapToken)) {
                         return@Thread
@@ -2979,6 +3004,7 @@ class MainActivity : AppCompatActivity() {
         val reportFile = runCatching { persistRuntimeReport(report) }.getOrNull()
 
         runOnUiThread {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             loadingText.text = getString(R.string.loading_failed_with_reason, safeReason)
             if (runtimeFailureDialogShown) {
                 return@runOnUiThread
