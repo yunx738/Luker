@@ -4,21 +4,21 @@ export const ADD_IMAGE_PROMPT_TOOL = Object.freeze({
     type: 'function',
     function: {
         name: 'add_image_prompt',
-        description: 'Add one image prompt for a distinct visual moment in the current message. Call this once per visual moment.',
+        description: 'Add an image prompt to the current message.',
         parameters: {
             type: 'object',
             properties: {
                 prompt: {
                     type: 'string',
-                    description: 'The complete image generation prompt. Follow the active prompt style guidance.',
+                    description: 'Image generation prompt.',
                 },
                 insert_after: {
                     type: 'string',
-                    description: 'A verbatim snippet from the current message that ends immediately before the insertion point. Use 10 to 40 characters.',
+                    description: 'Text from the current message that ends immediately before the insertion point.',
                 },
                 insert_before: {
                     type: 'string',
-                    description: 'A verbatim snippet from the current message that starts immediately after the insertion point. Use 10 to 40 characters.',
+                    description: 'Text from the current message that starts immediately after the insertion point.',
                 },
             },
             required: ['prompt', 'insert_after', 'insert_before'],
@@ -30,13 +30,13 @@ export const GENERATE_IMAGE_TOOL = Object.freeze({
     type: 'function',
     function: {
         name: 'generate_image',
-        description: 'Generate an image from the complete prompt and add it to the studio gallery.',
+        description: 'Generate an image and add it to the studio gallery.',
         parameters: {
             type: 'object',
             properties: {
                 prompt: {
                     type: 'string',
-                    description: 'The complete image generation prompt. Follow the active prompt style guidance.',
+                    description: 'Image generation prompt.',
                 },
             },
             required: ['prompt'],
@@ -68,12 +68,10 @@ export function validateGenerateImageArgs(args) {
     return { ok: true, value: { prompt } };
 }
 
-export function selectPromptCalls(toolCalls, { maxPrompts = 5, messageText = '' } = {}) {
+export function selectPromptCalls(toolCalls, { messageText = '' } = {}) {
     const accepted = [];
     const rejected = [];
     const seen = new Set();
-    let truncated = 0;
-    const limit = Math.max(1, Number(maxPrompts) || 1);
 
     for (const call of Array.isArray(toolCalls) ? toolCalls : []) {
         if (call?.name !== ADD_IMAGE_PROMPT_TOOL.function.name) {
@@ -95,12 +93,8 @@ export function selectPromptCalls(toolCalls, { maxPrompts = 5, messageText = '' 
             continue;
         }
         seen.add(key);
-        if (accepted.length >= limit) {
-            truncated += 1;
-            continue;
-        }
         accepted.push(value);
     }
 
-    return { accepted, rejected, truncated };
+    return { accepted, rejected };
 }
