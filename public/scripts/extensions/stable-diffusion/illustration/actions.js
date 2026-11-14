@@ -7,6 +7,7 @@ import {
     syncMessageSwipeData,
 } from './records.js';
 import { buildImageTag, escapeHtml, replaceIllustrationMarkup } from './message.js';
+import { emitMessageChanged } from './message-events.js';
 import { makeIllustrationId } from './presets.js';
 import { messageFingerprint } from './pipeline.js';
 import { deleteMediaFromServer } from '../../../chats.js';
@@ -132,7 +133,21 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
         syncMessageSwipeData(currentMessage, ensureSwipes);
         context.updateMessageBlock(messageId, currentMessage);
         await context.saveChat();
+        await emitMessageChanged(context, messageId);
         return record;
+    }
+
+    async function requestPrompt(initialPrompt) {
+        const result = await callGenericPopup(t`Image prompt`, POPUP_TYPE.INPUT, initialPrompt);
+        if (result === false || result === null || result === undefined) {
+            return null;
+        }
+        const trimmed = String(result).trim();
+        if (!trimmed) {
+            toast(t`The image prompt is empty.`, 'warning');
+            return null;
+        }
+        return trimmed;
     }
 
     async function runGeneration(action, { messageId, record, replaceRecord, prompt }) {
@@ -177,16 +192,11 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
 
         $root.on('click', '#sd_illustration_action_edit_prompt', async () => {
             await closeIfOpen(popup);
-            const prompt = await callGenericPopup(t`Image prompt`, POPUP_TYPE.INPUT, record.prompt);
-            if (prompt === null || prompt === undefined) {
+            const prompt = await requestPrompt(record.prompt);
+            if (!prompt) {
                 return;
             }
-            const trimmed = String(prompt).trim();
-            if (!trimmed) {
-                toast(t`The image prompt is empty.`, 'warning');
-                return;
-            }
-            await runGeneration('edit', { messageId, record, prompt: trimmed });
+            await runGeneration('edit', { messageId, record, prompt });
         });
 
         $root.on('click', '#sd_illustration_action_history', async () => {
@@ -218,7 +228,11 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
                     return;
                 }
                 await historyPopup.complete(POPUP_RESULT.AFFIRMATIVE);
-                await runGeneration('history', { messageId, record: selected, replaceRecord: record, prompt: selected.prompt });
+                const prompt = await requestPrompt(selected.prompt);
+                if (!prompt) {
+                    return;
+                }
+                await runGeneration('history', { messageId, record: selected, replaceRecord: record, prompt });
             });
         });
 
@@ -285,6 +299,7 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
         syncMessageSwipeData(message, ensureSwipes);
         context.updateMessageBlock(messageId, message);
         await context.saveChat();
+        await emitMessageChanged(context, messageId);
 
         if (deleteFiles) {
             const files = removed.map(entry => entry.imageUrl).filter(Boolean);
