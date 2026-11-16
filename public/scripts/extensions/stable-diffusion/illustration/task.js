@@ -1,4 +1,4 @@
-import { ADD_IMAGE_PROMPT_TOOL } from './tools.js';
+import { buildAddImagePromptTool } from './tools.js';
 
 function speakerName(message) {
     const name = String(message?.name || '').trim();
@@ -63,22 +63,33 @@ export function buildIllustrationTaskMessages({ preset, context, current, memory
     ];
 }
 
-export async function requestIllustrationPrompts({ context, preset, taskMessages, abortSignal }) {
+export async function requestIllustrationPrompts({
+    context,
+    preset,
+    taskMessages,
+    abortSignal,
+    availableLoras = [],
+    includeWeight = false,
+}) {
     if (typeof context?.generateTask !== 'function') {
         throw new Error('generateTask is not available.');
     }
     const result = await context.generateTask({
         taskMessages,
         includeCharacterCard: true,
-        worldInfoSource: 'task',
+        worldInfoSource: 'chat',
         apiPresetName: preset?.llm?.apiPresetName || '',
         llmPresetName: preset?.llm?.llmPresetName || '',
-        tools: [ADD_IMAGE_PROMPT_TOOL],
+        tools: [buildAddImagePromptTool(availableLoras, { includeWeight })],
         toolChoice: 'auto',
         functionCallMode: 'auto',
         substituteMacros: true,
         abortSignal,
     });
     const calls = Array.isArray(result?.toolCalls) ? result.toolCalls : [];
-    return calls.map(call => ({ name: String(call?.name || ''), args: call?.args || {} }));
+    return {
+        toolCalls: calls.map(call => ({ name: String(call?.name || ''), args: call?.args || {} })),
+        assistantText: String(result?.assistantText || ''),
+        finishReason: String(result?.finishReason || ''),
+    };
 }

@@ -10,6 +10,7 @@ import { buildImageTag, escapeHtml, replaceIllustrationMarkup } from './message.
 import { emitMessageChanged } from './message-events.js';
 import { makeIllustrationId } from './presets.js';
 import { messageFingerprint } from './pipeline.js';
+import { resolveReplayLoras } from '../lora/tool.js';
 import { deleteMediaFromServer } from '../../../chats.js';
 
 function collectHistory(message, record) {
@@ -27,8 +28,11 @@ function collectHistory(message, record) {
     return chain;
 }
 
-export function initIllustrationActions({ context, pipeline, imageService, settings, ensureSwipes, toast, t }) {
+export function initIllustrationActions({ context, pipeline, imageService, settings, ensureSwipes, toast, notifyError, t }) {
     const actionControllers = new Map();
+    const reportError = typeof notifyError === 'function'
+        ? notifyError
+        : message => toast(message, 'error');
 
     function cancelMatching(predicate) {
         for (const [key, controller] of [...actionControllers]) {
@@ -83,6 +87,7 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
         if (!message) {
             throw new Error('Message not found.');
         }
+        const savedLoras = Array.isArray(parent?.loras) ? parent.loras : [];
         const swipeId = message.swipe_id ?? 0;
         const beforeFingerprint = messageFingerprint(message);
         pipeline.cancelForMessage?.(messageId, swipeId);
@@ -91,11 +96,19 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
         const controllerKey = `${messageId}:${swipeId}`;
         actionControllers.set(controllerKey, controller);
 
+        let loras = [];
         let imageUrl;
         try {
+            if (savedLoras.length > 0) {
+                const loraState = await imageService.getAvailableLoras();
+                loras = resolveReplayLoras(savedLoras, loraState.names, dropped => {
+                    toast(t`Some LoRAs are unavailable and were skipped: ${dropped.join(', ')}`, 'warning');
+                }).loras;
+            }
             imageUrl = await imageService.generate(prompt, {
                 characterName: String(message.name || ''),
                 signal: controller.signal,
+                loras,
             });
         } finally {
             if (actionControllers.get(controllerKey) === controller) {
@@ -122,6 +135,7 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
             parentId: parent.id,
             anchorAfter: replaceRecord.anchorAfter,
             anchorBefore: replaceRecord.anchorBefore,
+            loras,
         });
         currentMessage.mes = replaceIllustrationMarkup(currentMessage.mes, replaceRecord.id, buildImageTag({
             id: record.id,
@@ -138,7 +152,7 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
     }
 
     async function requestPrompt(initialPrompt) {
-        const result = await callGenericPopup(t`Image prompt`, POPUP_TYPE.INPUT, initialPrompt);
+        const result = await callGenericPopup(t`Image prompt`, POPUP_TYPE.INPUT, initialPrompt, { rows: 6 });
         if (result === false || result === null || result === undefined) {
             return null;
         }
@@ -158,7 +172,7 @@ export function initIllustrationActions({ context, pipeline, imageService, setti
                 return;
             }
             console.error('Illustration action failed.', error);
-            toast(`${t`Illustration failed`}: ${error?.message || error}`, 'error');
+            reportError(`${t`Illustration failed`}: ${error?.message || error}`);
         }
     }
 

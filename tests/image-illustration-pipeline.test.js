@@ -6,6 +6,10 @@ import {
     messageFingerprint, getLastAssistantMessage, buildJobKey, createIllustrationPipeline,
 } from '../public/scripts/extensions/stable-diffusion/illustration/pipeline.js';
 
+// The jsdom environment used by this suite predates the platform clone helper
+// the illustration modules call; the values cloned here are plain data.
+globalThis.structuredClone ??= value => JSON.parse(JSON.stringify(value));
+
 const SETTINGS = {
     enabled: true,
     autoGenerate: true,
@@ -32,31 +36,55 @@ function makeMessage(extra = {}) {
     };
 }
 
-function makeHarness({ message, generate, confirmReplace, activityJob } = {}) {
+function makeHarness({ message, generate, confirmReplace, activityJob, generateTaskResult, notifyError } = {}) {
     const chat = [message];
     const toasts = [];
-    const calls = { generateTask: 0, confirmReplace: 0, activityJobs: [], messageChanges: [] };
+    const errors = [];
+    const calls = {
+        generateTask: 0,
+        taskArgs: [],
+        generateOptions: [],
+        confirmReplace: 0,
+        activityJobs: [],
+        messageChanges: [],
+    };
     const pipeline = createIllustrationPipeline({
         context: {
             chat,
             chatId: 'chat-1',
-            generateTask: async () => {
+            generateTask: async taskArgs => {
                 calls.generateTask += 1;
-                return {
+                calls.taskArgs.push(taskArgs);
+                return generateTaskResult ?? {
                     toolCalls: [{
                         name: 'add_image_prompt',
-                        args: { prompt: 'new prompt', insert_after: 'alpha', insert_before: 'beta' },
+                        args: {
+                            prompt: 'new prompt',
+                            insert_after: 'alpha',
+                            insert_before: 'beta',
+                            loras: [{ name: 'a.safetensors', weight: 0.8 }],
+                        },
                     }],
                 };
             },
         },
         imageService: {
             configure() {},
-            generate: async prompt => generate(prompt),
+            getAvailableLoras: async () => ({ names: ['a.safetensors'], includeWeight: true }),
+            generate: async (prompt, options) => {
+                calls.generateOptions.push(options);
+                return generate(prompt, options);
+            },
         },
         settings: SETTINGS,
         hooks: {
             toast: text => toasts.push(text),
+            notifyError: message => {
+                errors.push(String(message));
+                if (typeof notifyError === 'function') {
+                    notifyError(message);
+                }
+            },
             t: (strings, ...values) => strings.reduce((out, string, index) => out + string + (values[index] ?? ''), ''),
             saveChat: async () => {},
             updateMessageBlock: () => {},
@@ -78,7 +106,7 @@ function makeHarness({ message, generate, confirmReplace, activityJob } = {}) {
                 : undefined,
         },
     });
-    return { pipeline, chat, toasts, calls };
+    return { pipeline, chat, toasts, errors, calls };
 }
 
 function makeFakeActivityJob() {
@@ -201,7 +229,7 @@ test('illustration jobs open activity rounds before the prompt request and repor
 test('failed illustration images keep the round open with an error section', async () => {
     const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
     const activityJob = makeFakeActivityJob();
-    const { pipeline } = makeHarness({
+    const { pipeline, errors } = makeHarness({
         message,
         generate: async () => { throw new Error('upstream refused'); },
         activityJob,
@@ -217,5 +245,145 @@ test('failed illustration images keep the round open with an error section', asy
         key: 'error-0', kind: 'error', title: 'Error 1', body: 'upstream refused', meta: null,
     });
     expect(activityJob.calls.finished).toEqual(['failed']);
+    expect(errors).toEqual(['Image generation failed for 1 prompt(s). upstream refused']);
 });
 
+test('rejected prompts fail the round and surface the rejection reason', async () => {
+    const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
+    const activityJob = makeFakeActivityJob();
+    const { pipeline, calls, errors } = makeHarness({
+        message,
+        generate: async () => {
+            throw new Error('image generation must not run');
+        },
+        activityJob,
+        generateTaskResult: {
+            toolCalls: [{
+                name: 'add_image_prompt',
+                args: { prompt: 'new prompt', insert_after: 'missing-after', insert_before: 'missing-before' },
+            }],
+            assistantText: '',
+            finishReason: 'stop',
+        },
+    });
+
+    await pipeline.runForMessage({ messageId: 0, source: 'manual' });
+
+    expect(calls.generateTask).toBe(1);
+    expect(message.mes).toBe('alpha beta');
+    expect(activityJob.calls.sections).toEqual([]);
+    expect(activityJob.calls.finished).toEqual(['failed']);
+    expect(activityJob.calls.errors).toHaveLength(1);
+    expect(activityJob.calls.errors[0]).toContain('No image prompts could be used: quoted text not found ×1.');
+    expect(activityJob.calls.errors[0]).toContain('Rejected calls:');
+    expect(activityJob.calls.errors[0]).toContain('new prompt');
+    expect(errors).toEqual([
+        'Illustration failed: No image prompts could be used: quoted text not found ×1.',
+    ]);
+});
+
+test('a text-only model reply fails the round instead of finishing quietly', async () => {
+    const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
+    const activityJob = makeFakeActivityJob();
+    const { pipeline, errors } = makeHarness({
+        message,
+        generate: async () => {
+            throw new Error('image generation must not run');
+        },
+        activityJob,
+        generateTaskResult: {
+            toolCalls: [],
+            assistantText: 'I cannot illustrate this.',
+            finishReason: 'stop',
+        },
+    });
+
+    await pipeline.runForMessage({ messageId: 0, source: 'manual' });
+
+    expect(activityJob.calls.finished).toEqual(['failed']);
+    expect(activityJob.calls.errors[0]).toContain('The model replied with text but did not call add_image_prompt.');
+    expect(errors).toEqual([
+        'Illustration failed: The model replied with text but did not call add_image_prompt.',
+    ]);
+});
+
+test('the prompt tool offers the LoRA catalog state reported by the image service', async () => {
+    const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
+    const { pipeline, calls } = makeHarness({
+        message,
+        generate: async () => '/user/images/new.png',
+    });
+
+    await pipeline.runForMessage({ messageId: 0, source: 'manual' });
+
+    expect(calls.taskArgs).toHaveLength(1);
+    const [tool] = calls.taskArgs[0].tools;
+    expect(tool.function.name).toBe('add_image_prompt');
+    const loras = tool.function.parameters.properties.loras;
+    expect(loras.items.properties.name.enum).toEqual(['a.safetensors']);
+    expect(loras.items.properties).toHaveProperty('weight');
+});
+
+test('the LoRA selection reaches image generation and the stored record', async () => {
+    const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
+    const { pipeline, calls } = makeHarness({
+        message,
+        generate: async () => '/user/images/new.png',
+    });
+
+    await pipeline.runForMessage({ messageId: 0, source: 'manual' });
+
+    expect(calls.generateOptions).toEqual([{
+        characterName: 'Seraphina',
+        signal: expect.anything(),
+        loras: [{ name: 'a.safetensors', weight: 0.8 }],
+    }]);
+    expect(message.extra.illustrations[0].loras).toEqual([{ name: 'a.safetensors', weight: 0.8 }]);
+});
+
+test('a failed image keeps the LoRA selection on its record', async () => {
+    const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
+    const { pipeline } = makeHarness({
+        message,
+        generate: async () => {
+            throw new Error('upstream refused');
+        },
+    });
+
+    await pipeline.runForMessage({ messageId: 0, source: 'manual' });
+
+    expect(message.extra.illustrations[0]).toMatchObject({
+        status: 'failed',
+        loras: [{ name: 'a.safetensors', weight: 0.8 }],
+    });
+});
+
+test('a prompt naming an unavailable LoRA fails the round with the helper message', async () => {
+    const message = makeMessage({ mes: 'alpha beta', swipes: ['alpha beta'] });
+    const activityJob = makeFakeActivityJob();
+    const { pipeline, errors } = makeHarness({
+        message,
+        generate: async () => {
+            throw new Error('image generation must not run');
+        },
+        activityJob,
+        generateTaskResult: {
+            toolCalls: [{
+                name: 'add_image_prompt',
+                args: {
+                    prompt: 'new prompt',
+                    insert_after: 'alpha',
+                    insert_before: 'beta',
+                    loras: [{ name: 'b.safetensors' }],
+                },
+            }],
+        },
+    });
+
+    await pipeline.runForMessage({ messageId: 0, source: 'manual' });
+
+    expect(activityJob.calls.finished).toEqual(['failed']);
+    expect(errors).toEqual([
+        'Illustration failed: No image prompts could be used: unknown LoRA \'b.safetensors\' ×1.',
+    ]);
+});

@@ -4,6 +4,10 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ## Unreleased
 
+### Connections & Models
+
+- Added a network proxy setting to chat completion connection profiles, taking precedence over the global proxy.
+
 ### Image generation
 
 - Fixed AI Illustration settings labels being squeezed into vertical text.
@@ -18,11 +22,18 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 - Fixed CardApp failing to list and read preset documents.
 
+### Memory Graph
+
+- Allowed Memory Graph crawl candidate limit to be set to 0 for no limit.
+- Changed Memory Graph read API view fields to snake_case.
+- Aligned Memory Graph extraction, crawl, and compression prompts with the fields the runtime provides.
+
 ### Fixes
 
 - Fixed Memory Graph LLM recall not drilling into always-inject event rollups.
 - Fixed Memory Graph RAG recall filtering always-inject nodes after the per-type quota.
 - Fixed the Diagnostics menu overflowing the right edge on narrow screens.
+- Fixed chat rename failures not showing the server's reason.
 
 ### Storage & Sync
 
@@ -32,7 +43,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ### Client Apps
 
-- Optimized first-launch startup speed and storage usage in the iOS, HarmonyOS, and Android apps.
+- Optimized first-launch startup speed and storage usage in the iOS and Android apps.
 - Fixed the app failing to start when local service preparation was interrupted in the iOS and Android apps.
 - Fixed app updates wiping installed server plugins and third-party extensions in the HarmonyOS app.
 - Added retry and diagnostics export actions to the startup failure screen in the HarmonyOS app.
