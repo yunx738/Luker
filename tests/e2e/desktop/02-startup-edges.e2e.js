@@ -4,6 +4,8 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import net from 'node:net';
 import { launchLukerDesktop } from '../_lib/desktop.js';
+import { reservePort } from '../_lib/ports.js';
+import { cloneDataDir } from '../_lib/server.js';
 import { awaitMainUI } from '../_lib/page.js';
 
 const SEED_CONFIG = resolve(import.meta.dirname, '../../../default/config.yaml');
@@ -37,6 +39,28 @@ test('a busy preferred port does not stop startup', async () => {
     expect(d.port).not.toBe(8000);
     await d.close();
     await new Promise(r => blocker.close(r));
+});
+
+test('a port configured in config.yaml is used when no CLI port is passed', async () => {
+    const customPort = await reservePort('desktop');
+    const userData = mkdtempSync(join(tmpdir(), 'luker-desktop-configport-'));
+    cloneDataDir(join(userData, 'data'));
+    const seed = readFileSync(SEED_CONFIG, 'utf8');
+    const config = seed.replace(/^port:\s*\d+$/m, `port: ${customPort}`);
+    expect(config).not.toBe(seed);
+    writeFileSync(join(userData, 'config.yaml'), config);
+
+    const d = await launchLukerDesktop({
+        scenarioId: 'config-port',
+        userData,
+        passPort: false,
+    });
+    try {
+        expect(d.port).toBe(customPort);
+    } finally {
+        await d.close();
+        rmSync(userData, { recursive: true, force: true });
+    }
 });
 
 test('the boot log stops growing once the server is up', async () => {
@@ -76,8 +100,59 @@ test('a backend that fails after its module graph starts shows the error in the 
     const d = await launchLukerDesktop({ scenarioId: 'late-failure', userData });
     await expect(d.page.locator('body'))
         .toContainText(join(userData, 'data', 'luker-boot.log'));
-    await d.close();
+    await expect(d.page.locator('#boot-log'))
+        .toContainText('at least IPv6 or IPv4 must be enabled');
+    // Closing a failed startup window exits the app instead of hiding a dead shell to the tray.
+    const exitPromise = d.waitForExit();
+    await d.electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
+    await exitPromise;
     rmSync(userData, { recursive: true, force: true });
+});
+
+test('the startup failure screen allows opening the data directory and saving a new port before retry', async () => {
+    const seed = readFileSync(SEED_CONFIG, 'utf8');
+    const config = seed
+        .replace(/^port:\s*\d+$/m, 'port: 8456')
+        .replace(
+            /^protocol:\n(?: {4}ipv[46]: (?:true|false)\n)+/m,
+            'protocol:\n    ipv4: false\n    ipv6: false\n',
+        );
+    const userData = mkdtempSync(join(tmpdir(), 'luker-desktop-failure-recovery-'));
+    writeFileSync(join(userData, 'config.yaml'), config);
+
+    const d = await launchLukerDesktop({
+        scenarioId: 'failure-recovery',
+        userData,
+        passPort: false,
+        extraEnv: {
+            LUKER_DESKTOP_SKIP_OPEN_DATA_DIR: '1',
+            LUKER_DESKTOP_TEST_NO_RELAUNCH: '1',
+        },
+    });
+    let exited = false;
+    try {
+        await expect(d.page.locator('#boot-log'))
+            .toContainText('at least IPv6 or IPv4 must be enabled');
+        await expect(d.page.locator('#startup-port')).toBeVisible();
+        await expect(d.page.locator('#startup-port')).toHaveValue('8456');
+
+        await d.page.locator('#startup-open-data-dir').click();
+        const opened = await d.electronApp.evaluate(() => globalThis.__lukerDataDirectoryOpens);
+        expect(opened).toEqual([userData]);
+
+        await d.page.locator('#startup-port').fill('9345');
+        const exitPromise = d.waitForExit();
+        await d.page.locator('#startup-retry').click();
+        await exitPromise;
+        exited = true;
+
+        expect(readFileSync(join(userData, 'config.yaml'), 'utf8')).toContain('port: 9345');
+    } finally {
+        if (!exited) {
+            await d.close();
+        }
+        rmSync(userData, { recursive: true, force: true });
+    }
 });
 
 test('a storage mode the packaged build cannot load shows the error in the window', async () => {

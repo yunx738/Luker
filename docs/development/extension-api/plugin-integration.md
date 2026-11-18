@@ -4,23 +4,42 @@ APIs that connect plugins to Luker's pipelines and to each other: regex processi
 
 ## Regex Runtime API
 
-Plugins can register regex rules that live only in memory. They take part in every regex pass alongside the user's own rules and are never written to the user's regex list. The regex engine module exports two registration functions.
+Plugins register in-memory regex rules, run regex passes, and inspect or persist scoped regex scripts through `Luker.getContext().regex` without importing the regex extension's internal files. Runtime rules participate in every regex pass alongside user rules and are never written to the user's regex list.
+
+### `context.regex` methods and enums
+
+| Property | Kind | Description |
+|----------|------|-------------|
+| `applyRegex(rawString, placement, params?)` | Function | Runs all matching regex rules for the given placement and pass flags. |
+| `runRegexScript(regexScript, rawString, options?)` | Function | Executes a single regex script object against `rawString`. |
+| `placement` | Enum | Placement constants: `USER_INPUT`, `AI_OUTPUT`, `SLASH_COMMAND`, `WORLD_INFO`, `REASONING`. |
+| `substituteFindRegex` | Enum | Macro substitution modes for `findRegex`: `NONE`, `RAW`, `ESCAPED`. |
+| `SCRIPT_TYPES` | Enum | Persisted script scopes: `GLOBAL`, `PRESET`, `SCOPED`. |
+| `registerRegexProvider(owner, provider, options?)` | Function | Registers a callback evaluated on each regex pass and returns `{ refresh, unregister }`. |
+| `registerManagedRegexProvider(owner, options?)` | Function | Registers an engine-managed script set and returns `{ upsertScript, setScripts, removeScript, clearScripts, unregister }`. |
+| `unregisterRegexProvider(owner)` | Function | Removes a registered runtime or managed regex provider by owner ID. |
+| `getScripts(options?)` | Function | Lists active persisted and runtime regex scripts. |
+| `getScriptsByType(scriptType, options?)` | Function | Lists persisted regex scripts in a single `SCRIPT_TYPES` scope without invoking runtime providers. |
+| `saveScriptsByType(scripts, scriptType)` | Function | Persists an updated script array to the specified `SCRIPT_TYPES` scope. |
+| `getPluginLanes(script)` | Function | Extracts normalized `'request'` and `'reply'` plugin lanes from a script record. |
+| `omitLegacyPluginScope(script)` | Function | Returns a shallow copy with legacy `pluginOnly` fields stripped before saving. |
+| `normalizePluginScriptRecord(script)` | Function | Normalizes a script record so `pluginLanes` is populated consistently. |
 
 ### registerRegexProvider
 
-Use this when the rule set is derived from current state and should be recomputed on demand. The callback runs on every regex pass, so it always sees the current chat, character, and settings.
+Use this when the rule set is derived from current state and recomputed on demand. The callback runs on every regex pass and always sees the current chat, character, and settings.
 
 ```js
-import { registerRegexProvider } from '../../extensions/regex/engine.js';
+const { regex } = Luker.getContext();
 
-const registration = registerRegexProvider('my-plugin', () => [
+const registration = regex.registerRegexProvider('my-plugin', () => [
   {
     id: 'my-rule-1',
     scriptName: 'My Regex Rule',
     findRegex: '/foo/g',
     replaceString: 'bar',
     trimStrings: [],
-    placement: [1, 2],
+    placement: [regex.placement.USER_INPUT, regex.placement.AI_OUTPUT],
   },
 ]);
 
@@ -33,12 +52,12 @@ registration.unregister();
 
 ### registerManagedRegexProvider
 
-Use this when the engine should own the script storage. The returned handle manages one script set per plugin.
+Use this when the engine owns the script storage. The returned handle manages one script set per plugin.
 
 ```js
-import { registerManagedRegexProvider } from '../../extensions/regex/engine.js';
+const { regex } = Luker.getContext();
 
-const handle = registerManagedRegexProvider('my-plugin', {
+const handle = regex.registerManagedRegexProvider('my-plugin', {
   reloadOnChange: true,
 });
 
@@ -48,7 +67,7 @@ handle.upsertScript({
   findRegex: '/foo/g',
   replaceString: 'bar',
   trimStrings: [],
-  placement: [1, 2],
+  placement: [regex.placement.USER_INPUT, regex.placement.AI_OUTPUT],
 });
 handle.setScripts([ /* full replacement */ ]);
 handle.removeScript('my-rule-1');
@@ -81,21 +100,27 @@ handle.unregister();
 
 ## Search Tools API
 
-The search plugin exposes its API through the `Luker.searchTools` global object so other plugins can leverage search capabilities:
+The search plugin publishes a cross-extension service via `context.registerExtensionApi('search-tools', ...)` and also exposes `Luker.searchTools` for function-calling tool metadata:
 
 ```js
-// Check whether the search plugin is available
+const searchApi = Luker.getContext().getExtensionApi('search-tools');
+if (searchApi) {
+  const caps = searchApi.getActiveProviderCapabilities();
+  const webResults = await searchApi.search({ query: 'character setting' });
+  if (caps.supportsImageSearch) {
+    const images = await searchApi.searchImages({ query: 'character reference sheet' });
+  }
+  const pageImages = await searchApi.extractPageImages({ url: 'https://example.com/wiki/Character' });
+}
+
 if (globalThis?.Luker?.searchTools) {
-  // Get the list of available search tool names
   const toolNames = Luker.searchTools.toolNames;
-  // Get tool definitions (for function calling)
   const toolDefs = Luker.searchTools.getToolDefs();
-  // Check whether a tool name belongs to search tools
-  const isSearchTool = Luker.searchTools.isToolName('web_search');
+  const isSearchTool = Luker.searchTools.isToolName('luker_web_image_search');
 }
 ```
 
-`Luker.searchTools` exposes tool definition metadata; actual search execution happens via the internal tool-calling loop. See [Search Tools](/features/search-tools) for details.
+See [Search Tools](/features/search-tools) and [Image Generation API](/development/extension-api/image-generation) for full method signatures.
 
 ## Inter-Extension Communication
 

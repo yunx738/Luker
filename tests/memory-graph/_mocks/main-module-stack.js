@@ -24,7 +24,7 @@ import { jest } from '@jest/globals';
 // Return a chainable stub so top-level code like
 // `jQuery(document).off('click.foo').on('click.foo', ...)` in
 // public/scripts/extensions/luker-tabs.js (transitively imported via
-// memory-graph/ui-templates.js) doesn't blow up at module-load time.
+// memory-graph) doesn't blow up at module-load time.
 // Any prop access returns a callable that returns the same chain.
 globalThis.jQuery = (cb) => {
     if (typeof cb === 'function') { /* swallow DOM-ready callback */ }
@@ -95,15 +95,6 @@ jest.unstable_mockModule('../../public/scripts/extensions.js', () => ({
     registerExtensionApi: () => {},
     UNSET_VALUE: Symbol('UNSET_VALUE'),
 }));
-jest.unstable_mockModule('../../public/scripts/extensions/memory-graph/config-iteration/studio.js', () => ({
-    openConfigIterationStudio: () => Promise.resolve(),
-}));
-// graph-iteration/studio.js is the sibling studio boundary wired into
-// main.js (its iteration-library chain reaches public/lib.js, which has no
-// jest stub for relative `lib.js` specifiers). Stub it like the schema one.
-jest.unstable_mockModule('../../public/scripts/extensions/memory-graph/graph-iteration/studio.js', () => ({
-    openGraphIterationStudio: () => Promise.resolve(),
-}));
 jest.unstable_mockModule('../../public/scripts/power-user.js', () => ({
     performFuzzySearch: () => [],
 }));
@@ -119,10 +110,6 @@ jest.unstable_mockModule('../../public/scripts/world-info.js', () => ({
 jest.unstable_mockModule('../../public/scripts/i18n.js', () => ({
     addLocaleData: () => {}, translate: (k) => k,
     getCurrentLocale: () => 'en-US', t: (k) => k,
-}));
-jest.unstable_mockModule('../../public/scripts/extensions/regex/engine.js', () => ({
-    registerManagedRegexProvider: () => ({ dispose: () => {} }),
-    regex_placement: {}, substitute_find_regex: () => '',
 }));
 jest.unstable_mockModule(
     '../../public/scripts/extensions/connection-manager/profile-resolver.js',

@@ -1,6 +1,10 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test, expect } from '@playwright/test';
 import { startServer, tearDownServer } from '../_lib/server.js';
 import { awaitMainUI, reloadAndAwait } from '../_lib/page.js';
+
+test.describe.configure({ mode: 'serial' });
 
 let server;
 
@@ -44,10 +48,20 @@ test('revalidates unchanged settings fields after a real toggle', async ({ page 
     await toggle.scrollIntoViewIfNeeded();
 
     const initiallyChecked = await toggle.isChecked();
-    const saveResponse = page.waitForResponse(response =>
+    const firstSaveResponse = page.waitForResponse(response =>
         response.url().includes('/api/settings/') && response.request().method() === 'POST');
     await toggle.setChecked(!initiallyChecked);
-    expect((await saveResponse).ok()).toBe(true);
+    expect((await firstSaveResponse).ok()).toBe(true);
+
+    const secondSaveResponse = page.waitForResponse(response =>
+        response.url().includes('/api/settings/patch') && response.request().method() === 'POST');
+    await toggle.setChecked(initiallyChecked);
+    expect((await secondSaveResponse).ok()).toBe(true);
+
+    const thirdSaveResponse = page.waitForResponse(response =>
+        response.url().includes('/api/settings/patch') && response.request().method() === 'POST');
+    await toggle.setChecked(!initiallyChecked);
+    expect((await thirdSaveResponse).ok()).toBe(true);
 
     const reloadMarker = network.length;
     await reloadAndAwait(page, server.baseURL);
@@ -62,4 +76,34 @@ test('revalidates unchanged settings fields after a real toggle', async ({ page 
         return entry.fromDiskCache || Boolean(headers['If-None-Match']);
     })).toBe(true);
     expect(reloadNetwork.some(entry => entry.url.endsWith('/api/settings/get'))).toBe(false);
+});
+
+test('defers non-selected preset preload past welcome screen without re-fetching the active preset', async ({ page }) => {
+    const presetDir = join(server.dataRoot, 'default-user', 'OpenAI Settings');
+    mkdirSync(presetDir, { recursive: true });
+    writeFileSync(join(presetDir, 'Secondary_A.json'), JSON.stringify({
+        temperature: 1.23,
+        openai_max_context: 4096,
+        openai_max_tokens: 300,
+    }));
+
+    const requestOrder = [];
+    page.on('request', request => {
+        requestOrder.push(request.url());
+    });
+
+    await awaitMainUI(page, server.baseURL);
+    await expect.poll(() => requestOrder.filter(url =>
+        url.includes('/api/presets/get?') && url.includes('apiId=openai') && url.includes('name=Secondary_A')).length,
+    { timeout: 15_000 }).toBe(1);
+
+    const activePresetFetches = requestOrder.filter(url =>
+        url.includes('/api/presets/get?') && url.includes('apiId=openai') && url.includes('name=Default'));
+    expect(activePresetFetches).toHaveLength(1);
+
+    const welcomePanelIndex = requestOrder.findIndex(url => url.includes('welcomePanel.html'));
+    const secondaryPresetIndex = requestOrder.findIndex(url =>
+        url.includes('/api/presets/get?') && url.includes('apiId=openai') && url.includes('name=Secondary_A'));
+    expect(welcomePanelIndex).toBeGreaterThanOrEqual(0);
+    expect(secondaryPresetIndex).toBeGreaterThan(welcomePanelIndex);
 });

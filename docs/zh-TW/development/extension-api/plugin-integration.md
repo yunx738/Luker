@@ -4,27 +4,46 @@
 
 ## 正則執行時 API
 
-外掛可以註冊只存在於記憶體中的正則規則。這些規則和使用者自己的規則一起參與每一次正則處理，不會寫入使用者的正則清單。正則引擎模組匯出兩個註冊函式。
+外掛統一透過 `Luker.getContext().regex` 註冊記憶體態正則規則、執行正則改寫以及讀寫各作用域腳本，無需直接匯入正則擴充功能內部檔案。執行時規則與使用者規則一同參與每次正則處理，不會寫入使用者的持久化正則清單。
+
+### `context.regex` 介面與列舉
+
+| 屬性 | 型別 | 說明 |
+|------|------|------|
+| `applyRegex(rawString, placement, params?)` | 函式 | 依指定影響條目與通道參數執行全部匹配的正則規則 |
+| `runRegexScript(regexScript, rawString, options?)` | 函式 | 對輸入字串單獨執行一條正則腳本物件 |
+| `placement` | 列舉 | 影響條目常數：`USER_INPUT`、`AI_OUTPUT`、`SLASH_COMMAND`、`WORLD_INFO`、`REASONING` |
+| `substituteFindRegex` | 列舉 | `findRegex` 巨集替換模式：`NONE`、`RAW`、`ESCAPED` |
+| `SCRIPT_TYPES` | 列舉 | 持久化腳本作用域：`GLOBAL`、`PRESET`、`SCOPED` |
+| `registerRegexProvider(owner, provider, options?)` | 函式 | 註冊依需求計算的執行時規則回呼，回傳 `{ refresh, unregister }` |
+| `registerManagedRegexProvider(owner, options?)` | 函式 | 註冊由引擎託管儲存的執行時腳本集，回傳 `{ upsertScript, setScripts, removeScript, clearScripts, unregister }` |
+| `unregisterRegexProvider(owner)` | 函式 | 依 owner 識別碼註銷執行時或託管正則提供者 |
+| `getScripts(options?)` | 函式 | 列出目前生效的持久化與執行時正則腳本 |
+| `getScriptsByType(scriptType, options?)` | 函式 | 依 `SCRIPT_TYPES` 作用域讀取持久化腳本清單，不觸發執行時回呼 |
+| `saveScriptsByType(scripts, scriptType)` | 函式 | 將更新後的腳本陣列儲存至指定 `SCRIPT_TYPES` 作用域 |
+| `getPluginLanes(script)` | 函式 | 擷取腳本正規化後的 `'request'` 與 `'reply'` 外掛通道清單 |
+| `omitLegacyPluginScope(script)` | 函式 | 回傳剝離舊版 `pluginOnly` 欄位後的淺拷貝物件 |
+| `normalizePluginScriptRecord(script)` | 函式 | 正規化腳本記錄並補齊 `pluginLanes` 欄位 |
 
 ### registerRegexProvider
 
-規則集合由目前狀態推導，需要隨時重新計算時使用。回呼在每次正則處理時執行，因此總能讀到目前的聊天、角色與設定。
+規則集合由目前狀態推導、需要隨時重新計算時使用。回呼在每次正則處理時執行，始終讀取目前的聊天、角色與設定。
 
 ```js
-import { registerRegexProvider } from '../../extensions/regex/engine.js';
+const { regex } = Luker.getContext();
 
-const registration = registerRegexProvider('my-plugin', () => [
+const registration = regex.registerRegexProvider('my-plugin', () => [
   {
     id: 'my-rule-1',
     scriptName: 'My Regex Rule',
     findRegex: '/foo/g',
     replaceString: 'bar',
     trimStrings: [],
-    placement: [1, 2],
+    placement: [regex.placement.USER_INPUT, regex.placement.AI_OUTPUT],
   },
 ]);
 
-// 重新計算會自動進行。refresh() 還會重新載入已渲染的聊天。
+// 重新計算自動執行，refresh() 同時重新整理已渲染的聊天訊息
 registration.refresh({ requestReload: true });
 
 // 卸載
@@ -33,12 +52,12 @@ registration.unregister();
 
 ### registerManagedRegexProvider
 
-希望由引擎保管腳本儲存時使用。回傳的句柄管理該外掛的一組腳本。
+由引擎保管腳本儲存時使用，回傳的句柄管理該外掛的腳本集合。
 
 ```js
-import { registerManagedRegexProvider } from '../../extensions/regex/engine.js';
+const { regex } = Luker.getContext();
 
-const handle = registerManagedRegexProvider('my-plugin', {
+const handle = regex.registerManagedRegexProvider('my-plugin', {
   reloadOnChange: true,
 });
 
@@ -48,7 +67,7 @@ handle.upsertScript({
   findRegex: '/foo/g',
   replaceString: 'bar',
   trimStrings: [],
-  placement: [1, 2],
+  placement: [regex.placement.USER_INPUT, regex.placement.AI_OUTPUT],
 });
 handle.setScripts([ /* 整組替換 */ ]);
 handle.removeScript('my-rule-1');
@@ -81,21 +100,27 @@ handle.unregister();
 
 ## 搜尋工具 API
 
-搜尋外掛透過 `Luker.searchTools` 全域物件暴露 API，供其他外掛呼叫搜尋能力：
+搜尋外掛透過 `context.registerExtensionApi('search-tools', ...)` 發布跨外掛服務，並透過 `Luker.searchTools` 暴露函式呼叫工具定義與執行入口：
 
 ```js
-// 檢查搜尋外掛是否可用
+const searchApi = Luker.getContext().getExtensionApi('search-tools');
+if (searchApi) {
+  const caps = searchApi.getActiveProviderCapabilities();
+  const webResults = await searchApi.search({ query: '角色設定' });
+  if (caps.supportsImageSearch) {
+    const images = await searchApi.searchImages({ query: '角色設定圖' });
+  }
+  const pageImages = await searchApi.extractPageImages({ url: 'https://example.com/wiki/Character' });
+}
+
 if (globalThis?.Luker?.searchTools) {
-  // 取得可用的搜尋工具名稱列表
   const toolNames = Luker.searchTools.toolNames;
-  // 取得工具定義（用於函數呼叫）
   const toolDefs = Luker.searchTools.getToolDefs();
-  // 檢查某個工具名是否屬於搜尋工具
-  const isSearchTool = Luker.searchTools.isToolName('web_search');
+  const isSearchTool = Luker.searchTools.isToolName('luker_web_image_search');
 }
 ```
 
-`Luker.searchTools` 暴露的是工具定義中繼資料，實際的搜尋執行透過內部的工具呼叫迴圈完成。詳見[搜尋外掛](/zh-TW/features/search-tools)。
+完整簽章參見[搜尋外掛](/zh-TW/features/search-tools)與[圖像生成 API](/zh-TW/development/extension-api/image-generation)。
 
 ## 擴充功能間通訊
 

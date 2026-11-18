@@ -40,6 +40,7 @@ export class MysqlTransaction {
     }
 
     async getResource(key)       { return this._h(key.kind, 'getResource').get(key); }
+    async readResource(key)      { return this._h(key.kind, 'readResource').read(key); }
     async putResource(key, rec)  { return this._h(key.kind, 'putResource').put(key, rec); }
     async deleteResource(key)    { return this._h(key.kind, 'deleteResource').delete(key); }
     async listResources(filter)  { return this._h(filter.kind, 'listResources').list(filter); }
@@ -304,6 +305,11 @@ export function registerSettingsHandler(tx) {
             if (!rows.length) return null;
             return coerceJson(rows[0].doc);
         },
+        async read(key) {
+            const [rows] = await conn.execute('SELECT doc FROM settings WHERE handle=?', [key.handle]);
+            if (!rows.length) return { exists: false };
+            return { exists: true, valid: true, value: coerceJson(rows[0].doc) };
+        },
         async getResourceField(key, segments) {
             const path = toSqlJsonPath(segments);
             const [rows] = await conn.execute(
@@ -369,6 +375,19 @@ export function registerPresetHandler(tx) {
             const parsed = coerceJson(rows[0].doc);
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
             return null;
+        },
+        async read(key) {
+            const p = presetKeyToParams(key);
+            const [rows] = await conn.execute(
+                'SELECT doc FROM presets WHERE handle=? AND dir_key=? AND name=?',
+                [p.handle, p.dir_key, p.name],
+            );
+            if (!rows.length) return { exists: false };
+            const parsed = coerceJson(rows[0].doc);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return { exists: true, valid: true, value: parsed };
+            }
+            return { exists: true, valid: false, detail: 'Preset document is not valid JSON.' };
         },
         async put(key, record) {
             assertSafeRepoNameShape(key.name, { field: 'preset.name' });
@@ -558,6 +577,18 @@ export function registerNamedDocHandler(tx) {
             const parsed = coerceJson(rows[0].doc);
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
             return parsed;
+        },
+        async read(key) {
+            const [rows] = await conn.execute(
+                'SELECT doc FROM named_docs WHERE handle=? AND bucket=? AND name=?',
+                [key.handle, key.bucket, key.name],
+            );
+            if (!rows.length) return { exists: false };
+            const parsed = coerceJson(rows[0].doc);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return { exists: true, valid: true, value: parsed };
+            }
+            return { exists: true, valid: false, detail: 'Document is not valid JSON.' };
         },
         async put(key, record) {
             assertSafeRepoNameShape(key.name, { field: 'named-doc.name' });

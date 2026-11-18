@@ -28,6 +28,8 @@ import {
 import {
     hydrateTextGenPresetData,
     textgenerationwebui_settings as textgen_settings,
+    textgenerationwebui_presets,
+    textgenerationwebui_preset_names,
     loadTextGenSettings,
     generateTextGenWithStreaming,
     getTextGenGenerationData,
@@ -117,6 +119,8 @@ import {
     hydrateOpenAIPresetData,
     loadOpenAISettings,
     oai_settings,
+    openai_settings,
+    openai_setting_names,
     openai_messages_count,
     chat_completion_sources,
     getChatCompletionModel,
@@ -342,7 +346,7 @@ import { initAccessibility } from './scripts/a11y.js';
 import { applyStreamFadeIn } from './scripts/util/stream-fadein.js';
 import { initDomHandlers } from './scripts/dom-handlers.js';
 import { SimpleMutex } from './scripts/util/SimpleMutex.js';
-import { applyPatch as applyJsonPatch, compare as compareJsonPatch } from './scripts/util/fast-json-patch.js';
+import { applyCommittedSnapshotOperations, applyPatch as applyJsonPatch, compare as compareJsonPatch } from './scripts/util/fast-json-patch.js';
 import { shouldUseSettingsPatch } from './scripts/util/settings-patch-threshold.js';
 import { cloneAsJsonWire } from './scripts/util/json-clone.js';
 import { AudioPlayer } from './scripts/audio-player.js';
@@ -358,6 +362,8 @@ import { bootSelfProfilerFromStorage } from './scripts/self-profiler.js';
 import { createLukerDelivery, installFetchProxy, installFetchProxyForAllIframes, installLifecycleHooks } from './scripts/ws-delivery.js';
 import { loadSettingsEnvelope } from './scripts/settings-resource-read.js';
 import { listPresetDocuments, loadPresetResources, readPresetDocument } from './scripts/named-resource-read.js';
+import { initWorkbench } from './scripts/workbench/index.js';
+import { listHydratedIndexedPresetNames, listHydratedOrderedPresetNames } from './scripts/util/preset-hydration.js';
 
 installFrontendLogCapture();
 initAndroidDebugTrail();
@@ -1477,8 +1483,9 @@ async function getClientVersion() {
         const data = await response.json();
         CLIENT_VERSION = data.agent;
         EXTENSIONS_CLIENT_VERSION = data.compatAgent || data.agent || EXTENSIONS_CLIENT_VERSION;
-        displayVersion = `Luker ${data.pkgVersion}`;
-        currentVersion = data.pkgVersion;
+        const lukerVersion = data.lukerVersion || data.pkgVersion;
+        displayVersion = `Luker ${lukerVersion}`;
+        currentVersion = lukerVersion;
 
         if (data.gitRevision && data.gitBranch) {
             displayVersion += ` '${data.gitBranch}' (${data.gitRevision})`;
@@ -2335,6 +2342,8 @@ async function firstLoadInit() {
         await yieldToBrowser();
     }
 
+    void warmPreloadFullSettings();
+
     console.debug('[init] startup tasks batch 2 start (extensions)');
     await runStartupTasks([
         () => initTextGenModelSelects(),
@@ -2372,6 +2381,7 @@ async function firstLoadInit() {
         () => initItemizedPrompts(),
         () => initAccessibility(),
         () => initSwipePicker(),
+        () => initWorkbench(),
         () => addDebugFunctions(),
         () => doDailyExtensionUpdatesCheck(),
         () => {
@@ -9097,24 +9107,35 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
             break;
         }
         case 'openai': {
-            let [prompt, counts] = await prepareOpenAIMessages({
-                name2: name2,
-                charDescription: description,
-                charPersonality: personality,
-                scenario: scenario,
-                worldInfoBeforeEntries: worldInfoBeforeEntries,
-                worldInfoAfterEntries: worldInfoAfterEntries,
-                extensionPrompts: extension_prompts,
-                bias: promptBias,
-                type: type,
-                quietPrompt: quiet_prompt,
-                quietImage: quietImage,
-                cyclePrompt: cyclePrompt,
-                systemPromptOverride: system,
-                jailbreakPromptOverride: jailbreak,
-                messages: oaiMessages,
-                messageExamples: oaiMessageExamples,
-            }, dryRun);
+            let prompt, counts;
+            try {
+                [prompt, counts] = await prepareOpenAIMessages({
+                    name2: name2,
+                    charDescription: description,
+                    charPersonality: personality,
+                    scenario: scenario,
+                    worldInfoBeforeEntries: worldInfoBeforeEntries,
+                    worldInfoAfterEntries: worldInfoAfterEntries,
+                    extensionPrompts: extension_prompts,
+                    bias: promptBias,
+                    type: type,
+                    quietPrompt: quiet_prompt,
+                    quietImage: quietImage,
+                    cyclePrompt: cyclePrompt,
+                    systemPromptOverride: system,
+                    jailbreakPromptOverride: jailbreak,
+                    messages: oaiMessages,
+                    messageExamples: oaiMessageExamples,
+                }, dryRun);
+            } catch (error) {
+                if (!dryRun) {
+                    if (type !== 'quiet') {
+                        notifyMessageFailure(String(error?.message || error || ''), String(name2 || ''));
+                    }
+                    unblockGeneration(type);
+                }
+                throw error;
+            }
             generate_data = { prompt: prompt };
 
             // TODO: move these side-effects somewhere else, so this switch-case solely sets generate_data
@@ -12258,7 +12279,6 @@ const chatStateRequestCache = new Map();
 const presetStateRequestCache = new Map();
 const chatStateRequestGeneration = new Map();
 const presetStateRequestGeneration = new Map();
-let settingsGetCacheGeneration = 0;
 
 function normalizePresetStateApiId(apiId = '') {
     const normalized = String(apiId || (main_api === 'koboldhorde' ? 'kobold' : main_api) || '').trim();
@@ -12417,6 +12437,7 @@ function getChatMessageSnapshotKey(target = resolveChatStateTarget()) {
 
 let objectPatchWorker = null;
 let objectPatchWorkerSequence = 0;
+let objectPatchWorkerSettingsSeeded = false;
 const objectPatchWorkerPending = new Map();
 
 export function buildObjectPatchOperations(previousState, nextState, options = {}) {
@@ -12440,6 +12461,7 @@ function cleanupObjectPatchWorker(error = null) {
         objectPatchWorker.terminate();
         objectPatchWorker = null;
     }
+    objectPatchWorkerSettingsSeeded = false;
 
     if (objectPatchWorkerPending.size === 0) {
         return;
@@ -12552,6 +12574,63 @@ export async function buildObjectPatchOperationsAsync(previousState, nextState, 
         console.warn('Falling back to synchronous object patch diff', error);
         return buildObjectPatchOperations(previous, next, { maxOperations });
     }
+}
+
+async function diffSerializedSettingsWithWorker(previousSnapshot, nextSerialized, options = {}) {
+    const maxOperations = Number.isInteger(options?.maxOperations) && options.maxOperations > 0
+        ? options.maxOperations
+        : 4000;
+    const timeoutMs = Number.isInteger(options?.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : 15000;
+
+    const worker = ensureObjectPatchWorker();
+    if (!worker) {
+        return null;
+    }
+
+    const id = ++objectPatchWorkerSequence;
+    const operations = await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            objectPatchWorkerPending.delete(id);
+            reject(new Error('Object patch worker timeout'));
+        }, timeoutMs);
+
+        objectPatchWorkerPending.set(id, { resolve, reject, timeoutId });
+
+        try {
+            worker.postMessage({
+                id,
+                action: 'diffSerializedSnapshot',
+                snapshotKey: 'settings',
+                nextSerialized,
+                maxOperations,
+                attachTests: true,
+                ...(objectPatchWorkerSettingsSeeded
+                    ? {}
+                    : { previousSerialized: JSON.stringify(previousSnapshot) }),
+            });
+        } catch (error) {
+            clearTimeout(timeoutId);
+            objectPatchWorkerPending.delete(id);
+            reject(error);
+        }
+    });
+
+    objectPatchWorkerSettingsSeeded = true;
+    return {
+        operations,
+        commit() {
+            if (objectPatchWorker === worker) {
+                worker.postMessage({ action: 'commitSnapshot', stageId: id });
+            }
+        },
+        discard() {
+            if (objectPatchWorker === worker) {
+                worker.postMessage({ action: 'discardSnapshot', stageId: id });
+            }
+        },
+    };
 }
 
 function decodeJsonPointerSegment(segment) {
@@ -15796,34 +15875,10 @@ function reloadLoop() {
 ///////////////////////////////////////////
 const SETTINGS_GET_ENDPOINT = '/api/settings/get';
 let settingsGetRequestInterceptorInstalled = false;
-let settingsGetResponseCache = null;
-let settingsGetRequestPromise = null;
-
-function buildSettingsGetCachedResponse() {
-    if (!settingsGetResponseCache) {
-        return null;
-    }
-
-    return new Response(settingsGetResponseCache.body, {
-        headers: new Headers(settingsGetResponseCache.headers),
-        status: settingsGetResponseCache.status,
-        statusText: settingsGetResponseCache.statusText,
-    });
-}
-
-async function cacheSettingsGetResponse(response) {
-    const clone = response.clone();
-    return {
-        body: await clone.text(),
-        headers: Array.from(response.headers.entries()),
-        status: response.status,
-        statusText: response.statusText,
-    };
-}
 
 function isSettingsGetRequest(input, init = {}) {
     const request = input instanceof Request ? input : null;
-    const method = String(init.method ?? request?.method ?? 'GET').toUpperCase();
+    const method = String(init?.method ?? request?.method ?? 'GET').toUpperCase();
     if (method !== 'POST') {
         return false;
     }
@@ -15837,12 +15892,6 @@ function isSettingsGetRequest(input, init = {}) {
     }
 }
 
-function invalidateSettingsGetResponseCache() {
-    settingsGetCacheGeneration += 1;
-    settingsGetRequestPromise = null;
-    settingsGetResponseCache = null;
-}
-
 function installSettingsGetRequestInterceptor() {
     if (settingsGetRequestInterceptorInstalled) {
         return;
@@ -15854,52 +15903,41 @@ function installSettingsGetRequestInterceptor() {
             return await baseFetch(input, init);
         }
 
-        const cachedResponse = buildSettingsGetCachedResponse();
-        if (cachedResponse) {
-            return cachedResponse;
-        }
-
-        if (!settingsGetRequestPromise) {
-            const requestGeneration = settingsGetCacheGeneration;
-            settingsGetRequestPromise = (async () => {
-                const response = await baseFetch(input, init);
-                const cached = await cacheSettingsGetResponse(response);
-                if (response.ok && requestGeneration === settingsGetCacheGeneration) {
-                    settingsGetResponseCache = cached;
-                }
-                return cached;
-            })().finally(() => {
-                settingsGetRequestPromise = null;
+        const request = input instanceof Request ? input : null;
+        const signal = init?.signal ?? request?.signal;
+        try {
+            const envelope = await loadSettingsEnvelope({ bootstrap: false, signal });
+            return new Response(JSON.stringify(envelope), {
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                status: 200,
+                statusText: 'OK',
+            });
+        } catch (error) {
+            if (error?.name === 'AbortError' || !Number.isInteger(error?.status)) {
+                throw error;
+            }
+            return new Response(JSON.stringify({
+                code: error.code || 'http_error',
+                detail: error.detail || error.message || '',
+            }), {
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                status: error.status,
             });
         }
-
-        const requestCache = await settingsGetRequestPromise;
-        return new Response(requestCache.body, {
-            headers: new Headers(requestCache.headers),
-            status: requestCache.status,
-            statusText: requestCache.statusText,
-        });
     };
     settingsGetRequestInterceptorInstalled = true;
 }
 
-async function fetchSettingsPayload(endpoint, { silent = false } = {}) {
-    const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({}),
-        cache: 'no-cache',
-    });
-
-    if (!response.ok) {
+async function fetchSettingsEnvelope({ bootstrap = false, silent = false } = {}) {
+    try {
+        return await loadSettingsEnvelope({ bootstrap });
+    } catch (error) {
         if (!silent) {
             reloadLoop();
             toastr.error(t`Settings could not be loaded after multiple attempts. Please try again later.`);
         }
-        throw new Error(`Error getting settings from ${endpoint}`);
+        throw error;
     }
-
-    return response.json();
 }
 
 async function fetchBootstrapSnapshot() {
@@ -15922,12 +15960,21 @@ async function fetchBootstrapSnapshot() {
     }
 }
 
-function hydrateFullSettingsPresetData(data) {
-    hydrateKoboldPresetData(data);
-    hydrateNovelPresetData(data);
-    hydrateTextGenPresetData(data);
-    hydrateOpenAIPresetData(data);
+function hydrateFullSettingsPresetData(data, options = {}) {
+    hydrateKoboldPresetData(data, options);
+    hydrateNovelPresetData(data, options);
+    hydrateTextGenPresetData(data, options);
+    hydrateOpenAIPresetData(data, options);
     fullSettingsLoaded = true;
+}
+
+function collectHydratedPresetNamesByApi() {
+    return {
+        novel: listHydratedIndexedPresetNames(novelai_setting_names, novelai_settings),
+        openai: listHydratedIndexedPresetNames(openai_setting_names, openai_settings),
+        textgenerationwebui: listHydratedOrderedPresetNames(textgenerationwebui_preset_names, textgenerationwebui_presets),
+        kobold: listHydratedIndexedPresetNames(koboldai_setting_names, koboldai_settings),
+    };
 }
 
 async function warmPreloadFullSettings() {
@@ -15941,8 +15988,9 @@ async function warmPreloadFullSettings() {
 
     fullSettingsLoadPromise = (async () => {
         try {
-            const data = await loadPresetResources({ complete: true });
-            hydrateFullSettingsPresetData(data);
+            const skipNames = collectHydratedPresetNamesByApi();
+            const data = await loadPresetResources({ complete: true, skipNames });
+            hydrateFullSettingsPresetData(data, { preserveExisting: true });
             return true;
         } catch (error) {
             console.warn('Deferred settings preload failed', error);
@@ -15967,9 +16015,11 @@ export async function ensureFullSettingsLoaded() {
 export async function getSettings(options = {}) {
     let onboardingTask = null;
     const useBootstrap = options?.bootstrap === true;
-    const data = options?.payload ?? await fetchSettingsPayload(useBootstrap ? '/api/settings/bootstrap' : '/api/settings/get');
+    const data = options?.payload ?? await fetchSettingsEnvelope({ bootstrap: useBootstrap });
 
-    if (!useBootstrap) {
+    if (useBootstrap) {
+        fullSettingsLoaded = false;
+    } else {
         hydrateFullSettingsPresetData(data);
     }
 
@@ -16115,9 +16165,7 @@ export async function getSettings(options = {}) {
         }
     }
     await validateDisabledSamplers();
-    const initialSettings = buildSettingsNode(getSettingsPayloadSource(), undefined, undefined, false, SETTINGS_DIFF_DEPTH);
-    rememberSettingsSnapshot(initialSettings.value);
-    rememberSettingsSectionCache(initialSettings.value, initialSettings.entry);
+    rememberSettingsSnapshot(buildSettingsPayload());
     settingsReady = true;
     await eventSource.emit(event_types.SETTINGS_LOADED);
 
@@ -16125,10 +16173,6 @@ export async function getSettings(options = {}) {
     // persistence of `firstRun = false`. Keeping a reference prevents the
     // unhandled-rejection warning if doOnboarding throws.
     void onboardingTask;
-
-    if (useBootstrap) {
-        void warmPreloadFullSettings();
-    }
 }
 
 function primeCharactersSnapshot(snapshot) {
@@ -16137,12 +16181,37 @@ function primeCharactersSnapshot(snapshot) {
         : null;
 }
 
-function rememberSettingsSnapshot(nextSettings = null) {
+function rememberSettingsSnapshot(nextSettings = null, { serialized = null, syncWorker = true } = {}) {
     if (!isPlainObject(nextSettings)) {
         settingsSnapshotCache = null;
+        objectPatchWorkerSettingsSeeded = false;
+        if (syncWorker && objectPatchWorker) {
+            try {
+                objectPatchWorker.postMessage({ action: 'setSnapshot', snapshotKey: 'settings', state: null });
+            } catch {
+                objectPatchWorkerSettingsSeeded = false;
+            }
+        }
         return;
     }
     settingsSnapshotCache = nextSettings;
+    if (!syncWorker) {
+        return;
+    }
+    if (objectPatchWorker) {
+        try {
+            objectPatchWorker.postMessage({
+                action: 'setSnapshot',
+                snapshotKey: 'settings',
+                serialized: typeof serialized === 'string' ? serialized : JSON.stringify(nextSettings),
+            });
+            objectPatchWorkerSettingsSeeded = true;
+        } catch {
+            objectPatchWorkerSettingsSeeded = false;
+        }
+    } else {
+        objectPatchWorkerSettingsSeeded = false;
+    }
 }
 
 function getSettingsSnapshot() {
@@ -16162,6 +16231,10 @@ function getSettingsSnapshot() {
 
 function mergeSettingsSaveOptions(baseOptions = null, overrideOptions = null) {
     return {
+        onSaved: () => {
+            baseOptions?.onSaved?.();
+            overrideOptions?.onSaved?.();
+        },
         asyncDiff: overrideOptions?.asyncDiff ?? baseOptions?.asyncDiff ?? true,
         directSave: overrideOptions?.directSave ?? baseOptions?.directSave ?? false,
     };
@@ -16169,6 +16242,7 @@ function mergeSettingsSaveOptions(baseOptions = null, overrideOptions = null) {
 
 function normalizeSettingsSaveOptions(options = null) {
     const normalized = {
+        onSaved: options?.onSaved,
         asyncDiff: options?.asyncDiff !== false && options?.diffMode !== 'sync',
         directSave: options?.directSave === true,
     };
@@ -16196,7 +16270,7 @@ export function requestAsyncDiffForNextSettingsSave() {
     }, 5000);
 }
 
-function getSettingsPayloadSource() {
+function buildRawSettingsObject() {
     return {
         firstRun: firstRun,
         accountStorage: accountStorage.getState(),
@@ -16224,93 +16298,14 @@ function getSettingsPayloadSource() {
         selected_proxy: selected_proxy,
     };
 }
-// Incremental settings diff. Each save used to JSON round-trip the whole
-// settings tree, deep-clone both trees again inside compare(), and clone the
-// previous tree once more to attach test ops -- several full passes over a
-// multi-MB object on the main thread. Now each section is serialized once,
-// unchanged sections reuse the previously parsed value (detected by string
-// equality against the last save), and only changed leaves are diffed.
-const SETTINGS_DIFF_DEPTH = 4;
-let settingsSectionCache = null;
 
-function escapeSettingsPointerSegment(segment) {
-    return String(segment).replace(/~/g, '~0').replace(/\//g, '~1');
+function parseNormalizedSettingsObject(serialized) {
+    const parsed = JSON.parse(serialized);
+    return isPlainObject(parsed) ? parsed : {};
 }
 
-function prefixPatchOperations(operations, prefix) {
-    if (!prefix) {
-        return operations;
-    }
-    return operations.map(operation => {
-        const next = { ...operation, path: prefix + operation.path };
-        if (typeof operation.from === 'string') {
-            next.from = prefix + operation.from;
-        }
-        return next;
-    });
-}
-
-function buildSettingsNode(value, prev, prevEntry, hasPrev, depth) {
-    if (depth > 0 && isPlainObject(value) && typeof value.toJSON !== 'function') {
-        const canReuse = hasPrev && prevEntry instanceof Map && isPlainObject(prev);
-        const entry = new Map();
-        const out = {};
-        const removes = [];
-        const ops = [];
-        for (const key of Object.keys(value)) {
-            const childHasPrev = canReuse && Object.hasOwn(prev, key) && prevEntry.has(key);
-            const child = buildSettingsNode(value[key], childHasPrev ? prev[key] : undefined, childHasPrev ? prevEntry.get(key) : undefined, childHasPrev, depth - 1);
-            if (child.value === undefined) {
-                continue;
-            }
-            entry.set(key, child.entry);
-            out[key] = child.value;
-            if (!canReuse) {
-                continue;
-            }
-            const path = '/' + escapeSettingsPointerSegment(key);
-            if (!childHasPrev) {
-                ops.push({ op: 'add', path, value: child.value });
-            } else if (child.ops.length > 0) {
-                ops.push(...prefixPatchOperations(child.ops, path));
-            }
-        }
-        if (canReuse) {
-            for (const key of Object.keys(prev)) {
-                if (!Object.hasOwn(out, key)) {
-                    const path = '/' + escapeSettingsPointerSegment(key);
-                    removes.push({ op: 'test', path, value: prev[key] }, { op: 'remove', path });
-                }
-            }
-        } else if (hasPrev) {
-            return { value: out, entry, ops: diffSettingsLeaf(prev, out) };
-        }
-        return { value: out, entry, ops: removes.concat(ops) };
-    }
-    const serialized = JSON.stringify(value);
-    if (serialized === undefined) {
-        return { value: undefined, entry: undefined, ops: [] };
-    }
-    if (hasPrev && prevEntry === serialized) {
-        return { value: prev, entry: serialized, ops: [] };
-    }
-    const next = JSON.parse(serialized);
-    return { value: next, entry: serialized, ops: hasPrev ? diffSettingsLeaf(prev, next) : [] };
-}
-
-function diffSettingsLeaf(prev, next) {
-    return attachObjectPatchTests(prev, compareJsonPatch(prev, next));
-}
-
-function buildSettingsPayloadWithDiff() {
-    const snapshot = getSettingsSnapshot();
-    const cache = settingsSectionCache && settingsSectionCache.payload === snapshot ? settingsSectionCache : null;
-    const built = buildSettingsNode(getSettingsPayloadSource(), cache?.payload, cache?.entry, !!cache, SETTINGS_DIFF_DEPTH);
-    return { payload: built.value, entry: built.entry, operations: cache ? built.ops : null };
-}
-
-function rememberSettingsSectionCache(payload, entry) {
-    settingsSectionCache = isPlainObject(payload) && entry instanceof Map ? { payload, entry } : null;
+function buildSettingsPayload() {
+    return normalizeJsonObject(buildRawSettingsObject());
 }
 
 //MARK: saveSettings()
@@ -16332,22 +16327,36 @@ async function saveSettingsInternal(loopCounter = 0, options = {}) {
         TempResponseLength.restore(null);
     }
 
+    let workerDiff = null;
     try {
-        const incremental = buildSettingsPayloadWithDiff();
-        const payload = incremental.payload;
+        const serializedPayload = JSON.stringify(buildRawSettingsObject());
+        let nextSnapshot = null;
         let saved = false;
         const previousSnapshot = getSettingsSnapshot();
+
         if (!options.directSave && isPlainObject(previousSnapshot)) {
-            let operations = incremental.operations;
-            if (!operations) {
-                operations = options.asyncDiff
-                    ? await buildObjectPatchOperationsAsync(previousSnapshot, payload, { maxOperations: 4000 })
-                    : buildObjectPatchOperations(previousSnapshot, payload, { maxOperations: 4000 });
-            } else if (operations.length > 4000) {
-                operations = [{ op: 'replace', path: '', value: payload }];
+            if (options.asyncDiff) {
+                try {
+                    workerDiff = await diffSerializedSettingsWithWorker(previousSnapshot, serializedPayload, { maxOperations: 4000 });
+                } catch (error) {
+                    console.warn('Falling back to synchronous object patch diff', error);
+                    workerDiff = null;
+                }
             }
+
+            let operations;
+            if (workerDiff) {
+                operations = workerDiff.operations;
+            } else {
+                nextSnapshot = parseNormalizedSettingsObject(serializedPayload);
+                operations = buildObjectPatchOperations(previousSnapshot, nextSnapshot, { maxOperations: 4000 });
+            }
+
             if (operations.length === 0) {
                 saved = true;
+                workerDiff?.discard();
+                workerDiff = null;
+                nextSnapshot = previousSnapshot;
             } else if (shouldUseSettingsPatch(operations)) {
                 // Use ops count (not byte comparison) to decide patch vs full save —
                 // avoids JSON.stringify-ing the entire settings payload just to
@@ -16359,6 +16368,10 @@ async function saveSettingsInternal(loopCounter = 0, options = {}) {
                     cache: 'no-cache',
                 });
                 saved = patchResult.ok;
+                if (saved) {
+                    workerDiff?.commit();
+                    nextSnapshot = nextSnapshot ?? applyCommittedSnapshotOperations(previousSnapshot, operations);
+                }
             }
             // else: too many ops or overflow sentinel — fall through to full save below.
         }
@@ -16367,21 +16380,23 @@ async function saveSettingsInternal(loopCounter = 0, options = {}) {
             const result = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: getRequestHeaders(),
-                body: JSON.stringify(payload),
+                body: serializedPayload,
                 cache: 'no-cache',
             });
 
             if (!result.ok) {
                 throw new Error(`Failed to save settings: ${result.statusText}`);
             }
+            workerDiff?.commit();
+            nextSnapshot = nextSnapshot ?? parseNormalizedSettingsObject(serializedPayload);
         }
 
-        invalidateSettingsGetResponseCache();
-        settings = payload;
-        rememberSettingsSnapshot(payload);
-        rememberSettingsSectionCache(payload, incremental.entry);
+        settings = nextSnapshot;
+        rememberSettingsSnapshot(nextSnapshot, { serialized: serializedPayload, syncWorker: !workerDiff });
+        options.onSaved?.();
         await eventSource.emit(event_types.SETTINGS_UPDATED);
     } catch (error) {
+        workerDiff?.discard();
         console.error('Error saving settings:', error);
         toastr.error(t`Check the server connection and reload the page to prevent data loss.`, t`Settings could not be saved`);
     }

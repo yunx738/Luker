@@ -108,8 +108,10 @@ import {
     converter,
     sendTextareaMessage,
     buildObjectPatchOperationsAsync,
+    settingsReady,
 } from '../script.js';
 import {
+    extensionNames,
     extension_settings,
     getExtensionManifest,
     ModuleWorkerWrapper,
@@ -122,6 +124,12 @@ import {
     updateCharacterState,
     getCharacterStateBatch,
     deleteCharacterState,
+    getGlobalState,
+    setGlobalState,
+    patchGlobalState,
+    updateGlobalState,
+    getGlobalStateBatch,
+    deleteGlobalState,
     renderExtensionTemplate,
     renderExtensionTemplateAsync,
     saveMetadataDebounced,
@@ -148,6 +156,20 @@ import {
     rebindPreviousPrimaryBook,
 } from './character/post-replace-actions.js';
 import { decodeCardBoundOptionValue } from './character/preset-ref-codec.js';
+import {
+    STATE_ERROR_REASONS,
+    STATE_HINT_MAX_LENGTH,
+    isValidReason,
+    makeStateError,
+    makeStateOk,
+} from './state-errors.js';
+import {
+    formatHttpErrorHint,
+    formatTransportErrorHint,
+    formatConflictHint,
+    formatValidationArgsHint,
+    formatValidationTargetHint,
+} from './state-errors/format.js';
 import { humanizedDateTime, isMobile, shouldSendOnEnter } from './RossAscends-mods.js';
 import { ScraperManager } from './scrapers.js';
 import { executeSlashCommands, executeSlashCommandsWithOptions, registerSlashCommand } from './slash-commands.js';
@@ -170,7 +192,8 @@ import { updateReasoningUI, parseReasoningFromString, getReasoningTemplateByName
 import { IGNORE_SYMBOL, inject_ids } from './constants.js';
 import { macros } from './macros/macro-system.js';
 import { MessageFormatter } from './message-formatter.js';
-import { getRegexedString, regex_placement } from './extensions/regex/engine.js';
+import * as regexEngine from './extensions/regex/engine.js';
+const { getRegexedString, regex_placement } = regexEngine;
 import { addMessages, updateMessages, deleteMessages, getMessage, getMessageCount } from './messages.js';
 import { createFloorState } from './floor-state.js';
 import { generateTask, generateTaskStream, GenerateTaskError, resolveOpenAiStreamFlag } from './generate-task.js';
@@ -185,9 +208,12 @@ import * as ITERATION_LIBRARY_API_NS from './iteration-library/index.js';
 import * as LUKER_TABS_API from './extensions/luker-tabs.js';
 import * as FIELD_HELP_API from './extensions/field-help.js';
 import { skillsApi } from './skills/api.js';
+import { imageGenerationApi } from './image-generation/registry.js';
 import * as RUN_PANEL_API_NS from './run-panel/index.js';
+import * as WORKBENCH_REGISTRY from './workbench/registry.js';
 import { SECRET_KEYS, secret_state } from './secrets.js';
 import { EmbeddingService } from './embedding-service.js';
+import { accountsEnabled, currentUser } from './user.js';
 import * as LIB_BUNDLE from '../lib.js';
 
 /**
@@ -221,6 +247,24 @@ const RUN_PANEL_API = Object.freeze({
     events: RUN_PANEL_API_NS.events,
     withRound: RUN_PANEL_API_NS.withRound,
     withStreamingSection: RUN_PANEL_API_NS.withStreamingSection,
+    attachDock: RUN_PANEL_API_NS.attachDock,
+    openRunDock: RUN_PANEL_API_NS.openRunDock,
+    toggleRunDock: RUN_PANEL_API_NS.toggleRunDock,
+    getRunRecorder: RUN_PANEL_API_NS.getRunRecorder,
+});
+
+const WORKBENCH_API = Object.freeze({
+    registerWorkspace: WORKBENCH_REGISTRY.registerWorkspace,
+    registerIterateTarget: WORKBENCH_REGISTRY.registerIterateTarget,
+    registerAskProvider: WORKBENCH_REGISTRY.registerAskProvider,
+    registerSuggestRuleProvider: WORKBENCH_REGISTRY.registerSuggestRuleProvider,
+    open: WORKBENCH_REGISTRY.open,
+    saveSettingsChecked: WORKBENCH_REGISTRY.saveSettingsChecked,
+    getWorkspaces: WORKBENCH_REGISTRY.getWorkspaces,
+    getIterateTargets: WORKBENCH_REGISTRY.getIterateTargets,
+    getAskProviders: WORKBENCH_REGISTRY.getAskProviders,
+    getSuggestRuleProviders: WORKBENCH_REGISTRY.getSuggestRuleProviders,
+    subscribe: WORKBENCH_REGISTRY.subscribe,
 });
 
 function safeClone(value, fallback = {}) {
@@ -2471,30 +2515,30 @@ export function getContext() {
         getPastCharacterChats,
         deleteCharacterChat: deleteCharacterChatByName,
         saveSettingsDebounced,
-        // Prompt-scoped regex helpers. Third-party plugins (orchestrator,
-        // memory-graph, iter-studio, ...) that surface chat text to an
-        // LLM must rewrite it through the user's regex scripts, or their
-        // agents see raw `.mes` while the main generation pipeline sees
-        // the rewritten text. Direct `import` from
-        // `extensions/regex/engine.js` would transitively pull
-        // `public/script.js` and its DOM bootstrap chain into environments
-        // that can't handle it (jest ESM, isolated test rigs). Exposing
-        // the two primitives here keeps plugins DOM-clean and matches the
-        // three-layer API contract.
+        // Regex runtime & script API. Extensions and CardApp helpers consume
+        // regex capabilities exclusively through `getContext().regex` rather
+        // than importing `extensions/regex/engine.js` directly (which would
+        // pull `public/script.js` and its DOM bootstrap chain into isolated
+        // environments and couple plugins to internal engine paths).
         //
-        // - `applyRegex(rawString, placement, params?)` — thin alias for
-        //   `getRegexedString`. `placement` is a `regex_placement.*` value;
-        //   `params` mirrors the engine signature ({ characterOverride,
-        //   isMarkdown, isPrompt, isPluginInput, isPluginOutput, isEdit, depth }).
-        // - `placement` — the `regex_placement` enum (USER_INPUT / AI_OUTPUT
-        //   / SLASH_COMMAND / WORLD_INFO / REASONING).
-        //
-        // For READING chat floors as cooked prompt-ready records, prefer
+        //For READING chat floors as cooked prompt-ready records, prefer
         // `readPluginFloors` below over hand-rolling a chat walk — it
-        // already routes every floor through this lane with real depths.
+        // already routes every floor through the plugin regex lane with real depths.
         regex: {
-            applyRegex: getRegexedString,
-            placement: regex_placement,
+            applyRegex: regexEngine.getRegexedString,
+            runRegexScript: regexEngine.runRegexScript,
+            placement: regexEngine.regex_placement,
+            substituteFindRegex: regexEngine.substitute_find_regex,
+            SCRIPT_TYPES: regexEngine.SCRIPT_TYPES,
+            registerRegexProvider: regexEngine.registerRegexProvider,
+            registerManagedRegexProvider: regexEngine.registerManagedRegexProvider,
+            unregisterRegexProvider: regexEngine.unregisterRegexProvider,
+            getScripts: regexEngine.getRegexScripts,
+            getScriptsByType: regexEngine.getScriptsByType,
+            saveScriptsByType: regexEngine.saveScriptsByType,
+            getPluginLanes: regexEngine.getPluginLanes,
+            omitLegacyPluginScope: regexEngine.omitLegacyPluginScope,
+            normalizePluginScriptRecord: regexEngine.normalizePluginScriptRecord,
         },
         // Chat floor accessor for plugin LLM requests (lib/plugin-floors.js):
         // walks the current chat once, cooks each floor through the plugin
@@ -2508,10 +2552,12 @@ export function getContext() {
         floorRecordToTaskMessage,
         iterationLibrary: ITERATION_LIBRARY_API,
         runPanel: RUN_PANEL_API,
+        workbench: WORKBENCH_API,
         edits: EDITS_API,
         renderLukerTabs: LUKER_TABS_API.renderLukerTabs,
         renderFieldHelpButton: FIELD_HELP_API.renderFieldHelpButton,
         skills: skillsApi,
+        imageGeneration: imageGenerationApi,
         get onlineStatus() { return online_status; },
         get maxContext() { return Number(max_context); },
         get chatMetadata() { return chat_metadata; },
@@ -2826,12 +2872,31 @@ export function getContext() {
         listPostReplaceActions,
         importEmbeddedBookForCharacter,
         rebindPreviousPrimaryBook,
+        decodeCardBoundOptionValue,
+        stateErrors: Object.freeze({
+            STATE_ERROR_REASONS,
+            STATE_HINT_MAX_LENGTH,
+            isValidReason,
+            makeStateError,
+            makeStateOk,
+            formatHttpErrorHint,
+            formatTransportErrorHint,
+            formatConflictHint,
+            formatValidationArgsHint,
+            formatValidationTargetHint,
+        }),
         getCharacterState,
         setCharacterState,
         patchCharacterState,
         updateCharacterState,
         getCharacterStateBatch,
         deleteCharacterState,
+        getGlobalState,
+        setGlobalState,
+        patchGlobalState,
+        updateGlobalState,
+        getGlobalStateBatch,
+        deleteGlobalState,
         updateCharacterData,
         persistCharacterData,
         persistCharacterDataDebounced,
@@ -2898,6 +2963,10 @@ export function getContext() {
         textCompletion: {
             types: textgen_types,
         },
+        get accountsEnabled() { return Boolean(accountsEnabled); },
+        get currentUser() { return currentUser ? Object.freeze({ ...currentUser }) : null; },
+        get settingsReady() { return Boolean(settingsReady); },
+        listExtensionNames: () => Array.isArray(extensionNames) ? [...extensionNames] : [],
     };
 }
 

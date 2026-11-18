@@ -4,19 +4,43 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ## Unreleased
 
+### Workbench
+
+- Added the floating Workbench window with prompt token breakdown, local configuration suggestions, and read-only AI Q&A.
+- Unified AI iteration for Memory Graph, Memory Structure, Multi-Agent Orchestrator, Image Generation, presets, character cards, and world books inside Workbench, with diff review, Change history undo, and automatic migration of historical iteration sessions.
+
+### Multi-Agent Orchestrator
+
+- Embedded the orchestration flow editor, run inspector, run history, timing statistics, presets, skills, custom tools, and plot notes into Workbench.
+- Added a shared floating Run panel for live orchestration and pre-request search runs.
+- Fixed spec mode AI iteration failing to edit stage nodes written in string shorthand.
+
+### Documentation
+
+- Added the [Workbench guide](/features/workbench), [Image Generation & AI Illustration guide](/features/image-generation), [Workbench API reference](/development/extension-api/workbench), [Image Generation API reference](/development/extension-api/image-generation), and [Run Panel API reference](/development/extension-api/run-panel), and updated the Memory Graph, Multi-Agent Orchestrator, Search Tools, Preset Assistant, Character Card Editor Assistant, and State System guides.
+
 ### Connections & Models
 
 - Added a network proxy setting to chat completion connection profiles, taking precedence over the global proxy.
 
 ### Image generation
 
+- Added connection profile binding and OpenAI-compatible multimodal chat image generation to Image Generation.
+- Added character reference image, style reference image, and source image editing support across supported image backends.
+- Embedded Image Studio, the global Character Archive, and illustration run traces into Workbench, supporting fanwork character exploration and original character reference design.
+- Added inline illustration locking, version switching, and source image editing to AI Illustration.
 - Fixed AI Illustration settings labels being squeezed into vertical text.
+
+### Search Tools
+
+- Added image search and webpage image extraction tools and cross-plugin search APIs to Search Tools.
 
 ### Character Cards
 
 - Fixed character card replacement failing when importing tags.
 - Fixed reading and editing character cards whose filenames retain leading spaces or punctuation.
 - Fixed reading empty-named root properties from character cards.
+- Fixed deleting nested character card extension fields leaving internal sentinel objects behind.
 
 ### CardApp
 
@@ -24,9 +48,23 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ### Memory Graph
 
+- Embedded the Memory Graph network, timeline, data table, schema editor, and settings workspace into Workbench.
 - Allowed Memory Graph crawl candidate limit to be set to 0 for no limit.
 - Changed Memory Graph read API view fields to snake_case.
 - Aligned Memory Graph extraction, crawl, and compression prompts with the fields the runtime provides.
+
+### Request Inspector
+
+- Added the network proxy used by a chat request to the request detail view.
+
+### Third-party extensions
+
+- Fixed third-party extensions that read the SillyTavern version receiving the Luker version.
+- Fixed checking versions, switching branches, and updating third-party extensions and server plugins failing in mobile apps, environments where running external Git processes is restricted, and repositories whose configured remote URL omits the `.git` suffix.
+- Fixed third-party extension version checks clearing local branch and commit information when the remote repository cannot be reached.
+- Fixed narrow screens truncating third-party extension version and branch details in Manage extensions and non-Git extension folders appending an empty branch suffix.
+- Fixed third-party extensions failing to read and save chat completion presets and losing request message references across generation events.
+- Fixed non-streaming generation responses carrying an event-stream content-type header and character-bound preset switches failing to update the active preset name.
 
 ### Fixes
 
@@ -34,9 +72,14 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Fixed Memory Graph RAG recall filtering always-inject nodes after the per-type quota.
 - Fixed the Diagnostics menu overflowing the right edge on narrow screens.
 - Fixed chat rename failures not showing the server's reason.
+- Fixed renaming chats failing in the Android app and on filesystems without hard link support.
+- Fixed background Prompt Manager refreshes interrupting an active prompt drag.
+- Fixed prompt assembly failures showing a generic token-counting error, dispatching an empty context, and omitting cross-frame error details from diagnostics logs.
+- Fixed preset switching and background preset loading overwriting another preset's regex rules and settings.
 
 ### Storage & Sync
 
+- Added per-namespace global state storage across account storage quotas, settings backups, storage migrations, and LAN and S3 sync.
 - Fixed character card field edits bypassing sync locking and account storage quotas.
 - Fixed reading SQL settings strings starting with quotes and extension keys containing control characters.
 - Fixed sync status checks failing immediately on an interrupted request or alerting accounts without configured sync backends.
@@ -50,11 +93,28 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Added a crash recovery screen with reload and diagnostics export actions when the HarmonyOS app web page exits abnormally.
 - Preserved partial performance recordings when the renderer exits or reloads in the HarmonyOS and Android apps.
 - Included the newest performance trace in HarmonyOS and Android diagnostics bundles.
+- Fixed automatic browser launch and external npm probing running during startup and server plugin dependency installation in the iOS and HarmonyOS apps.
+- Fixed launching the desktop app while already running starting a duplicate process.
+- Fixed unsaved-change guards in the desktop app silently blocking page reloads and preventing quitting from the tray.
+- Restored page reload keyboard shortcuts in the Windows and Linux desktop apps.
+- Fixed the desktop app ignoring the configured server port and failing to step past reserved or occupied listen addresses.
+- Added the startup log, port configuration, retry, and open data directory actions to the startup failure screen in the desktop app.
+- Moved the client app Refresh and Endpoint buttons to the top action bar in User Settings.
 
 ### iOS App
 
 - Fixed full-screen pages and custom themes overlapping the status bar and bottom area in the iOS app.
 - Synced the iOS status bar and bottom area separately to the rendered top and bottom bar colors.
+
+### Extension API
+
+- Added Workbench registration APIs for embedded workspaces, AI iteration targets, Q&A read providers, and local suggestion rules, alongside global state read and patch helpers.
+- Exposed structured image generation on `context.imageGeneration` and CardApp `ctx.imageGeneration`.
+- Exposed runtime regex provider registration and scoped regex script management on `context.regex`.
+
+### Performance
+
+- Optimized first-screen startup, resource revalidation, settings saving, and hidden Prompt Manager rendering.
 
 ## v2.9.0-rc.2 (2026-11-11)
 

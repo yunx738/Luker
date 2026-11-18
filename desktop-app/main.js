@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } from 'electron';
 import fs from 'node:fs';
-import net from 'node:net';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -21,7 +21,15 @@ import {
 } from './data-location.js';
 import { createHttpAuthController, HttpAuthStore } from './http-auth.js';
 import { detectInstallFlavour } from './install-flavour.js';
-import { hidesOnClose, usesTray, devtoolsShortcutFor } from './window-behaviour.js';
+import {
+    cleanBootLog,
+    isSameFileUrl,
+    pickPort,
+    readCliPort,
+    resolveStartupListenPlan,
+    updateConfigPort,
+} from './startup-config.js';
+import { hidesOnClose, usesTray, devtoolsShortcutFor, reloadShortcutFor } from './window-behaviour.js';
 
 // Electron's main process exposes V8's WebAssembly but not the streaming
 // compile helpers, which live at the Blink layer in Chromium. Emscripten-built
@@ -38,10 +46,6 @@ if (typeof WebAssembly.instantiateStreaming !== 'function') {
         return { module, instance: await WebAssembly.instantiate(module, importObject) };
     };
 }
-
-const DEFAULT_PORT = 8000;
-// Probe window for a free port, matching the range the mobile shells use.
-const PORT_PROBE_COUNT = 50;
 
 app.setName('Luker');
 
@@ -63,6 +67,11 @@ prepareLocation(location);
 const userData = location.error ? defaultUserData : location.activeUserData;
 app.setPath('userData', userData);
 app.setPath('sessionData', userData);
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+    app.quit();
+}
 
 function sameDirectory(a, b) {
     const left = path.resolve(a);
@@ -120,21 +129,8 @@ if (!process.env.LUKER_PREBUILT_BUNDLES_DIR) {
     }
 }
 
-function readPreferredPort(argv) {
-    const prefix = '--port=';
-    for (const arg of argv) {
-        if (!arg.startsWith(prefix)) {
-            continue;
-        }
-        const parsed = Number.parseInt(arg.slice(prefix.length), 10);
-        if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) {
-            return parsed;
-        }
-    }
-    return DEFAULT_PORT;
-}
-
-const preferredPort = readPreferredPort(process.argv);
+const cliPort = readCliPort(process.argv);
+const backendRequire = createRequire(path.join(backendRoot, 'package.json'));
 
 const httpAuthStore = new HttpAuthStore(path.join(userData, 'http-auth.json'));
 
@@ -271,6 +267,7 @@ function startLogTee() {
         return;
     }
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.writeFileSync(logPath, '');
     originalStdoutWrite = process.stdout.write.bind(process.stdout);
     originalStderrWrite = process.stderr.write.bind(process.stderr);
     process.stdout.write = (chunk, encoding, callback) => {
@@ -322,6 +319,7 @@ function reportStartupFailure(error) {
     const message = error instanceof Error ? error.message : String(error);
     bootFailure = message;
     console.error(`Luker failed to start: ${message}`);
+    stopTeeingLogs();
     reportBootFailure(message);
     return true;
 }
@@ -339,38 +337,77 @@ function stopWatchingStartup() {
     process.off('uncaughtException', onUncaughtException);
 }
 
-function probePort(port) {
-    return new Promise((resolve, reject) => {
-        const probe = net.createServer();
-        probe.once('error', (err) => {
-            if (err.code === 'EADDRINUSE') {
-                resolve(false);
-            } else {
-                reject(err);
-            }
-        });
-        probe.listen({ host: '127.0.0.1', port }, () => {
-            probe.close(() => resolve(true));
-        });
-    });
-}
+const loadingPagePath = path.join(import.meta.dirname, 'loading.html');
 
-async function pickPort(preferred) {
-    for (let offset = 0; offset < PORT_PROBE_COUNT; offset++) {
-        const port = preferred + offset;
-        if (await probePort(port)) {
-            return port;
-        }
+function assertStartupFailureFrame(event, action) {
+    const frame = event.senderFrame;
+    if (bootFailure === null) {
+        throw new Error(`${action} is only available after a startup failure.`);
     }
-    throw new Error(`no free port between ${preferred} and ${preferred + PORT_PROBE_COUNT - 1}`);
+    if (!frame || frame.isDestroyed()) {
+        throw new Error(`${action} was requested by a frame that is no longer available.`);
+    }
+    if (!isSameFileUrl(frame.url, loadingPagePath)) {
+        throw new Error(`${action} was requested by a page outside the startup failure screen.`);
+    }
 }
 
-async function startBackend(win, locale, port) {
+ipcMain.handle('luker:get-startup-failure', (event) => {
+    assertStartupFailureFrame(event, 'The startup failure report');
+    const rawLog = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+    const configPath = path.join(userData, 'config.yaml');
+    const configText = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
+    const yaml = backendRequire('yaml');
+    const plan = resolveStartupListenPlan({
+        cliPort,
+        configText,
+        parseYaml: yaml.parse,
+    });
+    return {
+        bootLog: cleanBootLog(rawLog),
+        port: plan.configPort,
+        canEditPort: plan.configValid && cliPort === null,
+    };
+});
+
+ipcMain.handle('luker:retry-startup', (event, payload) => {
+    assertStartupFailureFrame(event, 'The startup retry action');
+    if (payload?.port !== undefined && payload?.port !== null) {
+        const nextPort = Number(payload.port);
+        if (!Number.isInteger(nextPort) || nextPort < 1 || nextPort > 65535) {
+            throw new RangeError(`Invalid port: ${payload.port}`);
+        }
+        const configPath = ensureConfigFile();
+        const configText = fs.readFileSync(configPath, 'utf8');
+        const yaml = backendRequire('yaml');
+        const plan = resolveStartupListenPlan({
+            cliPort,
+            configText,
+            parseYaml: yaml.parse,
+        });
+        if (!plan.configValid || cliPort !== null) {
+            throw new Error('The server port cannot be edited in the current startup configuration.');
+        }
+        fs.writeFileSync(configPath, updateConfigPort(configText, nextPort), 'utf8');
+    }
+    setTimeout(() => relaunchApp(), 50);
+    return { restarting: true };
+});
+
+ipcMain.handle('luker:open-startup-data-directory', (event) => {
+    assertStartupFailureFrame(event, 'Opening the data directory');
+    return openDataDirectory();
+});
+
+function ensureConfigFile() {
     const configPath = path.join(userData, 'config.yaml');
     if (!fs.existsSync(configPath)) {
         fs.copyFileSync(path.resolve(backendRoot, 'default', 'config.yaml'), configPath);
     }
+    return configPath;
+}
 
+async function startBackend(win, locale, port, configPath) {
     const serverJs = path.resolve(backendRoot, 'server.js');
 
     process.argv = [
@@ -597,6 +634,9 @@ const SHELL_STRINGS = {
         emptyStartConfirmMessage: 'Luker will use %s as an empty data folder. Existing data in the old folder stays in place.',
         moveFailedTitle: 'Luker could not move its data',
         moveFailedMessage: 'Luker could not move its data to %s.',
+        unloadConfirmTitle: 'Leave this page?',
+        unloadConfirmMessage: 'Changes you made will be lost if you leave.',
+        unloadConfirmLeave: 'Leave',
     },
     'zh-CN': {
         showWindow: '显示 Luker',
@@ -637,6 +677,9 @@ const SHELL_STRINGS = {
         emptyStartConfirmMessage: 'Luker 会把 %s 作为空的数据目录。旧目录中的现有数据保持不变。',
         moveFailedTitle: 'Luker 无法迁移数据',
         moveFailedMessage: 'Luker 无法把数据迁移到 %s。',
+        unloadConfirmTitle: '离开此页面？',
+        unloadConfirmMessage: '未保存的更改将在离开后丢失。',
+        unloadConfirmLeave: '离开',
     },
     'zh-TW': {
         showWindow: '顯示 Luker',
@@ -677,6 +720,9 @@ const SHELL_STRINGS = {
         emptyStartConfirmMessage: 'Luker 會把 %s 作為空的資料目錄。舊目錄中的現有資料保持不變。',
         moveFailedTitle: 'Luker 無法遷移資料',
         moveFailedMessage: 'Luker 無法把資料遷移到 %s。',
+        unloadConfirmTitle: '離開此頁面？',
+        unloadConfirmMessage: '未儲存的變更將在離開後遺失。',
+        unloadConfirmLeave: '離開',
     },
 };
 
@@ -695,11 +741,17 @@ function pickShellStrings(locale) {
 }
 
 function relaunchApp() {
+    app.releaseSingleInstanceLock();
     if (process.env.LUKER_DESKTOP_TEST_NO_RELAUNCH === '1') {
         app.quit();
         return;
     }
-    app.relaunch({ args: launchArgs });
+    // A Linux AppImage runs out of an ephemeral FUSE mount that disappears on
+    // exit, so relaunch has to target the outer AppImage file instead.
+    const relaunchOptions = process.platform === 'linux' && process.env.APPIMAGE
+        ? { execPath: process.env.APPIMAGE, args: launchArgs }
+        : { args: launchArgs };
+    app.relaunch(relaunchOptions);
     app.quit();
 }
 
@@ -1089,6 +1141,7 @@ async function runMigrationSession(current, strings, locale) {
             backgroundThrottling: false,
         },
     });
+    mainWindow = win;
     win.once('ready-to-show', () => win.show());
     win.on('close', (event) => {
         if (settled) {
@@ -1135,12 +1188,16 @@ async function runMigrationSession(current, strings, locale) {
 // takes the window down. Elsewhere the close is let through, because a hidden
 // window with no way back leaves the app running and unreachable.
 let quitting = false;
+let mainWindow = null;
 let tray = null;
 let trayHintShown = false;
 
 function showMainWindow(win) {
     if (win.isDestroyed()) {
         return;
+    }
+    if (process.platform === 'darwin') {
+        app.show();
     }
     if (win.isMinimized()) {
         win.restore();
@@ -1274,103 +1331,164 @@ function showHttpAuthDialog({ parent, host, port, realm, prefill }, strings) {
     });
 }
 
-app.whenReady().then(async () => {
-    // Electron installs a default application menu, which Windows and Linux
-    // draw as an in-window bar the shell has no use for. macOS keeps its own,
-    // because the standard Edit roles there also carry the clipboard
-    // accelerators.
-    if (process.platform !== 'darwin') {
-        Menu.setApplicationMenu(null);
+app.on('second-instance', () => {
+    if (mainWindow) {
+        showMainWindow(mainWindow);
     }
+});
 
-    const locale = app.getLocale();
-    const strings = pickShellStrings(locale);
-    if (location.error) {
-        await showLocationError(location, strings);
-        return;
-    }
-    if (location.state?.pendingMoveTo) {
-        await runMigrationSession(location, strings, locale);
-        return;
-    }
-    const win = new BrowserWindow({
-        width: 1024,
-        height: 768,
-        webPreferences: {
-            preload: path.join(import.meta.dirname, 'preload.js'),
-            // A hidden window is throttled by default, which would slow the
-            // renderer's timers and animations down while the app runs hidden.
-            // Leaving the page unthrottled matches what hiding does on macOS on
-            // its own, so every platform behaves the same way.
-            backgroundThrottling: false,
-        },
-    });
-    routeExternalNavigation(win);
+if (hasSingleInstanceLock) {
+    app.whenReady().then(async () => {
+        // Electron installs a default application menu, which Windows and Linux
+        // draw as an in-window bar the shell has no use for. macOS keeps its own,
+        // because the standard Edit roles there also carry the clipboard
+        // accelerators.
+        if (process.platform !== 'darwin') {
+            Menu.setApplicationMenu(null);
+        }
 
-    startLogTee();
-    fs.rmSync(updatesDirectory, { recursive: true, force: true });
-
-    const httpAuth = createHttpAuthController({
-        store: httpAuthStore,
-        prompt: (request) => showHttpAuthDialog(request, strings),
-    });
-    app.on('login', (event, contents, _details, authInfo, callback) => {
-        // Proxy authentication is outside the endpoint credentials the shell
-        // manages, so the proxy keeps whatever handling Electron gives it.
-        if (authInfo.isProxy) {
+        const locale = app.getLocale();
+        const strings = pickShellStrings(locale);
+        if (location.error) {
+            await showLocationError(location, strings);
             return;
         }
-        event.preventDefault();
-        const owner = contents ? BrowserWindow.fromWebContents(contents) : null;
-        httpAuth.handle(authInfo, callback, owner || win);
-    });
-    win.webContents.on('did-finish-load', () => httpAuth.resetAttempts());
-
-    // macOS keeps an application menu that already binds the devtools toggle,
-    // so the handler would race it. Only the menu-less platforms get one.
-    if (process.platform !== 'darwin') {
-        win.webContents.on('before-input-event', (event, input) => {
-            if (devtoolsShortcutFor(process.platform, input) === 'toggle') {
-                event.preventDefault();
-                win.webContents.toggleDevTools();
-            }
+        if (location.state?.pendingMoveTo) {
+            await runMigrationSession(location, strings, locale);
+            return;
+        }
+        const win = new BrowserWindow({
+            width: 1024,
+            height: 768,
+            webPreferences: {
+                preload: path.join(import.meta.dirname, 'preload.js'),
+                // A hidden window is throttled by default, which would slow the
+                // renderer's timers and animations down while the app runs hidden.
+                // Leaving the page unthrottled matches what hiding does on macOS on
+                // its own, so every platform behaves the same way.
+                backgroundThrottling: false,
+            },
         });
-    }
+        mainWindow = win;
+        routeExternalNavigation(win);
 
-    win.on('close', (event) => {
-        if (quitting || !hidesOnClose(process.platform)) {
-            return;
-        }
-        event.preventDefault();
-        win.hide();
-        // Windows tucks new tray icons into its overflow area, so the first
-        // close tells the user where the app went.
-        if (usesTray(process.platform) && !trayHintShown) {
-            trayHintShown = true;
-            tray.displayBalloon({ title: 'Luker', content: strings.trayHint });
-        }
-    });
+        startLogTee();
+        fs.rmSync(updatesDirectory, { recursive: true, force: true });
 
-    if (usesTray(process.platform)) {
-        createTray(win, strings);
-    } else if (process.platform === 'darwin') {
-        installApplicationMenu(strings);
-    }
+        const httpAuth = createHttpAuthController({
+            store: httpAuthStore,
+            prompt: (request) => showHttpAuthDialog(request, strings),
+        });
+        app.on('login', (event, contents, _details, authInfo, callback) => {
+            // Proxy authentication is outside the endpoint credentials the shell
+            // manages, so the proxy keeps whatever handling Electron gives it.
+            if (authInfo.isProxy) {
+                return;
+            }
+            event.preventDefault();
+            const owner = contents ? BrowserWindow.fromWebContents(contents) : null;
+            httpAuth.handle(authInfo, callback, owner || win);
+        });
+        win.webContents.on('did-finish-load', () => httpAuth.resetAttempts());
 
-    app.on('activate', () => showMainWindow(win));
-
-    await win.loadFile('loading.html', { query: { locale } });
-
-    try {
-        const port = await pickPort(preferredPort);
-        await startBackend(win, locale, port);
-    } catch (err) {
-        if (bootFailure === null) {
-            await win.loadFile('loading.html', {
-                query: { locale, error: String(err?.message || err), logPath },
+        // macOS keeps an application menu that already binds devtools and page
+        // reload, so the handler would race it. Only the menu-less platforms get one.
+        if (process.platform !== 'darwin') {
+            win.webContents.on('before-input-event', (event, input) => {
+                if (devtoolsShortcutFor(process.platform, input) === 'toggle') {
+                    event.preventDefault();
+                    win.webContents.toggleDevTools();
+                    return;
+                }
+                const reloadAction = reloadShortcutFor(process.platform, input);
+                if (reloadAction === 'reload') {
+                    event.preventDefault();
+                    win.webContents.reload();
+                } else if (reloadAction === 'force-reload') {
+                    event.preventDefault();
+                    win.webContents.reloadIgnoringCache();
+                }
             });
         }
-    }
+
+        win.on('close', (event) => {
+            if (quitting || bootFailure !== null || !hidesOnClose(process.platform)) {
+                return;
+            }
+            event.preventDefault();
+            win.hide();
+            // Windows tucks new tray icons into its overflow area, so the first
+            // close tells the user where the app went.
+            if (usesTray(process.platform) && !trayHintShown) {
+                trayHintShown = true;
+                tray.displayBalloon({ title: 'Luker', content: strings.trayHint });
+            }
+        });
+
+        if (usesTray(process.platform)) {
+            createTray(win, strings);
+        } else if (process.platform === 'darwin') {
+            installApplicationMenu(strings);
+        }
+
+        app.on('activate', () => showMainWindow(win));
+
+        await win.loadFile('loading.html', { query: { locale } });
+
+        try {
+            const configPath = ensureConfigFile();
+            const yaml = backendRequire('yaml');
+            const listenPlan = resolveStartupListenPlan({
+                cliPort,
+                configText: fs.readFileSync(configPath, 'utf8'),
+                parseYaml: yaml.parse,
+            });
+            const port = await pickPort(listenPlan.preferredPort, {
+                probeTargets: listenPlan.probeTargets,
+            });
+            await startBackend(win, locale, port, configPath);
+        } catch (err) {
+            if (bootFailure === null) {
+                const message = String(err?.message || err);
+                bootFailure = message;
+                console.error(`Luker failed to start: ${message}`);
+                stopTeeingLogs();
+                await win.loadFile('loading.html', {
+                    query: { locale, error: message, logPath },
+                });
+            }
+        }
+    });
+}
+
+app.on('web-contents-created', (_event, contents) => {
+    contents.on('will-prevent-unload', (event) => {
+        if (quitting) {
+            event.preventDefault();
+            return;
+        }
+        const strings = pickShellStrings(app.getLocale());
+        const owner = BrowserWindow.fromWebContents(contents);
+        if (owner && !owner.isDestroyed() && !owner.isVisible()) {
+            showMainWindow(owner);
+        }
+        const options = {
+            type: 'question',
+            buttons: [strings.unloadConfirmLeave, strings.cancel],
+            defaultId: 0,
+            cancelId: 1,
+            title: strings.unloadConfirmTitle,
+            message: strings.unloadConfirmTitle,
+            detail: strings.unloadConfirmMessage,
+            noLink: true,
+        };
+        const choice = owner && !owner.isDestroyed()
+            ? dialog.showMessageBoxSync(owner, options)
+            : dialog.showMessageBoxSync(options);
+        if (choice === 0) {
+            event.preventDefault();
+        }
+    });
 });
 
 app.on('before-quit', () => {
@@ -1380,4 +1498,12 @@ app.on('before-quit', () => {
     backendStarting = false;
     stopWatchingStartup();
     stopTeeingLogs();
+});
+
+app.on('will-quit', () => {
+    if (tray) {
+        tray.destroy();
+        tray = null;
+    }
+    app.releaseSingleInstanceLock();
 });

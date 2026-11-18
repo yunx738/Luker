@@ -133,6 +133,21 @@ if (typeof globalThis.Luker === 'undefined') {
     // mutation past `await register*OrchestrationTools()` and the test
     // would read an empty registry.
     const orchestratorMod = await import('../public/scripts/extensions/orchestrator/register-custom-tool.js');
+    const stateErrorsMod = await import('../public/scripts/state-errors.js');
+    const stateErrorsFormatMod = await import('../public/scripts/state-errors/format.js');
+    const presetRefCodecMod = await import('../public/scripts/character/preset-ref-codec.js');
+    const stateErrors = Object.freeze({
+        STATE_ERROR_REASONS: stateErrorsMod.STATE_ERROR_REASONS,
+        STATE_HINT_MAX_LENGTH: stateErrorsMod.STATE_HINT_MAX_LENGTH,
+        isValidReason: stateErrorsMod.isValidReason,
+        makeStateError: stateErrorsMod.makeStateError,
+        makeStateOk: stateErrorsMod.makeStateOk,
+        formatHttpErrorHint: stateErrorsFormatMod.formatHttpErrorHint,
+        formatTransportErrorHint: stateErrorsFormatMod.formatTransportErrorHint,
+        formatConflictHint: stateErrorsFormatMod.formatConflictHint,
+        formatValidationArgsHint: stateErrorsFormatMod.formatValidationArgsHint,
+        formatValidationTargetHint: stateErrorsFormatMod.formatValidationTargetHint,
+    });
     const extensionApis = {
         orchestrator: {
             registerOrchestrationTool: orchestratorMod.registerOrchestrationTool,
@@ -161,6 +176,48 @@ if (typeof globalThis.Luker === 'undefined') {
             // capability detection sentinels
             createMessageEditorHandle: null,
             registerExtensionApi: () => {},
+            stateErrors,
+            decodeCardBoundOptionValue: presetRefCodecMod.decodeCardBoundOptionValue,
+            regex: {
+                applyRegex: (s) => String(s ?? ''),
+                runRegexScript: (_script, s) => String(s ?? ''),
+                placement: { USER_INPUT: 1, AI_OUTPUT: 2, SLASH_COMMAND: 3, WORLD_INFO: 5, REASONING: 6 },
+                substituteFindRegex: { NONE: 0, RAW: 1, ESCAPED: 2 },
+                SCRIPT_TYPES: { GLOBAL: 0, PRESET: 1, SCOPED: 2 },
+                registerRegexProvider: () => ({ refresh: () => {}, unregister: () => {} }),
+                registerManagedRegexProvider: () => ({
+                    upsertScript: () => {},
+                    setScripts: () => {},
+                    removeScript: () => {},
+                    clearScripts: () => {},
+                    unregister: () => {},
+                    dispose: () => {},
+                }),
+                unregisterRegexProvider: () => {},
+                getScripts: () => [],
+                getScriptsByType: () => [],
+                saveScriptsByType: async () => {},
+                getPluginLanes: (script) => (
+                    Array.isArray(script?.pluginLanes)
+                        ? [...new Set(script.pluginLanes.filter(l => l === 'request' || l === 'reply'))]
+                        : (script?.pluginOnly ? ['request', 'reply'] : [])
+                ),
+                omitLegacyPluginScope: (script) => {
+                    if (!script || typeof script !== 'object') return script;
+                    const rest = { ...script };
+                    delete rest.pluginOnly;
+                    return rest;
+                },
+                normalizePluginScriptRecord: (script) => {
+                    if (!script || typeof script !== 'object') return script;
+                    const rest = { ...script };
+                    const lanes = Array.isArray(script?.pluginLanes)
+                        ? [...new Set(script.pluginLanes.filter(l => l === 'request' || l === 'reply'))]
+                        : (script?.pluginOnly ? ['request', 'reply'] : []);
+                    delete rest.pluginOnly;
+                    return { ...rest, pluginLanes: lanes };
+                },
+            },
         };
         return new Proxy(base, {
             get(t, prop) {

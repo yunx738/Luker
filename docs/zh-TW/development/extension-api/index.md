@@ -9,13 +9,15 @@
 | [世界書](/zh-TW/development/extension-api/world-info) | 世界書 CRUD、啟動掃描、角色輔助世界書 |
 | [預設與提示詞](/zh-TW/development/extension-api/presets-and-prompts) | `context.presets.*`、`buildPresetAwarePromptMessages`、`resolveWorldInfoForMessages`、提示詞結構檢視、推理輔助函式、設定視圖 |
 | [生成請求](/zh-TW/development/extension-api/generation) | `generateTask`、工具註冊、`generateRaw` / `generateQuietPrompt`、Service 類別、connection profile |
+| [圖像生成 API](/zh-TW/development/extension-api/image-generation) | `context.imageGeneration.*`、`getExtensionApi('sd')`、CardApp `ctx.imageGeneration`、參考圖角色、後端能力探測與歸屬控制 |
 | [斜線指令](/zh-TW/development/extension-api/slash-commands) | 註冊與執行斜線指令、具名 / 不具名引數、列舉 |
 | [巨集與變數](/zh-TW/development/extension-api/macros-and-variables) | 巨集註冊、內建巨集參考、`substituteParams`、本地與全域變數 |
 | [Skill](/zh-TW/development/extension-api/skills) | `context.skills.*` —— 安裝、讀取、寫入、搜尋、遷移作用域、嵌入打包 / 抽取；CardApp ctx 對等 |
 | [角色卡取代流程](/zh-TW/development/extension-api/character-replace-flow) | 取代角色卡時執行的登錄表：卡繫結保護槽位與取代後世界書動作 |
 | [UI 與彈窗](/zh-TW/development/extension-api/ui-and-popups) | 彈窗、載入器、範本、訊息格式化 |
-| [IterationStudio](/zh-TW/development/extension-api/iteration-studio) | AI 驅動迭代編輯的共享彈窗框架 —— 對話、會話、diff 預覽、批准 / 拒絕生命週期。adapter 提供工件形狀和工具 |
-| [執行面板](/zh-TW/development/extension-api/run-panel) | 多步 LLM 任務的共享記憶體內執行軌跡 —— 輪次、串流分節、停止、匯出。外掛透過工廠式 store 與面板驅動它 |
+| [工作台 API](/zh-TW/development/extension-api/workbench) | 統一工作台平台 —— 嵌入式工作區、AI 迭代目標、問答資料來源、本機建議規則 |
+| [迭代工具函式庫](/zh-TW/development/extension-api/iteration-studio) | 共享 `iterationLibrary` 模組 —— runner、儲存、差異對比、提案匯流排與世界書 / 技能 / 預設工具 |
+| [執行面板](/zh-TW/development/extension-api/run-panel) | 多步 LLM 任務的共享記憶體執行軌跡與懸浮執行面板 —— 輪次、串流分節、停止、匯出 |
 | [外掛整合](/zh-TW/development/extension-api/plugin-integration) | 正則執行時、搜尋工具、擴充 API 註冊表、事件系統、i18n、設定儲存、除錯與 scraper 註冊、tokenization、工具函式、symbols 與常數 |
 | [底層端點](/zh-TW/development/extension-api/low-level-endpoints) | 原始 HTTP 路由（僅供進階 / 除錯場景使用） |
 
@@ -48,7 +50,11 @@ const context = Luker.getContext();
 | `context.constants` | `unset`、`promptRoles`、`promptTypes`、`wiAnchor`、`wiPosition` |
 | `context.macros` | `register`、`registerAlias`、`registry`、`engine`、`category`、`envBuilder` |
 | `context.loader` | `show`、`hide`、`active`、`get`、`isBlocking`、`ToastMode`、`Handle` |
+| `context.workbench` | `registerWorkspace`、`registerIterateTarget`、`registerAskProvider`、`registerSuggestRuleProvider`、`open`、`saveSettingsChecked`、`getWorkspaces`、`getIterateTargets`、`getAskProviders`、`getSuggestRuleProviders`、`subscribe` |
+| `context.runPanel` | `createRunStore`、`createRunPanel`、`attachDock`、`openRunDock`、`toggleRunDock`、`getRunRecorder`、`events`、`withRound`、`withStreamingSection` |
+| `context.iterationLibrary` | `applyEdits`、`inverseEdit`、`registerOp`、`runner`、`storage`、`proposalBus`、`tools`、`render`、`textDiff`、`zoomOverlay`、`ui` |
 | `context.skills` | `list`、`get`、`readFile`、`listFiles`、`search`、`writeFile`、`editFile`、`deleteFile`、`install`、`delete`、`rename`、`moveScope`、`importBundled`、`listBundledManifest`、`packForEmbed`、`previewExtractEmbed`、`executeExtractEmbed`、`importFromUrl` |
+| `context.imageGeneration` | `isAvailable`、`generate`、`getCapabilities`、`listPresets`、`getCurrentPreset`、`switchPreset`、`getAvailableLoras` |
 | `context.worldInfoEntry` | `template`、`create`、`delete`、`setButtonClass`、`setGlobalSelection`、`getSorted` |
 | `context.chatWorldInfo` | `getNames`、`setSelection`、`globalSelection` |
 | `context.openai` | `proxies`、`ZAI_ENDPOINT`、`stripPresetConnectionFields` |
@@ -71,7 +77,7 @@ Luker 基於 SillyTavern 建構，但在 API 層面有以下主要差異：
 | 角色輔助世界書 | 無 | `getCharaAuxWorlds()` |
 | 生成鉤子 | 基礎事件 | 新增 `GENERATION_CONTEXT_READY`、`GENERATION_BEFORE_WORLD_INFO_SCAN` 等細粒度鉤子 |
 | 事件排序 | 註冊順序 | 支援 `priority`、`pluginOrder`、`makeFirst`/`makeLast` |
-| 正則執行時 | 無外掛 API | `registerManagedRegexProvider()` |
+| 正則執行時 | 無外掛 API | `context.regex.*` 統一 API |
 | 搜尋工具 | 無外掛 API | `Luker.searchTools` 全域 API |
 | 函數呼叫 | 基礎 `ToolManager` | 純文字模式支援 + 連線級獨立開關 + `sendOpenAIRequest` 預設覆寫 |
 | 連線設定 | 全域單一 | `context.presets.resolve()` 支援按預設解析連線設定 |
