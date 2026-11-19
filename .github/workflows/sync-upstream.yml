@@ -1,14 +1,11 @@
 name: Sync upstream (non-conflicting)
-
 on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
-
 permissions:
   contents: write
   issues: write
-
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
@@ -20,6 +17,8 @@ jobs:
     env:
       UPSTREAM_REPO: funnycups/Luker
       BRANCH: release
+      ISSUE_TITLE: Upstream sync blocked by merge conflict
+      ISSUE_LABEL: upstream-sync
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,23 +35,53 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch --no-tags upstream "$BRANCH"
+          UP_SHORT=$(git rev-parse --short "upstream/$BRANCH")
+          echo "upstream=$UP_SHORT" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "upstream/$BRANCH" HEAD; then
-            echo 'Already up to date.'
             echo 'result=uptodate' >> "$GITHUB_OUTPUT"
+            echo "### Upstream sync: already up to date with \`${UPSTREAM_REPO}@${UP_SHORT}\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if git merge --no-edit -m "Merge upstream ${UPSTREAM_REPO}@$(git rev-parse --short upstream/$BRANCH)" "upstream/$BRANCH"; then
+          INCOMING=$(git rev-list --count "HEAD..upstream/$BRANCH")
+          # patience diff anchors on unique lines, which avoids spurious
+          # conflicts when functions move around inside large files.
+          if git merge --no-edit -X patience -m "Merge upstream ${UPSTREAM_REPO}@${UP_SHORT}" "upstream/$BRANCH"; then
             echo 'result=merged' >> "$GITHUB_OUTPUT"
+            {
+              echo "### Upstream sync: merged \`${UPSTREAM_REPO}@${UP_SHORT}\`"
+              echo
+              echo "${INCOMING} upstream commit(s) merged into \`${BRANCH}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
             git merge --abort
             echo 'result=conflict' >> "$GITHUB_OUTPUT"
+            {
+              echo "### :warning: Upstream sync blocked by merge conflict"
+              echo
+              echo "Merging \`${UPSTREAM_REPO}@${UP_SHORT}\` (${INCOMING} commit(s)) into \`${BRANCH}\` stopped; nothing was pushed."
+              echo
+              echo "**Conflicting files:**"
+              echo
+              echo '```'
+              if [ -s "$RUNNER_TEMP/conflicts.txt" ]; then cat "$RUNNER_TEMP/conflicts.txt"; else echo '(unknown)'; fi
+              echo '```'
+              echo
+              echo "**Resolve locally:**"
+              echo
+              echo '```bash'
+              echo "git fetch upstream ${BRANCH}"
+              echo "git merge -X patience upstream/${BRANCH}"
+              echo "# fix conflicts, then"
+              echo "git push origin ${BRANCH}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Syntax check changed JS
         if: steps.merge.outputs.result == 'merged'
         run: |
-          git diff --name-only --diff-filter=AM ORIG_HEAD HEAD -- '*.js' '*.mjs' | while read -r f; do
+          git diff --name-only --diff-filter=AM ORIG_HEAD HEAD -- '*.js' '*.mjs' '*.cjs' | while read -r f; do
             node --check "$f" || { echo "::error file=$f::syntax error after merge"; exit 1; }
           done
 
@@ -60,25 +89,80 @@ jobs:
         if: steps.merge.outputs.result == 'merged'
         run: git push origin "HEAD:$BRANCH"
 
+      - name: Close resolved conflict issue
+        if: success() && steps.merge.outputs.result != 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const { data: repo } = await github.rest.repos.get(context.repo);
+              if (!repo.has_issues) {
+                core.info('Issues are disabled for this repository; nothing to close.');
+                return;
+              }
+              const open = await github.paginate(github.rest.issues.listForRepo, {
+                ...context.repo, state: 'open', labels: process.env.ISSUE_LABEL, per_page: 100,
+              });
+              const targets = open.filter(i => !i.pull_request && i.title === process.env.ISSUE_TITLE);
+              const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+              const upstream = `${process.env.UPSTREAM_REPO}@${{ steps.merge.outputs.upstream }}`;
+              for (const issue of targets) {
+                await github.rest.issues.createComment({
+                  ...context.repo, issue_number: issue.number,
+                  body: `Upstream sync recovered: \`${process.env.BRANCH}\` now contains \`${upstream}\`.\n\nRun: ${runUrl}`,
+                });
+                await github.rest.issues.update({
+                  ...context.repo, issue_number: issue.number, state: 'closed', state_reason: 'completed',
+                });
+                core.info(`Closed conflict issue #${issue.number}`);
+              }
+            } catch (error) {
+              core.warning(`Could not close conflict issue: ${error.message}`);
+            }
+
       - name: Report conflict
         if: steps.merge.outputs.result == 'conflict'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const files = fs.readFileSync('/tmp/conflicts.txt', 'utf8').trim();
-            const title = 'Upstream sync blocked by merge conflict';
-            const body = [
-              `Automatic merge of \`${process.env.UPSTREAM_REPO}@${process.env.BRANCH}\` stopped; nothing was pushed.`,
-              '', 'Conflicting files:', '```', files || '(unknown)', '```',
-              '', 'Resolve locally: `git fetch upstream && git merge upstream/release`, then push.',
-              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            ].join('\n');
-            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: 'open', labels: 'upstream-sync' });
-            const existing = open.find(i => i.title === title);
-            if (existing) {
-              await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+            const listFile = `${process.env.RUNNER_TEMP}/conflicts.txt`;
+            const files = (fs.existsSync(listFile) ? fs.readFileSync(listFile, 'utf8') : '').trim() || '(unknown)';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const upstream = `${process.env.UPSTREAM_REPO}@${{ steps.merge.outputs.upstream }}`;
+
+            let issueNote = '';
+            const { data: repo } = await github.rest.repos.get(context.repo);
+            if (!repo.has_issues) {
+              core.notice('Issues are disabled for this repository; conflict details are in the job summary only.');
             } else {
-              await github.rest.issues.create({ ...context.repo, title, body, labels: ['upstream-sync'] });
+              try {
+                const body = [
+                  `Automatic merge of \`${upstream}\` into \`${process.env.BRANCH}\` stopped; nothing was pushed.`,
+                  '', 'Conflicting files:', '```', files, '```',
+                  '', `Resolve locally: \`git fetch upstream && git merge -X patience upstream/${process.env.BRANCH}\`, then push.`,
+                  `Run: ${runUrl}`,
+                ].join('\n');
+                const open = await github.paginate(github.rest.issues.listForRepo, {
+                  ...context.repo, state: 'open', labels: process.env.ISSUE_LABEL, per_page: 100,
+                });
+                const existing = open.find(i => !i.pull_request && i.title === process.env.ISSUE_TITLE);
+                let number;
+                if (existing) {
+                  await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+                  number = existing.number;
+                } else {
+                  const { data: created } = await github.rest.issues.create({
+                    ...context.repo, title: process.env.ISSUE_TITLE, body, labels: [process.env.ISSUE_LABEL],
+                  });
+                  number = created.number;
+                }
+                issueNote = `Tracking issue: #${number}`;
+              } catch (error) {
+                core.warning(`Could not create/update conflict issue: ${error.message}`);
+              }
             }
-            core.warning('Merge conflict with upstream; see issue.');
+            if (issueNote) {
+              await core.summary.addRaw(`\n${issueNote}\n`).write();
+            }
+            core.setFailed(`Upstream merge conflict in: ${files.split('\n').join(', ')} (see job summary)`);

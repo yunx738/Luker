@@ -353,7 +353,7 @@ function getCharacterLookupIndex() {
             list.push(avatar);
         }
     }
-    characterLookupIndex = { source: characters, length: characters.length, byAvatar, personaToCharacters };
+    characterLookupIndex = { source: characters, length: characters.length, byAvatar, personaToCharacters, missing: new Set() };
     if (!characterLookupIndexResetQueued) {
         characterLookupIndexResetQueued = true;
         queueMicrotask(() => {
@@ -368,15 +368,30 @@ function getCharacterByAvatar(avatarId) {
     if (!avatarId) {
         return null;
     }
-
-    const index = getCharacterLookupIndex().byAvatar.get(avatarId);
-    const character = index === undefined ? null : characters[index];
-    if (character?.avatar === avatarId) {
-        return character;
+    const lookup = getCharacterLookupIndex();
+    const index = lookup.byAvatar.get(avatarId);
+    if (index !== undefined) {
+        const character = characters[index];
+        if (character?.avatar === avatarId) {
+            return character;
+        }
+        // Slot was mutated in place within this tick; rebuild the index once.
+        invalidateCharacterLookupIndex();
+        const refreshedIndex = getCharacterLookupIndex().byAvatar.get(avatarId);
+        return refreshedIndex === undefined ? null : (characters[refreshedIndex] ?? null);
     }
-    // Array was mutated in place within this tick; fall back to a fresh scan.
-    invalidateCharacterLookupIndex();
-    return characters.find(c => c?.avatar === avatarId) ?? null;
+    if (lookup.missing.has(avatarId)) {
+        return null;
+    }
+    // Guard against a same-length in-place replacement within this tick, but do
+    // not drop the index for genuinely missing/deleted avatars.
+    const found = characters.find(c => c?.avatar === avatarId) ?? null;
+    if (found) {
+        invalidateCharacterLookupIndex();
+        return found;
+    }
+    lookup.missing.add(avatarId);
+    return null;
 }
 
 function isPlainObject(value) {
