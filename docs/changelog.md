@@ -6,7 +6,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 
 ### Workbench
 
-- Added the floating Workbench window with prompt token breakdown, local configuration suggestions, and read-only AI Q&A.
+- Added the responsive floating Workbench window with prompt token breakdown, local configuration suggestions, and read-only AI Q&A.
 - Unified AI iteration for Memory Graph, Memory Structure, Multi-Agent Orchestrator, Image Generation, presets, character cards, and world books inside Workbench, with diff review, Change history undo, and automatic migration of historical iteration sessions.
 
 ### Multi-Agent Orchestrator
@@ -22,12 +22,15 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 ### Connections & Models
 
 - Added a network proxy setting to chat completion connection profiles, taking precedence over the global proxy.
+- Fixed switching APIs incorrectly prompting to reload the chat for preset regex scripts.
+- Fixed Vertex AI requests to the `us` and `eu` multi-regions using an invalid hostname.
 
 ### Image generation
 
 - Added connection profile binding and OpenAI-compatible multimodal chat image generation to Image Generation.
 - Added character reference image, style reference image, and source image editing support across supported image backends.
 - Embedded Image Studio, the global Character Archive, and illustration run traces into Workbench, supporting fanwork character exploration and original character reference design.
+- Added AI iteration for ComfyUI API-format workflows in Workbench with live node introspection, template node wiring, draft test generation, and per-node diff review.
 - Added inline illustration locking, version switching, and source image editing to AI Illustration.
 - Fixed AI Illustration settings labels being squeezed into vertical text.
 
@@ -76,6 +79,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Fixed background Prompt Manager refreshes interrupting an active prompt drag.
 - Fixed prompt assembly failures showing a generic token-counting error, dispatching an empty context, and omitting cross-frame error details from diagnostics logs.
 - Fixed preset switching and background preset loading overwriting another preset's regex rules and settings.
+- Fixed saving one world book dropping another world book's pending save.
 
 ### Storage & Sync
 
@@ -115,6 +119,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 ### Performance
 
 - Optimized first-screen startup, resource revalidation, settings saving, and hidden Prompt Manager rendering.
+- Optimized prompt group collapse and expand in the Prompt Manager.
 
 ## v2.9.0-rc.2 (2026-11-11)
 
