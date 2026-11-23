@@ -409,6 +409,60 @@ describe('event reactions', () => {
         expect((await fs.get()).state).toEqual({ a: 1 });
     });
 
+    test('mid-chat truncate keeps earlier floors and avoids stale-tail VALIDATION_COMMIT', async () => {
+        // 5 messages: floors 0, 2, 4 hold commits, and floor 4 is on swipe 2.
+        // Deleting single message at floor 2 shifts old floors 3..4 down to 2..3
+        // while chat.length only drops from 5 to 4. Settling with fromFloor=2
+        // drops floors >= 2, keeps floor 0 intact, and lets new writes land at floor 2.
+        const chatRef = { value: [msg(0), msg(0), msg(0), msg(0), msg(2)] };
+        const { store, deps } = makeDeps(chatRef);
+        const fs = createFloorStateWithDeps({ namespace: 'foo' }, deps);
+
+        await fs.update(() => ({ items: ['f0'] }), { floor: 0 });
+        await fs.update((s) => ({ items: [...s.items, 'f2'] }), { floor: 2 });
+        await fs.update((s) => ({ items: [...s.items, 'f4'] }), { floor: 4 });
+        expect((await fs.get()).state).toEqual({ items: ['f0', 'f2', 'f4'] });
+
+        // Splice out floor 2 only (chat length becomes 4, NOT 2).
+        chatRef.value.splice(2, 1);
+        await fs.__handleMessageDeleted(2);
+        await fs.ready();
+
+        const log = store._raw.get('foo__floor_log');
+        expect(log.commits.map((c) => c.floor)).toEqual([0]);
+        expect((await fs.get()).state).toEqual({ items: ['f0'] });
+        expect(store._raw.get('foo__orphans')).toBeUndefined();
+
+        // Subsequent commit anchored at floor 2 succeeds (log tail is 0, not stale 4).
+        const nextWrite = await fs.update((s) => ({ items: [...s.items, 'new-f2'] }), { floor: 2 });
+        expect(nextWrite.ok).toBe(true);
+        expect((await fs.get()).state).toEqual({ items: ['f0', 'new-f2'] });
+    });
+
+    test('MESSAGE_SWIPE_DELETED with wasActive=true truncates later floors', async () => {
+        const chatRef = { value: [msg(0), msg(1), msg(0)] };
+        const { store, eventSource, deps } = makeDeps(chatRef);
+        const fs = createFloorStateWithDeps({ namespace: 'foo' }, deps);
+
+        await fs.update(() => ({ list: ['a'] }), { floor: 0 });
+        await fs.update((s) => ({ list: [...s.list, 'b'] }), { floor: 1 });
+        await fs.update((s) => ({ list: [...s.list, 'c'] }), { floor: 2 });
+
+        // Delete active swipe 1 on non-tail floor 1 → floor 1 becomes swipe 0.
+        chatRef.value[1] = msg(0);
+        await eventSource.emit(event_types.MESSAGE_SWIPE_DELETED, {
+            messageId: 1,
+            swipeId: 1,
+            newSwipeId: 0,
+            wasActive: true,
+        });
+        await fs.ready();
+
+        expect(store._raw.get('foo__floor_log').commits.map((c) => c.floor)).toEqual([0]);
+        expect((await fs.get()).state).toEqual({ list: ['a'] });
+        expect(store._raw.get('foo__orphans')).toBeUndefined();
+    });
+
     test('MESSAGE_DELETED to length 0 leaves an empty log and null state', async () => {
         const chatRef = { value: [msg(0)] };
         const { store, eventSource, deps } = makeDeps(chatRef);
@@ -913,6 +967,38 @@ describe('broken-log recovery via floor truncate', () => {
         store._raw.set('foo__orphans', { ...firstOrphan, tampered: true });
         expect((await fs.get()).state).toEqual({ x: 1 });
         expect(store._raw.get('foo__orphans').tampered).toBe(true);
+    });
+
+    test('recovery tracks root-level replace commits when locating brokenFloor', async () => {
+        // Commit #0 uses a root-level replace (path: ''), which returns a new
+        // document instead of mutating probe in place. Commit #1 cleanly builds
+        // on it, and only commit #2 is broken. Recovery must truncate at floor 2
+        // and preserve floors 0 and 1 (not falsely blame floor 1).
+        const chatRef = { value: [msg(0), msg(0), msg(0)] };
+        const { store, deps } = makeDeps(chatRef);
+        store._raw.set('foo__floor_log', {
+            version: 1,
+            commits: [
+                { floor: 0, swipeId: 0, patches: [{ op: 'replace', path: '', value: { x: 1 } }] },
+                { floor: 1, swipeId: 0, patches: [{ op: 'replace', path: '/x', value: 2 }] },
+                {
+                    floor: 2, swipeId: 0, patches: [
+                        { op: 'test', path: '/x', value: 999 },
+                        { op: 'replace', path: '/x', value: 3 },
+                    ],
+                },
+            ],
+        });
+
+        const fs = createFloorStateWithDeps({ namespace: 'foo' }, deps);
+        await fs.ready();
+
+        const result = await fs.get();
+        expect(result.ok).toBe(true);
+        expect(result.recovered).toBe(true);
+        expect(result.state).toEqual({ x: 2 });
+        expect(store._raw.get('foo__orphans').brokenFloor).toBe(2);
+        expect(store._raw.get('foo__floor_log').commits.map((c) => c.floor)).toEqual([0, 1]);
     });
 });
 

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { h, clear, copyText, put } from '../../../../lens-shared/util.js';
+import { requireStoredPrompt } from '../../../../lib/prompt-values.js';
 import {
     button,
     emptyState,
     iconButton,
     sectionTitle,
-    segmented,
     selectInput,
     switchControl,
 } from '../../../../lens-shared/ui.js';
@@ -16,20 +16,24 @@ import {
     requestToolCallsWithRetry,
 } from '../../../../lib/iter-tool-calling.js';
 import {
-    LOREBOOK_READ_TOOL_DEFS,
-    isLorebookReadTool,
-    runLorebookReadTool,
-} from '../../../../iteration-library/tools/lorebook-reads.js';
-import { createCharacterProfileStore } from '../../character-archive/store.js';
-import { promoteLocalReferenceImage } from '../../character-sources-client.js';
+    buildCompactProfileIndex,
+    createCharacterProfileStore,
+    formatCharacterProfileForAgent,
+} from '../../character-archive/store.js';
+import { filterReplayReferences, resolveCharacterReferenceMode } from '../../capabilities.js';
 import { defaultLoadVisualPreviewDataUrl } from '../../exploration/agent.js';
-import { readCharacterCardData } from '../../exploration/tools.js';
-import { DEFAULT_STUDIO_PROMPT, makeIllustrationId } from '../../illustration/presets.js';
+import { makeIllustrationId } from '../../illustration/presets.js';
 import { getPresetById, selectPreset } from '../../illustration/settings.js';
+import {
+    findCharacterImageConflict,
+    formatBackendCapabilitiesBlock,
+    formatCharacterReferencePolicyBlock,
+} from '../../illustration/task.js';
 import {
     GENERATE_IMAGE_TOOL,
     READ_CHARACTER_PROFILES_TOOL,
     buildGenerateImageTool,
+    resolvePromptCharacterRefs,
     validateGenerateImageArgs,
 } from '../../illustration/tools.js';
 import { resolveReplayLoras } from '../../lora/tool.js';
@@ -43,108 +47,6 @@ import {
 import { icon } from '../icons.js';
 import { i18n, i18nFormat } from '../i18n.js';
 
-export const DEFAULT_CHARACTER_DESIGN_PROMPT = `You are an interactive character visual designer helping the user establish canonical reference portraits and outfits for original or unillustrated characters.
-
-Workflow:
-1. When designing a character from a card, worldbook, or user persona, read the source material first using read_character_card, read_user_persona, world_book_list / lorebook_list / lorebook_query / lorebook_get, or read_character_profiles.
-2. Call generate_image with a clean, single-character portrait or full-body design prompt on a neutral or simple background so facial traits, hairstyle, build, and outfit read clearly.
-3. Across follow-up turns, incorporate user feedback and pass source_image_id or character_image_ids to keep approved traits consistent while refining details or adding outfits.
-4. Once an image satisfies the character design or the user asks to save/stage the profile, call stage_character_profile referencing the chosen gallery image_ids. Never invent filesystem paths; pass image_ids returned by generate_image.`;
-
-const READ_CHARACTER_CARD_TOOL = Object.freeze({
-    type: 'function',
-    function: {
-        name: 'read_character_card',
-        description: 'Read character card description, personality, scenario, bound primary worldbook, and local card avatar/sprite paths.',
-        parameters: {
-            type: 'object',
-            properties: {
-                card_avatar: {
-                    type: 'string',
-                    description: 'Optional character card avatar filename or name. Omit to read the selected source card.',
-                },
-            },
-            additionalProperties: false,
-        },
-    },
-});
-
-const READ_USER_PERSONA_TOOL = Object.freeze({
-    type: 'function',
-    function: {
-        name: 'read_user_persona',
-        description: 'Read the active user persona display name, appearance/persona description, and /User Avatars/... image path.',
-        parameters: {
-            type: 'object',
-            properties: {},
-            additionalProperties: false,
-        },
-    },
-});
-
-const STAGE_CHARACTER_PROFILE_TOOL = Object.freeze({
-    type: 'function',
-    function: {
-        name: 'stage_character_profile',
-        description: 'Stage a character visual profile proposal for user review and archive application using gallery image_ids generated in this session.',
-        parameters: {
-            type: 'object',
-            properties: {
-                profile_id: { type: 'string', description: 'Optional existing character profile id to update.' },
-                name: { type: 'string', description: 'Canonical character display name.' },
-                aliases: { type: 'array', items: { type: 'string' } },
-                source_work: { type: 'string', description: 'Source work or project label.' },
-                canonical_tags: { type: 'array', items: { type: 'string' }, description: 'Core appearance tags.' },
-                negative_tags: { type: 'array', items: { type: 'string' } },
-                prose_description: { type: 'string', description: 'Natural language appearance summary.' },
-                base_image_ids: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Optional gallery image_ids to attach to the default outfit.',
-                },
-                outfits: {
-                    type: 'array',
-                    items: {
-                        type: 'object',
-                        properties: {
-                            id: { type: 'string' },
-                            name: { type: 'string' },
-                            tags: { type: 'array', items: { type: 'string' } },
-                            prose: { type: 'string' },
-                            image_ids: {
-                                type: 'array',
-                                items: { type: 'string' },
-                                description: 'Gallery image_ids from generate_image to promote as reference sheets for this outfit.',
-                            },
-                        },
-                        required: ['name'],
-                        additionalProperties: false,
-                    },
-                },
-                default_outfit_id: { type: 'string' },
-            },
-            required: ['name'],
-            additionalProperties: false,
-        },
-    },
-});
-
-function readUserPersonaData(context) {
-    const name = String(context?.name1 || 'User');
-    const description = String(context?.powerUserSettings?.persona_description || '').trim();
-    const explicitAvatar = String(
-        context?.userAvatar
-        || globalThis.document?.querySelector?.('#user_avatar_block .avatar.selected')?.getAttribute?.('imgfile')
-        || '',
-    ).trim();
-    const avatarImagePath = explicitAvatar ? `/User Avatars/${explicitAvatar}` : '';
-    return {
-        name,
-        description,
-        avatarImagePath,
-    };
-}
-
 function resolveGalleryOrManagedPath(idOrPath, session) {
     const token = String(idOrPath || '').trim();
     if (!token) return '';
@@ -156,11 +58,32 @@ function resolveGalleryOrManagedPath(idOrPath, session) {
     return '';
 }
 
+function formatConflictMessage(conflict) {
+    const raw = String(conflict?.message || '').trim();
+    return raw
+        ? i18n(raw)
+        : i18n('Character reference images are incompatible with the active image backend or workflow.');
+}
+
+function getCharacterRefLimitError(references, capabilities) {
+    const totalCharRefs = (Array.isArray(references) ? references : []).filter(r => r?.role === 'character').length;
+    if (
+        capabilities?.supportsCharacterReference
+        && capabilities.maxCharacterReferences !== null
+        && capabilities.maxCharacterReferences !== undefined
+        && totalCharRefs > capabilities.maxCharacterReferences
+    ) {
+        return `Selected character references resolve to ${totalCharRefs} image(s), exceeding limit of ${capabilities.maxCharacterReferences}.`;
+    }
+    return '';
+}
+
 export function createStudioView(app) {
     const el = h('div', { class: 'sdlens-studio', dataset: { sdView: 'studio' } });
     let sessions = [];
     let profiles = [];
     let session = null;
+    let currentCapabilities = null;
     let selectedImageId = '';
     let draftInput = '';
     let busy = false;
@@ -177,19 +100,35 @@ export function createStudioView(app) {
     function resolveImageBackend() {
         if (app.imageService) return app.imageService;
         const ctx = getCtx();
+        const isApiAvailable = () => (
+            ctx?.imageGeneration
+            && (typeof ctx.imageGeneration.isAvailable !== 'function' || ctx.imageGeneration.isAvailable())
+        );
         return {
             async getAvailableLoras() {
-                const caps = await ctx?.imageGeneration?.getCapabilities?.();
+                if (!isApiAvailable()) return { names: [], includeWeight: false };
+                const caps = await ctx.imageGeneration.getCapabilities?.();
                 return caps?.availableLoras || { names: [], includeWeight: false };
             },
             async getCapabilities() {
-                return (await ctx?.imageGeneration?.getCapabilities?.()) || null;
+                if (!isApiAvailable()) return null;
+                return (await ctx.imageGeneration.getCapabilities?.()) || null;
             },
             async generate(prompt, opts) {
                 const res = await ctx.imageGeneration.generate({ prompt, ...opts });
                 return res.imagePath;
             },
         };
+    }
+
+    async function refreshCapabilities() {
+        const imageBackend = resolveImageBackend();
+        try {
+            currentCapabilities = (await imageBackend.getCapabilities?.()) ?? null;
+        } catch {
+            currentCapabilities = null;
+        }
+        return currentCapabilities;
     }
 
     async function refreshLists() {
@@ -204,7 +143,7 @@ export function createStudioView(app) {
     }
 
     async function ensureSessionLoaded() {
-        await refreshLists();
+        await Promise.all([refreshLists(), refreshCapabilities()]);
         const ill = getIllSettings();
         if (!session) {
             if (sessions.length > 0) {
@@ -220,13 +159,12 @@ export function createStudioView(app) {
     async function persistCurrentSession(target = session) {
         const ctx = getCtx();
         if (!target || typeof ctx?.updateGlobalState !== 'function') return;
-        if (target.messages.length === 0 && !target.stagedProfileDraft && target.images.length === 0) {
+        if (target.messages.length === 0 && target.images.length === 0) {
             return;
         }
         const saved = await createStudioSessionStore(ctx).saveSession(target);
         if (session?.id === target.id) {
-            Object.assign(target, saved);
-            session = target;
+            target.updatedAt = saved.updatedAt;
         }
         await refreshLists();
     }
@@ -258,36 +196,26 @@ export function createStudioView(app) {
             capabilities,
             includeStudioFields: true,
         });
-        if (session?.mode !== 'character_design') {
-            return [genTool];
+        if (capabilities?.characterReferenceEnabled) {
+            return [genTool, JSON.parse(JSON.stringify(READ_CHARACTER_PROFILES_TOOL))];
         }
-        return [
-            genTool,
-            JSON.parse(JSON.stringify(READ_CHARACTER_CARD_TOOL)),
-            JSON.parse(JSON.stringify(READ_USER_PERSONA_TOOL)),
-            ...LOREBOOK_READ_TOOL_DEFS.map(t => JSON.parse(JSON.stringify(t))),
-            JSON.parse(JSON.stringify(READ_CHARACTER_PROFILES_TOOL)),
-            JSON.parse(JSON.stringify(STAGE_CHARACTER_PROFILE_TOOL)),
-        ];
+        return [genTool];
     }
 
-    function buildStudioSystemPrompt(preset) {
-        const baseStudio = String(preset?.studioPrompt || '').trim() || DEFAULT_STUDIO_PROMPT;
-        if (session?.mode !== 'character_design') {
-            return baseStudio;
+    function buildStudioSystemPrompt(preset, { capabilities = null, characterArchiveIndex = undefined } = {}) {
+        const baseStudio = requireStoredPrompt(preset.studioPrompt, i18n('Fill in the prompt or reset it to the default.'));
+        const parts = [baseStudio];
+        if (capabilities) {
+            const capsBlock = formatBackendCapabilitiesBlock(capabilities);
+            if (capsBlock) parts.push(capsBlock);
+            if (capabilities.characterReferenceEnabled) {
+                const policyBlock = formatCharacterReferencePolicyBlock(capabilities, { includeExplore: false });
+                if (policyBlock) parts.push(policyBlock);
+                const archiveText = String(characterArchiveIndex || '').trim() || '(empty)';
+                parts.push(`<character_archive>\n${archiveText}\n</character_archive>`);
+            }
         }
-        const customDesign = String(preset?.characterDesignPrompt || '').trim();
-        const designBlock = customDesign || DEFAULT_CHARACTER_DESIGN_PROMPT;
-        const contextNotes = [];
-        if (session.targetProfileId) {
-            contextNotes.push(`Target profile id: ${session.targetProfileId}`);
-        }
-        if (session.sourceKind === 'persona') {
-            contextNotes.push('Primary source: active user persona (call read_user_persona).');
-        } else if (session.sourceCardAvatar) {
-            contextNotes.push(`Primary source character card: ${session.sourceCardAvatar} (call read_character_card).`);
-        }
-        return [designBlock, baseStudio, ...contextNotes].filter(Boolean).join('\n\n');
+        return parts.filter(Boolean).join('\n\n');
     }
 
     async function executeSingleStudioTool(rawCall, { loraState, capabilities, imageBackend, signal }) {
@@ -305,12 +233,40 @@ export function createStudioView(app) {
                 return { toolResult: { status: 'failed', error: validation.error }, generatedImage: null };
             }
             const val = validation.value;
-            const references = [];
+            const allowSource = !capabilities || Boolean(capabilities.supportsSourceImage);
+            const allowCharacter = !capabilities || Boolean(capabilities.supportsCharacterReference);
 
-            // Explicit or attached source image
-            const sourceToken = val.sourceImageId
-                || session.attachedReferences.find(r => r.role === 'source')?.imagePath
-                || '';
+            if (!allowSource && val.sourceImageId) {
+                return {
+                    toolResult: {
+                        status: 'failed',
+                        error: 'Source image editing (img2img) is disabled in the current preset; omit source_image_id.',
+                    },
+                    generatedImage: null,
+                };
+            }
+            if (!allowCharacter && val.characterImageIds?.length > 0) {
+                return {
+                    toolResult: {
+                        status: 'failed',
+                        error: 'Character reference images are disabled in the current preset; omit character_image_ids.',
+                    },
+                    generatedImage: null,
+                };
+            }
+
+            const references = [];
+            const seenPaths = new Set();
+            const pushUniqueRef = (ref) => {
+                if (!ref?.imagePath || seenPaths.has(ref.imagePath)) return;
+                seenPaths.add(ref.imagePath);
+                references.push(ref);
+            };
+
+            // Explicit or attached source image (gated on supportsSourceImage)
+            const sourceToken = allowSource
+                ? (val.sourceImageId || session.attachedReferences.find(r => r.role === 'source')?.imagePath || '')
+                : '';
             if (sourceToken) {
                 const resolvedSource = resolveGalleryOrManagedPath(sourceToken, session);
                 if (!resolvedSource) {
@@ -319,24 +275,75 @@ export function createStudioView(app) {
                         generatedImage: null,
                     };
                 }
-                references.push({ imagePath: resolvedSource, role: 'source' });
+                pushUniqueRef({ imagePath: resolvedSource, role: 'source' });
             }
 
-            // Character reference images from gallery or attached references
-            for (const charToken of val.characterImageIds || []) {
-                const resolvedChar = resolveGalleryOrManagedPath(charToken, session);
-                if (!resolvedChar) {
+            const hasExplicitOrAttachedCharImgs = Boolean(
+                val.characterRefs?.length
+                || val.characterImageIds?.length
+                || (allowCharacter && session.attachedReferences.some(r => r.role === 'character')),
+            );
+            const charImgConflict = hasExplicitOrAttachedCharImgs ? findCharacterImageConflict(capabilities) : null;
+            if (charImgConflict) {
+                return {
+                    toolResult: { status: 'failed', error: formatConflictMessage(charImgConflict) },
+                    generatedImage: null,
+                };
+            }
+
+            const effectiveNegativePrompt = val.negativePrompt || '';
+
+            // Character archive refs (v2 character_refs)
+            if (Array.isArray(val.characterRefs) && val.characterRefs.length > 0) {
+                let profileMap = new Map(profiles.map(p => [p.id, p]));
+                if (typeof ctx?.getGlobalState === 'function') {
+                    const liveProfiles = await createCharacterProfileStore(ctx).listProfiles();
+                    profiles = liveProfiles;
+                    profileMap = new Map(liveProfiles.map(p => [p.id, p]));
+                }
+                const resolvedRefs = resolvePromptCharacterRefs(val.characterRefs, {
+                    profileMap,
+                    capabilities,
+                });
+                if (!resolvedRefs.ok) {
                     return {
-                        toolResult: { status: 'failed', error: `Unknown character_image_id "${charToken}".` },
+                        toolResult: { status: 'failed', error: resolvedRefs.error },
                         generatedImage: null,
                     };
                 }
-                references.push({ imagePath: resolvedChar, role: 'character' });
-            }
-            for (const att of session.attachedReferences.filter(r => r.role === 'character')) {
-                if (att?.imagePath && !references.some(r => r.imagePath === att.imagePath)) {
-                    references.push({ imagePath: att.imagePath, role: 'character', label: att.label || '' });
+                for (const ref of resolvedRefs.references) {
+                    pushUniqueRef(ref);
                 }
+            }
+
+            // Character reference images from gallery or attached references (gated on supportsCharacterReference)
+            if (allowCharacter) {
+                for (const charToken of val.characterImageIds || []) {
+                    const resolvedChar = resolveGalleryOrManagedPath(charToken, session);
+                    if (!resolvedChar) {
+                        return {
+                            toolResult: { status: 'failed', error: `Unknown character_image_id "${charToken}".` },
+                            generatedImage: null,
+                        };
+                    }
+                    pushUniqueRef({ imagePath: resolvedChar, role: 'character' });
+                }
+                for (const att of session.attachedReferences.filter(r => r.role === 'character')) {
+                    if (att?.imagePath) {
+                        pushUniqueRef({ imagePath: att.imagePath, role: 'character', label: att.label || '' });
+                    }
+                }
+            }
+
+            const capError = getCharacterRefLimitError(references, capabilities);
+            if (capError) {
+                return {
+                    toolResult: {
+                        status: 'failed',
+                        error: capError,
+                    },
+                    generatedImage: null,
+                };
             }
 
             const genOpts = {
@@ -345,7 +352,7 @@ export function createStudioView(app) {
                 loras: val.loras,
                 signal,
             };
-            if (val.negativePrompt) genOpts.negativePrompt = val.negativePrompt;
+            if (effectiveNegativePrompt) genOpts.negativePrompt = effectiveNegativePrompt;
             if (val.aspectRatio) genOpts.aspectRatio = val.aspectRatio;
             if (references.length > 0) genOpts.references = references;
 
@@ -353,15 +360,18 @@ export function createStudioView(app) {
             try {
                 const imageUrl = await imageBackend.generate(val.prompt, genOpts);
                 // Clear one-shot source attachment once used
-                session.attachedReferences = session.attachedReferences.filter(r => r.role !== 'source');
+                if (allowSource) {
+                    session.attachedReferences = session.attachedReferences.filter(r => r.role !== 'source');
+                }
                 const imgRecord = {
                     id: imgId,
                     prompt: val.prompt,
-                    negativePrompt: val.negativePrompt || '',
+                    negativePrompt: effectiveNegativePrompt,
                     aspectRatio: val.aspectRatio || '',
                     imageUrl,
-                    sourceImageId: val.sourceImageId || '',
-                    characterImageIds: val.characterImageIds || [],
+                    sourceImageId: sourceToken,
+                    characterImageIds: allowCharacter ? (val.characterImageIds || []) : [],
+                    characterRefs: allowCharacter ? (val.characterRefs || []) : [],
                     loras: val.loras,
                     status: 'ready',
                     error: '',
@@ -376,11 +386,12 @@ export function createStudioView(app) {
                 const imgRecord = {
                     id: imgId,
                     prompt: val.prompt,
-                    negativePrompt: val.negativePrompt || '',
+                    negativePrompt: effectiveNegativePrompt,
                     aspectRatio: val.aspectRatio || '',
                     imageUrl: '',
-                    sourceImageId: val.sourceImageId || '',
-                    characterImageIds: val.characterImageIds || [],
+                    sourceImageId: sourceToken,
+                    characterImageIds: allowCharacter ? (val.characterImageIds || []) : [],
+                    characterRefs: allowCharacter ? (val.characterRefs || []) : [],
                     loras: val.loras,
                     status: 'failed',
                     error: reason,
@@ -393,62 +404,21 @@ export function createStudioView(app) {
             }
         }
 
-        if (name === 'read_character_card') {
-            const targetAvatar = String(args.card_avatar || session?.sourceCardAvatar || '').trim();
-            const cardData = await readCharacterCardData(ctx, { cardAvatar: targetAvatar, abortSignal: signal });
-            return { toolResult: cardData, generatedImage: null };
-        }
-
-        if (name === 'read_user_persona') {
-            return { toolResult: readUserPersonaData(ctx), generatedImage: null };
-        }
-
-        if (isLorebookReadTool(name)) {
-            const out = await runLorebookReadTool(
-                { id: rawCall?.id, name, args },
-                { context: ctx, avatar: session?.sourceCardAvatar || '' },
-            );
-            return { toolResult: out, generatedImage: null };
-        }
-
         if (name === READ_CHARACTER_PROFILES_TOOL.function.name) {
+            if (!capabilities?.characterReferenceEnabled) {
+                return {
+                    toolResult: { status: 'failed', error: 'Character visual archive is disabled in the current preset.' },
+                    generatedImage: null,
+                };
+            }
+            const ids = Array.isArray(args.ids) ? args.ids : [];
             const store = createCharacterProfileStore(ctx);
-            const found = await store.getProfilesByIds(Array.isArray(args.ids) ? args.ids : []);
-            return { toolResult: { profiles: found }, generatedImage: null };
-        }
-
-        if (name === 'stage_character_profile') {
-            const staged = {
-                profileId: String(args.profile_id || session?.targetProfileId || '').trim(),
-                name: String(args.name || '').trim(),
-                aliases: Array.isArray(args.aliases) ? args.aliases.map(String) : [],
-                sourceWork: String(args.source_work || '').trim(),
-                sourceCardAvatars: session?.sourceCardAvatar ? [session.sourceCardAvatar] : [],
-                canonicalTags: Array.isArray(args.canonical_tags) ? args.canonical_tags.map(String) : [],
-                negativeTags: Array.isArray(args.negative_tags) ? args.negative_tags.map(String) : [],
-                proseDescription: String(args.prose_description || '').trim(),
-                baseImageIds: Array.isArray(args.base_image_ids) ? args.base_image_ids.map(String) : [],
-                outfits: Array.isArray(args.outfits)
-                    ? args.outfits.map((o, idx) => ({
-                        id: String(o.id || makeIllustrationId(`outfit_${idx + 1}`)),
-                        name: String(o.name || `Outfit ${idx + 1}`),
-                        tags: Array.isArray(o.tags) ? o.tags.map(String) : [],
-                        prose: String(o.prose || ''),
-                        imageIds: Array.isArray(o.image_ids) ? o.image_ids.map(String) : [],
-                    }))
-                    : [],
-                defaultOutfitId: String(args.default_outfit_id || '').trim(),
-            };
-            session.stagedProfileDraft = staged;
-            return {
-                toolResult: {
-                    ok: true,
-                    staged: true,
-                    name: staged.name,
-                    outfits: staged.outfits.length,
-                },
-                generatedImage: null,
-            };
+            const found = await store.getProfilesByIds(ids);
+            const agentMode = resolveCharacterReferenceMode(capabilities);
+            const formatted = found.length > 0
+                ? found.map(p => formatCharacterProfileForAgent(p, { mode: agentMode })).join('\n\n---\n\n')
+                : `No character profiles found for ids: ${ids.join(', ')}`;
+            return { toolResult: formatted, generatedImage: null };
         }
 
         return {
@@ -467,25 +437,47 @@ export function createStudioView(app) {
             app.toast(i18n('No illustration preset is selected.'), { error: true });
             return;
         }
-        const systemPrompt = buildStudioSystemPrompt(preset);
-        if (!systemPrompt) {
-            app.toast(i18n('The studio prompt is empty.'), { error: true });
+        try {
+            requireStoredPrompt(preset.studioPrompt, i18n('Fill in the prompt or reset it to the default.'));
+        } catch (error) {
+            app.toast(String(error?.message || error), { error: true });
             return;
         }
 
         const turnSession = session;
         busy = true;
         abortController = new AbortController();
-        draftInput = '';
-        appendStudioUserMessage(turnSession, text);
         paint();
 
+        let appendedUserMessage = false;
         try {
             const imageBackend = resolveImageBackend();
             const [loraState, capabilities] = await Promise.all([
                 imageBackend.getAvailableLoras(),
                 imageBackend.getCapabilities?.() ?? Promise.resolve(null),
+                refreshLists(),
             ]);
+            currentCapabilities = capabilities;
+
+            const charImgConflict = findCharacterImageConflict(capabilities);
+            if (charImgConflict) {
+                app.toast(`${i18n('Studio request failed')}: ${formatConflictMessage(charImgConflict)}`, { error: true });
+                return;
+            }
+
+            let characterArchiveIndex;
+            if (capabilities?.characterReferenceEnabled) {
+                characterArchiveIndex = buildCompactProfileIndex(profiles, {
+                    includeImages: Boolean(capabilities.supportsCharacterReference),
+                });
+            }
+            const systemPrompt = buildStudioSystemPrompt(preset, { capabilities, characterArchiveIndex });
+
+            draftInput = '';
+            appendStudioUserMessage(turnSession, text);
+            appendedUserMessage = true;
+            paint();
+
             const tools = buildStudioTools(loraState, capabilities);
             const allowedNames = tools.map(t => t.function.name);
             const taskMessages = [
@@ -608,7 +600,7 @@ export function createStudioView(app) {
                     paint();
                 }
 
-                if (turnSession.mode === 'general' && !turnSession.visualReview && roundImages.length > 0) {
+                if (!turnSession.visualReview && roundImages.length > 0) {
                     break;
                 }
             }
@@ -618,7 +610,9 @@ export function createStudioView(app) {
             if (!abortController?.signal?.aborted) {
                 app.toast(`${i18n('Studio request failed')}: ${String(err?.message || err)}`, { error: true });
             }
-            await persistCurrentSession(turnSession);
+            if (appendedUserMessage) {
+                await persistCurrentSession(turnSession);
+            }
         } finally {
             busy = false;
             abortController = null;
@@ -628,152 +622,14 @@ export function createStudioView(app) {
         }
     }
 
-    async function applyStagedProfile() {
-        const staged = session?.stagedProfileDraft;
-        if (!staged) return;
-        const ctx = getCtx();
-        const profileStore = createCharacterProfileStore(ctx);
-        const targetId = staged.profileId || session.targetProfileId || makeIllustrationId('char');
-        const beforeSnapshot = await profileStore.getProfile(targetId);
-
-        async function promoteIds(imageIds = []) {
-            const out = [];
-            for (const imgId of imageIds) {
-                const sourcePath = resolveGalleryOrManagedPath(imgId, session);
-                if (!sourcePath) continue;
-                const promoted = await promoteLocalReferenceImage({
-                    context: ctx,
-                    sourcePath,
-                    profileId: targetId,
-                });
-                if (promoted?.imagePath && !out.includes(promoted.imagePath)) {
-                    out.push(promoted.imagePath);
-                }
-            }
-            return out;
-        }
-
-        try {
-            const baseRefs = await promoteIds(staged.baseImageIds || []);
-            const outfits = [];
-            if (Array.isArray(staged.outfits) && staged.outfits.length > 0) {
-                for (let idx = 0; idx < staged.outfits.length; idx++) {
-                    const o = staged.outfits[idx];
-                    const outfitRefs = await promoteIds(o.imageIds || []);
-                    outfits.push({
-                        id: o.id || makeIllustrationId(`outfit_${idx + 1}`),
-                        name: o.name || `Outfit ${idx + 1}`,
-                        tags: o.tags || [],
-                        prose: o.prose || '',
-                        referenceImages: idx === 0 ? [...new Set([...baseRefs, ...outfitRefs])] : outfitRefs,
-                    });
-                }
-            } else {
-                outfits.push({
-                    id: 'outfit_default',
-                    name: 'Default',
-                    tags: [],
-                    prose: '',
-                    referenceImages: baseRefs,
-                });
-            }
-
-            const saved = await profileStore.upsertProfile({
-                id: targetId,
-                name: staged.name,
-                aliases: staged.aliases,
-                sourceWork: staged.sourceWork,
-                sourceCardAvatars: staged.sourceCardAvatars,
-                canonicalTags: staged.canonicalTags,
-                negativeTags: staged.negativeTags,
-                proseDescription: staged.proseDescription,
-                outfits,
-                defaultOutfitId: staged.defaultOutfitId || outfits[0]?.id || 'outfit_default',
-            });
-
-            session.targetProfileId = saved.id;
-            session.stagedProfileDraft = null;
-            await persistCurrentSession();
-            await refreshLists();
-
-            app.recordHistory?.({
-                label: `${i18n('Apply to character archive')}: ${saved.name}`,
-                undo: async () => {
-                    if (beforeSnapshot) {
-                        await profileStore.upsertProfile(beforeSnapshot);
-                    } else {
-                        await profileStore.deleteProfile(saved.id);
-                    }
-                    await refreshLists();
-                    paint();
-                },
-            });
-
-            app.toast(i18nFormat('Applied character profile "${0}" to archive.', saved.name));
-            paint();
-        } catch (err) {
-            app.toast(String(err?.message || err), { error: true });
-        }
-    }
-
-    async function promoteSingleGalleryImageToProfile(image) {
-        if (!image?.imageUrl) return;
-        const ctx = getCtx();
-        const profileStore = createCharacterProfileStore(ctx);
-        const explicitTargetId = String(session?.targetProfileId || '').trim();
-        const targetId = explicitTargetId || makeIllustrationId('char');
-        const before = explicitTargetId ? await profileStore.getProfile(targetId) : null;
-        try {
-            const promoted = await promoteLocalReferenceImage({
-                context: ctx,
-                sourcePath: image.imageUrl,
-                profileId: targetId,
-            });
-            const nextOutfits = before?.outfits ? JSON.parse(JSON.stringify(before.outfits)) : [{
-                id: 'outfit_default',
-                name: 'Default',
-                tags: [],
-                prose: '',
-                referenceImages: [],
-            }];
-            const targetOutfit = (before?.defaultOutfitId
-                ? nextOutfits.find(o => o.id === before.defaultOutfitId)
-                : null) || nextOutfits[0];
-            if (targetOutfit) {
-                targetOutfit.referenceImages = Array.isArray(targetOutfit.referenceImages)
-                    ? targetOutfit.referenceImages
-                    : [];
-                if (!targetOutfit.referenceImages.includes(promoted.imagePath)) {
-                    targetOutfit.referenceImages.push(promoted.imagePath);
-                }
-            }
-            const saved = await profileStore.upsertProfile({
-                ...(before || { id: targetId, name: session?.title || 'Character' }),
-                outfits: nextOutfits,
-            });
-            session.targetProfileId = saved.id;
-            await persistCurrentSession();
-            await refreshLists();
-            app.recordHistory?.({
-                label: `${i18n('Bind asset')}: ${saved.name}`,
-                undo: async () => {
-                    if (before) await profileStore.upsertProfile(before);
-                    else await profileStore.deleteProfile(saved.id);
-                    await refreshLists();
-                    paint();
-                },
-            });
-            app.toast(i18nFormat('Applied character profile "${0}" to archive.', saved.name));
-            paint();
-        } catch (err) {
-            app.toast(String(err?.message || err), { error: true });
-        }
-    }
-
     async function regenerateGalleryImage(image) {
         if (busy || !image?.prompt) return;
         try {
+            const ctx = getCtx();
             const imageBackend = resolveImageBackend();
+            const freshCapabilities = (await imageBackend.getCapabilities?.()) ?? null;
+            currentCapabilities = freshCapabilities;
+
             const savedLoras = Array.isArray(image.loras) ? image.loras : [];
             let loras = [];
             if (savedLoras.length > 0) {
@@ -784,27 +640,79 @@ export function createStudioView(app) {
                     app.toast(msg);
                 }).loras;
             }
+
             const reconstructedRefs = [];
+            const seenPaths = new Set();
+            const pushUniqueRef = (ref) => {
+                if (!ref?.imagePath || seenPaths.has(ref.imagePath)) return;
+                seenPaths.add(ref.imagePath);
+                reconstructedRefs.push(ref);
+            };
+
             if (image.sourceImageId) {
                 const resolvedSource = resolveGalleryOrManagedPath(image.sourceImageId, session);
                 if (resolvedSource) {
-                    reconstructedRefs.push({ imagePath: resolvedSource, role: 'source' });
+                    pushUniqueRef({ imagePath: resolvedSource, role: 'source' });
                 }
             }
             for (const charToken of Array.isArray(image.characterImageIds) ? image.characterImageIds : []) {
                 const resolvedChar = resolveGalleryOrManagedPath(charToken, session);
                 if (resolvedChar) {
-                    reconstructedRefs.push({ imagePath: resolvedChar, role: 'character' });
+                    pushUniqueRef({ imagePath: resolvedChar, role: 'character' });
                 }
             }
+            if (Array.isArray(image.characterRefs) && image.characterRefs.length > 0) {
+                if (freshCapabilities && !freshCapabilities.supportsCharacterReference) {
+                    reconstructedRefs.push({ imagePath: '', role: 'character' });
+                } else {
+                    let profileMap = new Map(profiles.map(p => [p.id, p]));
+                    if (typeof ctx?.getGlobalState === 'function') {
+                        const liveProfiles = await createCharacterProfileStore(ctx).listProfiles();
+                        profiles = liveProfiles;
+                        profileMap = new Map(liveProfiles.map(p => [p.id, p]));
+                    }
+                    const resolved = resolvePromptCharacterRefs(image.characterRefs, {
+                        profileMap,
+                        capabilities: freshCapabilities,
+                    });
+                    if (!resolved.ok) {
+                        throw new Error(resolved.error);
+                    }
+                    for (const ref of resolved.references) {
+                        pushUniqueRef(ref);
+                    }
+                }
+            }
+
+            const { references: filteredRefs, skipped } = filterReplayReferences(reconstructedRefs, freshCapabilities);
+            if (skipped.length > 0) {
+                const msg = i18n('Some saved reference images were skipped because they are disabled in the current preset.');
+                globalThis.toastr?.warning?.(msg, i18n('Image Generation'));
+                app.toast(msg);
+            }
+
+            const finalRefs = filteredRefs.filter(r => r.imagePath);
+            const capError = getCharacterRefLimitError(finalRefs, freshCapabilities);
+            if (capError) {
+                throw new Error(capError);
+            }
+            if (finalRefs.some(r => r.role === 'character')) {
+                const conflict = findCharacterImageConflict(freshCapabilities);
+                if (conflict) {
+                    throw new Error(formatConflictMessage(conflict));
+                }
+            }
+
             const imageUrl = await imageBackend.generate(image.prompt, {
                 attribution: 'none',
                 subdir: '_studio',
                 negativePrompt: image.negativePrompt || undefined,
                 aspectRatio: image.aspectRatio || undefined,
-                references: reconstructedRefs.length > 0 ? reconstructedRefs : undefined,
+                references: finalRefs.length > 0 ? finalRefs : undefined,
                 loras,
             });
+            const allowSource = !freshCapabilities || Boolean(freshCapabilities.supportsSourceImage);
+            const allowCharacter = !freshCapabilities || Boolean(freshCapabilities.supportsCharacterReference);
             const record = {
                 id: makeIllustrationId('img'),
                 messageId: image.messageId || '',
@@ -812,8 +720,9 @@ export function createStudioView(app) {
                 negativePrompt: image.negativePrompt || '',
                 aspectRatio: image.aspectRatio || '',
                 imageUrl,
-                sourceImageId: image.sourceImageId || '',
-                characterImageIds: image.characterImageIds || [],
+                sourceImageId: allowSource ? (image.sourceImageId || '') : '',
+                characterImageIds: allowCharacter ? (image.characterImageIds || []) : [],
+                characterRefs: allowCharacter ? (image.characterRefs || []) : [],
                 loras,
                 status: 'ready',
                 error: '',
@@ -839,7 +748,7 @@ export function createStudioView(app) {
                 try {
                     selectPreset(ill, nextId);
                     if (session) session.presetId = nextId;
-                    await persistCurrentSession();
+                    await Promise.all([persistCurrentSession(), refreshCapabilities()]);
                     paint();
                 } catch (err) {
                     app.toast(String(err?.message || err), { error: true });
@@ -891,63 +800,8 @@ export function createStudioView(app) {
     }
 
     function renderCenterPane() {
-        const modeOpts = [
-            { value: 'general', label: i18n('Free image generation'), iconName: 'image' },
-            { value: 'character_design', label: i18n('Character reference design'), iconName: 'spark' },
-        ];
-        const modeSeg = segmented(modeOpts, session?.mode || 'general', (next) => {
-            if (!session || busy) return;
-            session.mode = next;
-            void persistCurrentSession();
-            paint();
-        }, {
-            ariaLabel: i18n('Studio session mode'),
-            renderIcon: icon,
-        });
-        const modeBtns = modeSeg.querySelectorAll('.lw-seg-btn');
-        modeOpts.forEach((opt, idx) => {
-            if (modeBtns[idx]) modeBtns[idx].dataset.sdStudioMode = opt.value;
-        });
-
-        const toolbarItems = [modeSeg];
-        if (session?.mode === 'character_design') {
-            const profileOpts = [
-                { value: '', label: i18n('Create new profile on apply') },
-                ...profiles.map(p => ({ value: p.id, label: `${p.name} (${p.id})` })),
-            ];
-            const targetSelect = selectInput(profileOpts, session.targetProfileId || '', (val) => {
-                session.targetProfileId = val;
-                void persistCurrentSession();
-            }, { ariaLabel: i18n('Target profile to update') });
-            targetSelect.dataset.sdRole = 'studio-target-profile';
-
-            const ctx = getCtx();
-            const sourceOpts = [
-                { value: 'current_card', label: i18n('Current character card') },
-                { value: 'persona', label: `${i18n('Persona')}: ${ctx?.name1 || 'User'}` },
-                ...(Array.isArray(ctx?.characters) ? ctx.characters : [])
-                    .filter(c => c?.avatar)
-                    .map(c => ({ value: `card:${c.avatar}`, label: `${c.name || c.avatar} (${c.avatar})` })),
-            ];
-            const currentSourceValue = session.sourceKind === 'persona'
-                ? 'persona'
-                : (session.sourceKind === 'card' && session.sourceCardAvatar ? `card:${session.sourceCardAvatar}` : 'current_card');
-            const sourceSelect = selectInput(sourceOpts, currentSourceValue, (val) => {
-                if (val === 'persona') {
-                    session.sourceKind = 'persona';
-                    session.sourceCardAvatar = '';
-                } else if (val.startsWith('card:')) {
-                    session.sourceKind = 'card';
-                    session.sourceCardAvatar = val.slice(5);
-                } else {
-                    session.sourceKind = 'current_card';
-                    session.sourceCardAvatar = '';
-                }
-                void persistCurrentSession();
-            }, { ariaLabel: i18n('Source character card') });
-            sourceSelect.dataset.sdRole = 'studio-source-select';
-            toolbarItems.push(targetSelect, sourceSelect);
-        } else if (session) {
+        const toolbarItems = [];
+        if (session) {
             const visualSwitch = switchControl(i18n('Visual review'), Boolean(session.visualReview), (next) => {
                 session.visualReview = next;
                 void persistCurrentSession();
@@ -955,38 +809,6 @@ export function createStudioView(app) {
             visualSwitch.style.width = 'auto';
             toolbarItems.push(visualSwitch);
         }
-
-        const staged = session?.stagedProfileDraft;
-        const proposalCard = staged
-            ? h('div', { class: 'sdlens-proposal-card', dataset: { sdRole: 'staged-proposal' } },
-                sectionTitle(i18n('Staged character profile proposal')),
-                h('div', { style: { fontWeight: '600', fontSize: '13.5px' }, text: `${staged.name}${staged.sourceWork ? ` · ${staged.sourceWork}` : ''}` }),
-                staged.canonicalTags?.length
-                    ? h('div', { style: { fontSize: '12px', color: 'var(--lw-muted)' }, text: staged.canonicalTags.join(', ') })
-                    : null,
-                staged.proseDescription
-                    ? h('div', { style: { fontSize: '12.5px' }, text: staged.proseDescription })
-                    : null,
-                ...(staged.outfits || []).map(o => h('div', { style: { fontSize: '12px' } },
-                    h('strong', { text: `${o.name}: ` }),
-                    h('span', { text: (o.tags || []).join(', ') }))),
-                h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end' } },
-                    button(i18n('Cancel'), () => {
-                        session.stagedProfileDraft = null;
-                        void persistCurrentSession();
-                        paint();
-                    }, { small: true, ghost: true }),
-                    (() => {
-                        const btn = button(i18n('Apply to character archive'), () => { void applyStagedProfile(); }, {
-                            small: true,
-                            primary: true,
-                            iconName: 'check',
-                            renderIcon: icon,
-                        });
-                        btn.dataset.sdRole = 'apply-staged-profile';
-                        return btn;
-                    })()))
-            : null;
 
         const messageNodes = (session?.messages || []).map((msg, idx) => h('div', {
             class: `sdlens-msg ${msg.role === 'user' ? 'is-user' : 'is-assistant'}`.trim(),
@@ -1013,7 +835,10 @@ export function createStudioView(app) {
                 })))
             : null));
 
-        const attachedSource = session?.attachedReferences?.find(r => r.role === 'source');
+        const allowSourceImage = !currentCapabilities || Boolean(currentCapabilities.supportsSourceImage);
+        const attachedSource = allowSourceImage
+            ? session?.attachedReferences?.find(r => r.role === 'source')
+            : null;
         const attachedBanner = attachedSource
             ? h('div', { class: 'sdlens-studio-source-banner' },
                 h('span', { title: attachedSource.imagePath, text: i18nFormat('Editing source image: ${0}', attachedSource.imagePath) }),
@@ -1026,9 +851,7 @@ export function createStudioView(app) {
         const inputEl = h('textarea', {
             class: 'sdlens-textarea',
             rows: 2,
-            placeholder: session?.mode === 'character_design'
-                ? i18n('Describe your original character or request adjustments to the candidate sheet…')
-                : i18n('Describe the scene or feedback for the next image…'),
+            placeholder: i18n('Describe the scene or feedback for the next image…'),
             dataset: { sdRole: 'studio-input' },
             onInput: (e) => { draftInput = e.target.value; },
             onKeydown: (e) => {
@@ -1062,9 +885,7 @@ export function createStudioView(app) {
 
         return h('section', { class: 'sdlens-studio-main' },
             h('div', { class: 'sdlens-studio-toolbar' }, ...toolbarItems),
-            h('div', { class: 'sdlens-studio-messages' },
-                ...messageNodes,
-                proposalCard),
+            h('div', { class: 'sdlens-studio-messages' }, ...messageNodes),
             attachedBanner,
             h('div', { class: 'sdlens-studio-compose' }, inputEl, sendOrStopBtn));
     }
@@ -1100,7 +921,7 @@ export function createStudioView(app) {
                         b.dataset.studioAction = 'regenerate';
                         return b;
                     })(),
-                    selected.status === 'ready' && selected.imageUrl
+                    selected.status === 'ready' && selected.imageUrl && (!currentCapabilities || currentCapabilities.supportsSourceImage)
                         ? (() => {
                             const b = button(i18n('Edit source'), () => {
                                 session.attachedReferences = [
@@ -1110,16 +931,6 @@ export function createStudioView(app) {
                                 paint();
                             }, { small: true });
                             b.dataset.studioAction = 'edit-source';
-                            return b;
-                        })()
-                        : null,
-                    selected.status === 'ready' && selected.imageUrl
-                        ? (() => {
-                            const b = button(i18n('Bind asset'), () => { void promoteSingleGalleryImageToProfile(selected); }, {
-                                small: true,
-                                primary: session?.mode === 'character_design',
-                            });
-                            b.dataset.studioAction = 'promote-reference';
                             return b;
                         })()
                         : null))
@@ -1149,26 +960,8 @@ export function createStudioView(app) {
 
     return {
         el,
-        show(opts = {}) {
-            void ensureSessionLoaded().then(() => {
-                if (opts?.characterDesign) {
-                    this.openForCharacterDesign(opts.characterDesign);
-                }
-            });
-        },
-        openForCharacterDesign({ profileId = '', characterName = '', cardAvatar = '', initialBrief = '' } = {}) {
-            const ill = getIllSettings();
-            session = createStudioSession({
-                presetId: ill?.currentPresetId || '',
-                mode: 'character_design',
-                targetProfileId: profileId,
-                sourceKind: cardAvatar ? 'card' : 'current_card',
-                sourceCardAvatar: cardAvatar,
-                title: characterName ? `OC: ${characterName}` : '',
-            });
-            selectedImageId = '';
-            draftInput = initialBrief || characterName || '';
-            paint();
+        show() {
+            void ensureSessionLoaded();
         },
         destroy() {
             abortController?.abort('Studio closed');

@@ -1,6 +1,9 @@
+import { filterReplayReferences } from '../capabilities.js';
 import { buildLorasProperty, validateLorasArg } from '../lora/tool.js';
-import { resolveProfileAssets } from '../character-archive/store.js';
+import { normalizeReferenceImageEntry } from '../character-archive/store.js';
 import { findInsertionPoint } from './message.js';
+
+export { filterReplayReferences };
 
 export const SUPPORTED_ASPECT_RATIOS = Object.freeze(['1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9']);
 
@@ -40,7 +43,7 @@ export const READ_CHARACTER_PROFILES_TOOL = Object.freeze({
     type: 'function',
     function: {
         name: 'read_character_profiles',
-        description: 'Read full canonical appearance tags, outfits, and reference image metadata for specific character ids from <character_archive>.',
+        description: 'Read character visual archive details (plain-text description and/or reference image metadata according to active reference mode) for specific character ids from <character_archive>.',
         parameters: {
             type: 'object',
             properties: {
@@ -109,6 +112,34 @@ export const GENERATE_IMAGE_TOOL = Object.freeze({
  */
 const cloneJson = value => JSON.parse(JSON.stringify(value));
 
+function buildCharacterRefsProperty(capabilities) {
+    if (!capabilities?.supportsCharacterReference) {
+        return null;
+    }
+    const capNote = capabilities.maxCharacterReferences !== null && capabilities.maxCharacterReferences !== undefined
+        ? ` Current backend accepts at most ${capabilities.maxCharacterReferences} reference image(s) per prompt.`
+        : '';
+    return {
+        type: 'array',
+        description: `Character visual archive references to bind to this image.${capNote}`,
+        items: {
+            type: 'object',
+            properties: {
+                profile_id: {
+                    type: 'string',
+                    description: 'Character profile id from <character_archive>.',
+                },
+                image_paths: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Optional subset of reference image paths from this profile. Omit to attach all reference images of the profile.',
+                },
+            },
+            required: ['profile_id'],
+        },
+    };
+}
+
 export function buildAddImagePromptTool(loras, { includeWeight = false, capabilities = null, includeAgentFields = false } = {}) {
     const tool = cloneJson(ADD_IMAGE_PROMPT_TOOL);
     const props = tool.function.parameters.properties;
@@ -125,28 +156,9 @@ export function buildAddImagePromptTool(loras, { includeWeight = false, capabili
                 description: 'Optional aspect ratio override matching scene composition.',
             };
         }
-        if (capabilities?.supportsCharacterReference) {
-            const capNote = capabilities.maxCharacterReferences !== null && capabilities.maxCharacterReferences !== undefined
-                ? ` Current backend accepts at most ${capabilities.maxCharacterReferences} reference image(s) per prompt.`
-                : '';
-            props.character_refs = {
-                type: 'array',
-                description: `Character visual archive references to bind to this image.${capNote}`,
-                items: {
-                    type: 'object',
-                    properties: {
-                        profile_id: {
-                            type: 'string',
-                            description: 'Character profile id from <character_archive>.',
-                        },
-                        outfit_id: {
-                            type: 'string',
-                            description: 'Optional outfit id from the character profile.',
-                        },
-                    },
-                    required: ['profile_id'],
-                },
-            };
+        const charRefsProp = buildCharacterRefsProperty(capabilities);
+        if (charRefsProp) {
+            props.character_refs = charRefsProp;
         }
         if (capabilities?.supportsMultiCharacterPrompts) {
             props.character_captions = {
@@ -184,17 +196,24 @@ export function buildIllustrationAgentTools({
     includeWeight = false,
     capabilities = null,
     includeArchiveTools = false,
+    allowExploration = true,
 } = {}) {
+    const archiveToolsEnabled = Boolean(
+        includeArchiveTools
+        && (!capabilities || capabilities.characterReferenceEnabled !== false),
+    );
     const tools = [
         buildAddImagePromptTool(loras, {
             includeWeight,
             capabilities,
-            includeAgentFields: Boolean(capabilities || includeArchiveTools),
+            includeAgentFields: Boolean(capabilities || archiveToolsEnabled),
         }),
     ];
-    if (includeArchiveTools) {
+    if (archiveToolsEnabled) {
         tools.push(cloneJson(READ_CHARACTER_PROFILES_TOOL));
-        tools.push(cloneJson(EXPLORE_CHARACTERS_TOOL));
+        if (allowExploration) {
+            tools.push(cloneJson(EXPLORE_CHARACTERS_TOOL));
+        }
     }
     return tools;
 }
@@ -235,6 +254,10 @@ export function buildGenerateImageTool(loras, { includeWeight = false, capabilit
                 description: 'Optional gallery image ids or managed local paths (/characters/*, /User Avatars/*, /user/images/*) to pass as character reference images.',
             };
         }
+        const charRefsProp = buildCharacterRefsProperty(capabilities);
+        if (charRefsProp) {
+            props.character_refs = charRefsProp;
+        }
     }
 
     const lorasProperty = buildLorasProperty(loras, { includeWeight });
@@ -258,7 +281,7 @@ function validateAspectRatioField(raw, capabilities) {
     return { ok: true, value: ratio };
 }
 
-function validateCharacterRefsShape(raw) {
+function validateCharacterRefsShape(raw, capabilities = null) {
     if (raw === undefined || raw === null) {
         return { ok: true, value: [] };
     }
@@ -267,12 +290,35 @@ function validateCharacterRefsShape(raw) {
     }
     const normalized = [];
     for (const entry of raw) {
-        const profileId = String(entry?.profile_id ?? entry?.profileId ?? '').trim();
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            return { ok: false, error: 'Each character_refs entry must be an object with profile_id' };
+        }
+        const profileId = String(entry.profile_id ?? entry.profileId ?? '').trim();
         if (!profileId) {
             return { ok: false, error: 'Each character_refs entry requires a non-empty profile_id' };
         }
-        const outfitId = String(entry?.outfit_id ?? entry?.outfitId ?? '').trim();
-        normalized.push(outfitId ? { profileId, outfitId } : { profileId });
+        const rawPaths = entry.image_paths ?? entry.imagePaths;
+        if (rawPaths !== undefined && rawPaths !== null) {
+            if (!Array.isArray(rawPaths)) {
+                return { ok: false, error: `character_refs entry for "${profileId}" has non-array image_paths` };
+            }
+            const imagePaths = rawPaths.map(p => String(p ?? '').trim()).filter(Boolean);
+            if (imagePaths.length === 0) {
+                return {
+                    ok: false,
+                    error: `character_refs entry for "${profileId}" provided an empty image_paths array; omit image_paths to attach all images or specify valid paths.`,
+                };
+            }
+            normalized.push({ profileId, imagePaths });
+        } else {
+            normalized.push({ profileId });
+        }
+    }
+    if (normalized.length > 0 && capabilities && capabilities.supportsCharacterReference === false) {
+        return {
+            ok: false,
+            error: `Character reference images are disabled in the current preset or unsupported by backend "${capabilities.source || 'unknown'}"; omit character_refs.`,
+        };
     }
     return { ok: true, value: normalized };
 }
@@ -329,7 +375,7 @@ export function validateAddImagePromptArgs(args, { availableLoras, includeWeight
     if (!ratio.ok) {
         return { ok: false, error: ratio.error };
     }
-    const charRefs = validateCharacterRefsShape(args?.character_refs);
+    const charRefs = validateCharacterRefsShape(args?.character_refs, capabilities);
     if (!charRefs.ok) {
         return { ok: false, error: charRefs.error };
     }
@@ -355,41 +401,30 @@ export function validateAddImagePromptArgs(args, { availableLoras, includeWeight
     return { ok: true, value };
 }
 
-export function mergeNegativePrompts(explicitNegative = '', negativeTags = []) {
-    const parts = [];
-    const seen = new Set();
-    const pushItem = (raw) => {
-        const trimmed = String(raw ?? '').trim();
-        if (!trimmed) return;
-        const key = trimmed.toLowerCase();
-        if (seen.has(key)) return;
-        seen.add(key);
-        parts.push(trimmed);
-    };
-
-    for (const chunk of String(explicitNegative || '').split(',')) {
-        pushItem(chunk);
-    }
-    for (const tag of Array.isArray(negativeTags) ? negativeTags : []) {
-        pushItem(tag);
-    }
-    return parts.join(', ');
-}
-
 /**
- * Deterministically resolves `character_refs` against archived character profiles and backend capabilities.
+ * Deterministically resolves `character_refs` against archived v2 character profiles and backend capabilities.
  */
 export function resolvePromptCharacterRefs(characterRefs = [], { profileMap = new Map(), capabilities = null } = {}) {
     if (!Array.isArray(characterRefs) || characterRefs.length === 0) {
-        return { ok: true, references: [], negativeTags: [] };
+        return { ok: true, references: [] };
+    }
+    if (capabilities && capabilities.supportsCharacterReference === false) {
+        return {
+            ok: false,
+            error: `Character reference images are disabled in the current preset or unsupported by backend "${capabilities.source || 'unknown'}"; omit character_refs.`,
+        };
     }
     const references = [];
     const seenPaths = new Set();
-    const negativeTags = [];
 
     for (const ref of characterRefs) {
         const profileId = String(ref?.profileId ?? ref?.profile_id ?? '').trim();
-        const outfitId = String(ref?.outfitId ?? ref?.outfit_id ?? '').trim();
+        if (!profileId) {
+            return {
+                ok: false,
+                error: 'Each character_refs entry requires a non-empty profile_id.',
+            };
+        }
         const profile = profileMap instanceof Map ? profileMap.get(profileId) : profileMap?.[profileId];
         if (!profile) {
             return {
@@ -397,39 +432,64 @@ export function resolvePromptCharacterRefs(characterRefs = [], { profileMap = ne
                 error: `Unknown character profile_id "${profileId}". Check <character_archive> or call read_character_profiles first.`,
             };
         }
-        if (outfitId && !(Array.isArray(profile.outfits) && profile.outfits.some(o => o.id === outfitId))) {
-            const validIds = (profile.outfits || []).map(o => o.id).join(', ') || 'none';
+
+        const availableImages = (Array.isArray(profile.referenceImages) ? profile.referenceImages : [])
+            .map(normalizeReferenceImageEntry)
+            .filter(Boolean);
+
+        if (availableImages.length === 0) {
             return {
                 ok: false,
-                error: `Unknown outfit_id "${outfitId}" for character "${profile.name}" (${profile.id}). Available outfit ids: ${validIds}.`,
+                error: `Character "${profile.name}" (${profile.id}) has no reference images (refs=0). Do not pass character_refs for this character.`,
             };
         }
-        const resolved = resolveProfileAssets(profile, { outfitId });
-        for (const neg of resolved?.negativeTags || []) {
-            negativeTags.push(neg);
-        }
-        const refImages = resolved?.referenceImages || [];
-        if (refImages.length > 0 && capabilities && capabilities.supportsCharacterReference === false) {
-            return {
-                ok: false,
-                error: `Current image backend "${capabilities.source || 'unknown'}" does not support character reference images; omit character_refs and write appearance tags in prompt.`,
-            };
-        }
-        if (!capabilities || capabilities.supportsCharacterReference) {
-            const label = resolved?.outfitName
-                ? `${resolved.name} — ${resolved.outfitName}`
-                : String(resolved?.name || profile.name);
-            for (const imagePath of refImages) {
-                if (seenPaths.has(imagePath)) {
-                    continue;
-                }
-                seenPaths.add(imagePath);
-                references.push({
-                    imagePath,
-                    role: 'character',
-                    label,
-                });
+
+        const requestedRaw = ref?.imagePaths ?? ref?.image_paths;
+        let selectedImages;
+        if (requestedRaw !== undefined && requestedRaw !== null) {
+            if (!Array.isArray(requestedRaw)) {
+                return {
+                    ok: false,
+                    error: `image_paths for character "${profile.name}" (${profile.id}) must be an array.`,
+                };
             }
+            const requestedPaths = requestedRaw.map(p => String(p ?? '').trim()).filter(Boolean);
+            if (requestedPaths.length === 0) {
+                return {
+                    ok: false,
+                    error: `image_paths for character "${profile.name}" (${profile.id}) is empty; omit image_paths to attach all images or specify valid paths from reference_images.`,
+                };
+            }
+            const byPath = new Map(availableImages.map(img => [img.path, img]));
+            const missing = requestedPaths.filter(path => !byPath.has(path));
+            if (missing.length > 0) {
+                const validList = availableImages.map(img => img.path).join(', ');
+                return {
+                    ok: false,
+                    error: `Invalid image_paths for character "${profile.name}" (${profile.id}): ${missing.join(', ')}. Available paths: ${validList}.`,
+                };
+            }
+            selectedImages = [];
+            const seenInEntry = new Set();
+            for (const path of requestedPaths) {
+                if (seenInEntry.has(path)) continue;
+                seenInEntry.add(path);
+                selectedImages.push(byPath.get(path));
+            }
+        } else {
+            selectedImages = availableImages;
+        }
+
+        for (const img of selectedImages) {
+            if (seenPaths.has(img.path)) {
+                continue;
+            }
+            seenPaths.add(img.path);
+            references.push({
+                imagePath: img.path,
+                role: 'character',
+                label: img.label ? `${profile.name} — ${img.label}` : String(profile.name),
+            });
         }
     }
 
@@ -441,11 +501,11 @@ export function resolvePromptCharacterRefs(characterRefs = [], { profileMap = ne
     ) {
         return {
             ok: false,
-            error: `Selected character_refs resolve to ${references.length} reference image(s), exceeding backend "${capabilities.source}" limit of ${capabilities.maxCharacterReferences}. Select fewer characters or outfits within the limit.`,
+            error: `Selected character_refs resolve to ${references.length} reference image(s), exceeding limit of ${capabilities.maxCharacterReferences}. Select fewer characters or specify a smaller image_paths subset within the limit.`,
         };
     }
 
-    return { ok: true, references, negativeTags };
+    return { ok: true, references };
 }
 
 export function validateGenerateImageArgs(args, { availableLoras, includeWeight = false, capabilities = null } = {}) {
@@ -460,6 +520,10 @@ export function validateGenerateImageArgs(args, { availableLoras, includeWeight 
     const ratio = validateAspectRatioField(args?.aspect_ratio, capabilities);
     if (!ratio.ok) {
         return { ok: false, error: ratio.error };
+    }
+    const charRefs = validateCharacterRefsShape(args?.character_refs, capabilities);
+    if (!charRefs.ok) {
+        return { ok: false, error: charRefs.error };
     }
     const value = { prompt, loras: loras.value };
     const negativePrompt = String(args?.negative_prompt ?? '').trim();
@@ -478,6 +542,9 @@ export function validateGenerateImageArgs(args, { availableLoras, includeWeight 
         if (ids.length > 0) {
             value.characterImageIds = ids;
         }
+    }
+    if (charRefs.value.length > 0) {
+        value.characterRefs = charRefs.value;
     }
     return { ok: true, value };
 }
@@ -508,18 +575,17 @@ export function selectPromptCalls(toolCalls, {
             rejected.push({ reason: 'anchors not found', call });
             continue;
         }
-        if (Array.isArray(value.characterRefs) && value.characterRefs.length > 0 && profileMap) {
-            const resolved = resolvePromptCharacterRefs(value.characterRefs, { profileMap, capabilities });
+        if (Array.isArray(value.characterRefs) && value.characterRefs.length > 0) {
+            const resolved = resolvePromptCharacterRefs(value.characterRefs, {
+                profileMap: profileMap || new Map(),
+                capabilities,
+            });
             if (!resolved.ok) {
                 rejected.push({ reason: resolved.error, call });
                 continue;
             }
             if (resolved.references.length > 0) {
                 value.references = resolved.references;
-            }
-            const mergedNeg = mergeNegativePrompts(value.negativePrompt || '', resolved.negativeTags);
-            if (mergedNeg) {
-                value.negativePrompt = mergedNeg;
             }
         }
         const key = JSON.stringify([

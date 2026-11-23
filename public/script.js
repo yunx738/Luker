@@ -4079,7 +4079,7 @@ export async function deleteMessage(id, swipeDeletionIndex = undefined, askConfi
 
     refreshSwipeButtons();
 
-    await settleMessageDeleted(chat.length);
+    await settleMessageDeleted(firstMessageId);
     await eventSource.emit(event_types.MESSAGE_DELETED, chat.length, {
         kind: 'delete',
         deletedPlayableSeqFrom: deletedPlayableCount > 0 ? deletedPlayablePrefix + 1 : null,
@@ -5948,6 +5948,24 @@ export function substituteParamsLegacy(content, _name1, _name2, _original, _grou
 
 /** @typedef {import('./scripts/macros/engine/MacroRegistry.js').MacroHandler} MacroHandler */
 
+function createSideEffectFreeVariables(liveVariables) {
+    const noopScope = (scope) => ({
+        get: (name, args) => scope.get(name, args),
+        has: (name) => scope.has(name),
+        set: () => {},
+        add: () => {},
+        push: () => {},
+        pop: () => {},
+        inc: (name) => scope.get(name),
+        dec: (name) => scope.get(name),
+        del: () => {},
+    });
+    return {
+        local: noopScope(liveVariables.local),
+        global: noopScope(liveVariables.global),
+    };
+}
+
 /**
  * Substitutes {{macros}} in a string using the new macro engine.
  *
@@ -6006,6 +6024,12 @@ export function substituteParams(content, options = {}) {
     });
 
     const env = MacroEnvBuilder.buildFromRawEnv(ctx);
+    if (options.skipSideEffects) {
+        const liveVariables = globalThis.Luker?.getContext?.()?.variables;
+        if (liveVariables) {
+            env.variables = createSideEffectFreeVariables(liveVariables);
+        }
+    }
     const result = MacroEngine.evaluate(content, env);
     return result;
 }
@@ -6334,7 +6358,7 @@ export async function getExtensionPrompt(position = extension_prompt_types.IN_PR
  * @param {string?} name2Override Override for name2
  * @returns {string} Processed string
  */
-export function baseChatReplace(value, name1Override = null, name2Override = null) {
+export function baseChatReplace(value, name1Override = null, name2Override = null, { substitute = substituteParams } = {}) {
     if (typeof value === 'string' && value.length > 0) {
         // skipSideEffects:true — character card fields (first_mes, alternate
         // greetings, persona blocks) get rendered into prompt templates on every
@@ -6342,7 +6366,7 @@ export function baseChatReplace(value, name1Override = null, name2Override = nul
         // when first_mes lands in chat[0] and op-log scans it, not every time
         // the prompt is rebuilt. Without this flag, every generation would reset
         // chat_metadata.variables back to the first_mes initial values.
-        value = substituteParams(value, { name1Override, name2Override, replaceCharacterCard: false, skipSideEffects: true });
+        value = substitute(value, { name1Override, name2Override, replaceCharacterCard: false, skipSideEffects: true });
 
         if (power_user.collapse_newlines) {
             value = collapseNewlines(value);
@@ -6497,70 +6521,71 @@ export function isCharacterFavorite(character) {
  * Each field is only processed (baseChatReplace) when first accessed.
  * @param {Object} [options={}]
  * @param {number} [options.chid] Optional character index
+ * @param {typeof baseChatReplace} [options.replace] Field text substitution
  * @returns {CharacterCardFields} Character card fields with lazy evaluation
  */
-export function getCharacterCardFieldsLazy({ chid = undefined } = {}) {
+export function getCharacterCardFieldsLazy({ chid = undefined, replace = baseChatReplace } = {}) {
     const currentChid = chid ?? this_chid;
     const character = characters[currentChid];
 
     // For group chats, we need to check if group cards should be used
     const useGroupCards = selected_group && character;
-    const groupCardsLazy = useGroupCards ? getGroupCharacterCardsLazy(selected_group, Number(currentChid)) : null;
+    const groupCardsLazy = useGroupCards ? getGroupCharacterCardsLazy(selected_group, Number(currentChid), { replace }) : null;
 
     /** @type {Record<string, () => string|string[]>} */
     const resolvers = {
-        persona: () => baseChatReplace(power_user.persona_description?.trim()),
+        persona: () => replace(power_user.persona_description?.trim()),
         system: () => {
             if (!character) return '';
             const systemPrompt = chat_metadata.system_prompt || getCharacterSystemPrompt(character) || '';
-            return power_user.prefer_character_prompt ? baseChatReplace(systemPrompt.trim()) : '';
+            return power_user.prefer_character_prompt ? replace(systemPrompt.trim()) : '';
         },
         jailbreak: () => {
             if (!character) return '';
-            return power_user.prefer_character_jailbreak ? baseChatReplace(getCharacterPostHistoryInstructions(character)?.trim()) : '';
+            return power_user.prefer_character_jailbreak ? replace(getCharacterPostHistoryInstructions(character)?.trim()) : '';
         },
         version: () => getCharacterVersion(character),
         charDepthPrompt: () => {
             if (!character) return '';
-            return baseChatReplace(getCharacterDepthPromptPrompt(character)?.trim());
+            return replace(getCharacterDepthPromptPrompt(character)?.trim());
         },
         creatorNotes: () => {
             if (!character) return '';
-            return baseChatReplace(getCharacterCreatorNotes(character)?.trim());
+            return replace(getCharacterCreatorNotes(character)?.trim());
         },
         // These four fields may be overridden by group cards
         description: () => {
             if (groupCardsLazy) return groupCardsLazy.description;
             if (!character) return '';
-            return baseChatReplace(getCharacterDescription(character)?.trim());
+            return replace(getCharacterDescription(character)?.trim());
         },
         personality: () => {
             if (groupCardsLazy) return groupCardsLazy.personality;
             if (!character) return '';
-            return baseChatReplace(getCharacterPersonality(character)?.trim());
+            return replace(getCharacterPersonality(character)?.trim());
         },
         scenario: () => {
             if (groupCardsLazy) return groupCardsLazy.scenario;
             if (!character) return '';
             const scenarioText = chat_metadata.scenario || getCharacterScenario(character) || '';
-            return baseChatReplace(scenarioText.trim());
+            return replace(scenarioText.trim());
         },
         mesExamples: () => {
             if (groupCardsLazy) return groupCardsLazy.mesExamples;
             if (!character) return '';
             const exampleDialog = chat_metadata.mes_example || getCharacterMesExample(character) || '';
-            return baseChatReplace(exampleDialog.trim());
+            return replace(exampleDialog.trim());
         },
         firstMessage: () => {
             if (!character) return '';
             const firstMes = character.first_mes?.trim() || '';
-            return baseChatReplace(firstMes);
+            return replace(firstMes);
         },
         alternateGreetings: () => {
             if (!character) return [];
             const altGreetings = character.data?.alternate_greetings;
             if (!Array.isArray(altGreetings)) return [];
-            return altGreetings.map(greeting => baseChatReplace(greeting?.trim()));
+            return altGreetings.map(greeting => replace(greeting?.trim()));
         },
     };
 
@@ -6571,10 +6596,11 @@ export function getCharacterCardFieldsLazy({ chid = undefined } = {}) {
  * Returns the character card fields for the current character.
  * @param {Object} [options={}]
  * @param {number} [options.chid] Optional character index
+ * @param {typeof baseChatReplace} [options.replace] Field text substitution
  * @returns {CharacterCardFields} Character card fields
  */
-export function getCharacterCardFields({ chid = undefined } = {}) {
-    const lazy = getCharacterCardFieldsLazy({ chid });
+export function getCharacterCardFields({ chid = undefined, replace = baseChatReplace } = {}) {
+    const lazy = getCharacterCardFieldsLazy({ chid, replace });
 
     // Resolve all lazy fields into a plain object
     return {
@@ -6596,9 +6622,12 @@ export function getCharacterCardFields({ chid = undefined } = {}) {
 /**
  * Parses an examples string.
  * @param {string} examplesStr
+ * @param {boolean} isInstruct
+ * @param {Object} [options]
+ * @param {typeof substituteParams} [options.substitute]
  * @returns {string[]} Examples array with block heading
  */
-export function parseMesExamples(examplesStr, isInstruct) {
+export function parseMesExamples(examplesStr, isInstruct, { substitute = substituteParams, api = main_api } = {}) {
     if (!examplesStr || examplesStr.length === 0 || examplesStr === '<START>') {
         return [];
     }
@@ -6607,8 +6636,8 @@ export function parseMesExamples(examplesStr, isInstruct) {
         examplesStr = '<START>\n' + examplesStr.trim();
     }
 
-    const exampleSeparator = power_user.context.example_separator ? `${substituteParams(power_user.context.example_separator)}\n` : '';
-    const blockHeading = (main_api === 'openai' || isInstruct) ? '<START>\n' : exampleSeparator;
+    const exampleSeparator = power_user.context.example_separator ? `${substitute(power_user.context.example_separator)}\n` : '';
+    const blockHeading = (api === 'openai' || isInstruct) ? '<START>\n' : exampleSeparator;
     const splitExamples = examplesStr.split(/<START>/gi).slice(1).map(block => `${blockHeading}${block.trim()}\n`);
 
     return splitExamples;
@@ -7612,6 +7641,9 @@ export async function simulateWorldInfoActivation({
     chatForWI = undefined,
     includeNames = world_info_include_names,
     globalScanData = undefined,
+    isolated = false,
+    substitute = substituteParams,
+    applyRegex = undefined,
 } = {}) {
     const resolvedCoreChat = Array.isArray(coreChat) ? coreChat : [];
     const resolvedMaxContext = Number.isFinite(maxContextOverride) && Number(maxContextOverride) > 0
@@ -7624,7 +7656,13 @@ export async function simulateWorldInfoActivation({
         ? { ...globalScanData, trigger: normalizeGenerationTrigger(globalScanData.trigger || type) }
         : buildWorldInfoGlobalScanData(type);
 
-    const worldInfoResolution = await getWorldInfoPrompt(resolvedChatForWI, resolvedMaxContext, dryRun, resolvedGlobalScanData);
+    const worldInfoResolution = await getWorldInfoPrompt(
+        resolvedChatForWI,
+        resolvedMaxContext,
+        dryRun,
+        resolvedGlobalScanData,
+        { isolated, substitute, applyRegex },
+    );
     return {
         ...worldInfoResolution,
         chatForWI: resolvedChatForWI,
@@ -10337,6 +10375,7 @@ export async function sendMessageAsUser(messageText, messageBias, insertAt = nul
             await saveChatConditional();
         }
         extractMessageById(insertAt);
+        await settleMessageDeleted(insertAt);
         await eventSource.emit(event_types.MESSAGE_SENT, insertAt);
         await reloadCurrentChat();
         await eventSource.emit(event_types.USER_MESSAGE_RENDERED, insertAt);
@@ -11214,6 +11253,7 @@ async function rollbackTakeoverPlaceholder(messageId, type, origText, origReason
         chat.splice(messageId, 1);
         const patched = await patchChatMessages([{ op: 'remove', path: `/${messageId}` }]);
         if (!patched) await saveChatConditional();
+        await settleMessageDeleted(messageId);
         await reloadCurrentChat();
         return;
     }
@@ -16769,6 +16809,7 @@ async function messageEditMove(sourceId, targetId) {
     if (!patched) {
         await saveChatConditional();
     }
+    await settleMessageDeleted(Math.min(Number(sourceId), Number(targetId)));
     return true;
 }
 
@@ -17870,7 +17911,7 @@ export async function deleteSwipe(swipeId = null, messageId = chat.length - 1) {
     messageId = Number(messageId);
     swipeId = Number(swipeId);
     message.swipe_id = newSwipeId;
-    await settleMessageSwipeDeleted({ messageId, swipeId, newSwipeId });
+    await settleMessageSwipeDeleted({ messageId, swipeId, newSwipeId, wasActive: swipeId === currentSwipeId });
     await eventSource.emit(event_types.MESSAGE_SWIPE_DELETED, { messageId, swipeId, newSwipeId });
 
     if (swipeId === currentSwipeId) {
@@ -21491,6 +21532,7 @@ jQuery(async function () {
             await saveChatConditional();
         }
 
+        await settleMessageDeleted(insertAt);
         await reloadCurrentChat();
 
         currentChatToolsSelectedIds.clear();
@@ -22135,12 +22177,14 @@ jQuery(async function () {
             clone.mes = clone.mes.trim();
         }
 
-        chat.splice(Number(this_edit_mes_id) + 1, 0, clone);
+        const insertAt = Number(this_edit_mes_id) + 1;
+        chat.splice(insertAt, 0, clone);
         const newMessageElement = updateMessageElement(clone);
         this_edit_mes_element.after(newMessageElement);
 
         updateViewMessageIds();
         await saveChatConditional();
+        await settleMessageDeleted(insertAt);
         chatElement[0].scrollTop = oldScroll;
         showSwipeButtons();
     });

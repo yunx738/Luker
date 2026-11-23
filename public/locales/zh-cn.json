@@ -1,4 +1,24 @@
 {
+    "Advanced prompts": "高级提示词",
+    "Iteration base prompt": "迭代基础提示词",
+    "Orchestrator optimization mode prompt": "多智能体编排优化模式提示词",
+    "Jailbreak-only mode prompt": "仅越狱模式提示词",
+    "Fill in the prompt or reset it to the default.": "请填写提示词或重置为默认值。",
+    "Default prompt style": "默认提示词风格",
+    "Choose a default prompt style": "选择默认提示词风格",
+    "Iterate prompts with AI": "使用 AI 迭代提示词",
+    "Studio prompt": "画室提示词",
+    "Character profile agent": "角色建档",
+    "Character profile agent prompt": "角色建档提示词",
+    "The character profile changed. Reload it before continuing.": "角色档案已更改。请重新加载后继续。",
+    "Enter a character name or choose a source.": "请输入角色名称或选择设定来源。",
+    "Failed to open the temporary media session.": "无法建立临时媒体会话。",
+    "Failed to close the temporary media session.": "无法关闭临时媒体会话。",
+    "The temporary media connection closed.": "临时媒体连接已关闭。",
+    "Select an image file.": "请选择图片文件。",
+    "Promote temporary reference images before saving the character profile.": "请先保存临时参考图，再保存角色档案。",
+    "${0}: Fill in the prompt or reset it to the default.": "${0}：请填写提示词或重置为默认值。",
+    "Failed to initialize character prompt defaults.": "初始化角色提示词默认值失败。",
     "Group chat ${0} could not be loaded. Reload the page to retry.": "无法加载群聊 ${0}。请重新加载页面后重试。",
     "Group chat ${0} could not be saved. Check the server connection and retry saving.": "无法保存群聊 ${0}。请检查服务器连接后重试保存。",
     "Syncing: ${0}": "正在同步：${0}",
@@ -7001,7 +7021,7 @@
     ,"sd_illustration_preset_rename": "重命名"
     ,"sd_illustration_preset_delete": "删除"
     ,"sd_illustration_prompt": "消息配图任务提示词"
-    ,"sd_illustration_studio_prompt": "迭代工作台提示词"
+    ,"sd_illustration_studio_prompt": "画室提示词"
     ,"sd_illustration_api_preset": "连接配置"
     ,"sd_illustration_llm_preset": "补全预设"
     ,"sd_illustration_context_count": "上下文消息数"
@@ -7009,7 +7029,7 @@
     ,"sd_illustration_min_interval": "请求最小间隔，毫秒"
     ,"sd_illustration_display_width": "插图显示宽度，百分比"
     ,"sd_illustration_generate_last": "为最后一条消息生成插图"
-    ,"sd_illustration_open_studio": "图像迭代工作台"
+    ,"sd_illustration_open_studio": "画室"
     ,"sd_illustration_message_button": "AI 插图"
     ,"sd_generation_preset": "生图预设"
     ,"Also delete server image files": "同时删除服务器图片文件"
@@ -7625,12 +7645,11 @@
     ,"Searching images...": "正在搜索图片..."
     ,"Extract Page Images": "提取网页图片"
     ,"Extracting page images...": "正在提取网页图片..."
-    ,"sd_illustration_exploration_section": "角色视觉探索 Agent"
+    ,"sd_illustration_exploration_section": "角色建档 Agent"
     ,"sd_illustration_visual_inspection": "开启多模态视觉审阅下载的候选参考图"
     ,"sd_illustration_exploration_api_preset": "探索连接配置"
     ,"sd_illustration_exploration_llm_preset": "探索补全预设"
     ,"sd_illustration_exploration_prompt": "探索提示词覆盖"
-    ,"sd_illustration_character_design_prompt": "原创角色定妆提示词覆盖"
     ,"(Inherit illustration connection)": "（继承插图连接配置）"
     ,"(Inherit illustration preset)": "（继承插图补全预设）"
     ,"sd_connection_profile_label": "连接配置"
@@ -7736,4 +7755,89 @@
     ,"Obsidian Ink": "墨玉（夜间纯色）"
     ,"Warm Paper": "素笺（日间护眼）"
     ,"Follow System": "跟随系统日夜"
+    ,"AI Profile Builder": "AI 建档"
+    ,"Refine with AI": "AI 调整档案"
+    ,"Build character profile with AI": "AI 角色建档"
+    ,"Refine character profile with AI": "AI 调整角色档案"
+    ,"Source material": "读取设定来源"
+    ,"Do not read a character card": "不读取角色卡"
+    ,"Current chat card: ${0}": "当前聊天角色卡：${0}"
+    ,"Current user persona: ${0}": "当前用户人设：${0}"
+    ,"Editable profile draft": "可编辑角色档案草稿"
+    ,"Describe the character, ask AI to search public sources or generate candidate portraits, and edit the draft on the right at any time.": "描述目标角色，让 AI 检索公开图源或生成候选立绘，并随时在右侧直接编辑草稿。"
+    ,"Describe the character or request appearance, outfit, or reference updates…": "描述角色特征，或提出外貌、服装与参考图的修改意见…"
+    ,"Character Builder AI": "角色建档 AI"
+    ,"Saving…": "正在保存…"
+    ,"Confirm & save to archive": "确认保存至角色库"
+    ,"Draft conflicts need your choice before saving": "保存前需先处理草稿冲突"
+    ,"Keep my edit": "保留我的修改"
+    ,"Use AI suggestion": "采纳 AI 建议"
+    ,"Your edit": "你的修改"
+    ,"AI suggestion": "AI 建议"
+    ,"Draft updated.": "草稿已更新。"
+    ,"Builder stopped.": "已停止生成。"
+    ,"Resolve all draft conflicts before saving.": "请先处理全部草稿冲突再保存。"
+    ,"Character profile requires a non-empty name.": "角色档案名称不能为空。"
+    ,"Temporary media cleanup failed: ${0}": "临时图片清理失败：${0}"
+    ,"Retry cleanup": "重试清理"
+    ,"Use AI Profile Builder to craft or look up character profiles through conversation, or create a blank profile manually.": "点击「AI 建档」通过多轮对话检索公开图源或生成候选立绘，或手动新建空白角色档案。"
+    ,"Legacy character design prompts need review": "存在待处理的旧定妆提示词"
+    ,"Review legacy prompts": "查看旧提示词"
+    ,"Legacy character design prompts": "旧定妆提示词迁移"
+    ,"Character design prompt overrides are no longer used at runtime. Export these saved custom texts or discard them explicitly. Cancel keeps this record for later review.": "运行时不再读取角色定妆提示词覆盖。你可以导出保存这些自定义文本或明确舍弃，点击取消将保留记录以供稍后处理。"
+    ,"Export & clear": "导出并清除"
+    ,"Discard legacy prompts": "舍弃旧提示词"
+    ,"Discard these legacy character design prompts permanently?": "确认永久舍弃这些旧定妆提示词？"
+    ,"Confirm that you received the complete exported file before clearing these legacy prompts.": "请确认已收到完整的导出文件，再清除这些旧定妆提示词。"
+    ,"sd_references_section_title": "参考与图生图"
+    ,"sd_character_reference_enabled_txt": "启用角色参考"
+    ,"sd_character_reference_mode_label": "传递方式"
+    ,"sd_character_reference_mode_text_only": "仅文字说明"
+    ,"sd_character_reference_mode_image_only": "仅参考图"
+    ,"sd_character_reference_mode_text_and_image": "文字说明与参考图"
+    ,"sd_img2img_enabled_txt": "允许图生图编辑（基于已有图片修改）"
+    ,"sd_style_references_enabled_txt": "启用画风与氛围参考"
+    ,"Current ComfyUI workflow JSON could not be parsed to inspect %ref_image% reference nodes, so requests with reference images or img2img will fail.": "当前 ComfyUI 工作流 JSON 无法解析，无法检测 %ref_image% 参考图节点，携带参考图或图生图的请求将会失败。"
+    ,"Current ComfyUI workflow does not contain any %ref_image% LoadImage nodes, so requests with reference images or img2img will fail.": "当前 ComfyUI 工作流未包含 %ref_image% LoadImage 节点，携带参考图或执行图生图时会失败。"
+    ,"RunPod Serverless mode does not support uploading reference images. Disable reference images and img2img, or switch character reference mode to text-only.": "RunPod Serverless 模式不支持上传参考图，请关闭参考图与图生图或将角色参考切换为「仅文字说明」。"
+    ,"Enabled style reference count exceeds the available reference slots in the current workflow or model, so generation will fail.": "已启用的画风参考图数量超出当前工作流或模型可用参考图槽位数，生图时会失败。"
+    ,"Enabled style references occupy all available reference slots, leaving no room for character reference images or img2img.": "当前画风参考图已占满全部参考图槽位，无法再附加角色参考图或图生图底图编辑。"
+    ,"The selected image backend does not support image inputs. Switch character reference mode to text-only or disable reference images and img2img.": "当前生图源服务端不支持图片输入，请将角色参考切换为「仅文字说明」或关闭参考图与图生图编辑。"
+    ,"The selected WebUI backend only supports source image editing (img2img) and does not support character or style reference images.": "当前 WebUI 生图源仅支持图生图底图编辑，不支持角色参考图或画风参考。"
+    ,"NovelAI character reference images require a V4.5 model. Switch to a V4.5 model or use text-only character descriptions.": "NovelAI 角色参考图仅支持 V4.5 模型，请切换至 V4.5 模型或改用「仅文字说明」。"
+    ,"The selected NovelAI model does not support style/vibe references.": "当前 NovelAI 模型不支持画风与氛围参考。"
+    ,"NovelAI supports at most 4 style references, so generation will fail.": "NovelAI 画风参考最多支持 4 张，生图时会失败。"
+    ,"The selected Google model uses :predict or video generation and does not support reference images or img2img.": "当前 Google 模型使用 :predict 或视频接口，不支持参考图或图生图编辑。"
+    ,"The selected OpenAI model does not support image edits or reference image inputs.": "当前 OpenAI 模型不支持图像编辑或参考图输入。"
+    ,"Some saved reference images were skipped because they are disabled in the current preset.": "部分已保存的参考图在当前预设中已关闭，本次重画已跳过。"
+    ,"Character reference images are incompatible with the active image backend or workflow.": "角色参考图与当前生图源或工作流不兼容。"
+    ,"Reference configuration conflict": "参考图配置冲突"
+    ,"Checks whether active reference or img2img switches conflict with the current image backend or workflow": "检查当前启用的参考图或图生图开关是否与生图源或工作流冲突"
+    ,"Reference settings conflict with the current image backend or workflow": "参考图设置与当前生图源或工作流存在冲突"
+    ,"${0} reference image(s)": "${0} 张参考图"
+    ,"Character visual description": "角色说明"
+    ,"Describe appearance, Danbooru character tag if applicable, outfits, and visual notes…": "描述外貌特征、适用的 Danbooru 角色名 tag、常见服装与注意项…"
+    ,"Reference images": "参考图"
+    ,"No reference images added yet.": "暂未添加参考图。"
+    ,"Short label (optional)": "简短说明（可选）"
+    ,"Reference label": "参考图说明"
+    ,"Reference label (e.g. default outfit, side view)": "参考图说明（如常服、侧视图）"
+    ,"Align character visual archive descriptions with bound lorebooks": "对照绑定世界书校准角色视觉库说明"
+    ,"Backup Settings": "备份设置"
+    ,"Changes are saved to config.yaml and take effect immediately for subsequent backups.": "修改会保存到 config.yaml，并对后续备份立即生效。"
+    ,"Lowering retention limits does not delete existing backup files on disk right away.": "调低保留上限不会立即删除磁盘上已有的备份文件。"
+    ,"Some backup settings are overridden by environment variables at runtime. Saving still updates config.yaml.": "部分备份配置当前被环境变量覆盖。保存仍会写入 config.yaml，但运行时以环境变量为准。"
+    ,"Overridden by ${0} (${1})": "已由环境变量 ${0} 覆盖（当前生效值：${1}）"
+    ,"Retention": "保留数量"
+    ,"Backups to keep per chat and settings file": "每个聊天与设置文件保留的备份数"
+    ,"Automatic Chat Backups": "自动聊天备份"
+    ,"Enable automatic chat backups": "启用自动聊天备份"
+    ,"Unlimited total chat backups": "不限聊天备份总数"
+    ,"Maximum total chat backups per user": "每位用户最多保留的聊天备份总数"
+    ,"Backup throttle interval": "备份节流间隔"
+    ,"Check chat file integrity before saving": "保存聊天前校验文件完整性"
+    ,"Full Data Backup": "完整数据备份"
+    ,"Allow users to download full data backups": "允许用户下载完整数据备份"
+    ,"Backup settings saved.": "备份设置已保存。"
+    ,"Please enter a valid non-negative integer.": "请输入大于或等于 0 的整数。"
 }

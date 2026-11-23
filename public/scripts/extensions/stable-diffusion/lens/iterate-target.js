@@ -18,6 +18,7 @@ import {
 import { diffUnits } from '../../../workbench/model/units.js';
 import {
     CHARACTER_PROFILES_NAMESPACE,
+    CHARACTER_PROFILES_VERSION,
     createCharacterProfileStore,
     normalizeCharacterProfile,
 } from '../character-archive/store.js';
@@ -29,15 +30,17 @@ import {
     validateComfyWorkflowGraph,
 } from '../comfy-workflow-graph.js';
 import { patchGenerationPresetConfig } from '../generation-presets.js';
-import { makeIllustrationId } from '../illustration/presets.js';
+import { getDefaultPromptValues, makeIllustrationId } from '../illustration/presets.js';
 import { getPresetById } from '../illustration/settings.js';
 import { i18n } from './i18n.js';
+import { simulateSdExploration, simulateSdIllustration } from './simulate.js';
 
 export const DEFAULT_SD_ITERATE_PROMPT = `You are a configuration, visual-archive, and ComfyUI workflow editor for Luker's Image Generation and AI Illustration system.
 
 Capabilities:
-- Edit AI illustration prompt presets (illustrationPrompt, studioPrompt, characterDesignPrompt, explorationPrompt, visualInspection) via sd_list_presets, sd_read_preset, and sd_update_preset.
-- Edit character visual archive profiles (canonicalTags, negativeTags, proseDescription, outfits) via sd_list_characters, sd_read_character, sd_upsert_character, and sd_delete_character, cross-checking bound lorebooks with world_book_list, lorebook_list, lorebook_query, and lorebook_get.
+- Edit AI illustration prompt presets (illustrationPrompt, studioPrompt, explorationPrompt, visualInspection) via sd_list_presets, sd_read_preset, and sd_update_preset.
+- Simulate unsaved prompt changes in an isolated sandbox and open the Simulation Review popup for user inspection and annotations via sd_simulate_illustration (for illustrationPrompt, optionally allowing sandbox character exploration) and sd_simulate_exploration (for explorationPrompt, choosing mode "background" with targets or mode "dialog" with user_turns).
+- Edit character visual archive profiles (description and reference_images) via sd_list_characters, sd_read_character, sd_upsert_character, and sd_delete_character, cross-checking bound lorebooks with world_book_list, lorebook_list, lorebook_query, and lorebook_get.
 - Edit ComfyUI API-format workflows and custom placeholders via sd_list_workflows, sd_read_workflow, sd_create_workflow, sd_upsert_workflow_nodes, sd_remove_workflow_nodes, sd_delete_workflow, and sd_update_comfy_config.
 - Query the user's connected ComfyUI server via sd_search_comfy_nodes and sd_inspect_comfy_node before wiring unfamiliar or custom nodes so class_type names, required inputs, enum filenames, and output slot indices match installed nodes.
 - Validate draft workflows end-to-end without overwriting saved workflow files via sd_test_workflow_draft, and inspect recorded run traces via sd_read_run.
@@ -60,6 +63,8 @@ const READ_TOOL_NAMES = new Set([
     'sd_search_comfy_nodes',
     'sd_inspect_comfy_node',
     'sd_test_workflow_draft',
+    'sd_simulate_illustration',
+    'sd_simulate_exploration',
 ]);
 
 const SD_ITERATE_TOOLS = Object.freeze([
@@ -98,7 +103,7 @@ const SD_ITERATE_TOOLS = Object.freeze([
         type: 'function',
         function: {
             name: 'sd_read_character',
-            description: 'Read full tags, prose, and outfits of a character profile in the working draft.',
+            description: 'Read full plain-text description and reference images of a character profile in the working draft.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -225,6 +230,70 @@ const SD_ITERATE_TOOLS = Object.freeze([
     {
         type: 'function',
         function: {
+            name: 'sd_simulate_illustration',
+            description: 'Run the illustration agent and image generation against the unsaved working draft in an isolated sandbox, open Simulation Review for user inspection and annotations, and return the tagged text result without modifying chat, global character archive, or formal image storage.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    preset_id: { type: 'string', description: 'Optional draft preset id (defaults to the current preset).' },
+                    message_index: { type: 'integer', description: 'Optional 0-based chat message index to illustrate.' },
+                    sample_message: { type: 'string', description: 'Optional sample assistant message text when testing without a chat or with custom text.' },
+                    allow_exploration: { type: 'boolean', description: 'Whether the illustration agent may invoke sandbox explore_characters (default true).' },
+                },
+                additionalProperties: false,
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'sd_simulate_exploration',
+            description: 'Run the character profile agent against the unsaved working draft in an isolated sandbox in either "background" mode (requires targets) or "dialog" mode (requires user_turns), open Simulation Review for user inspection and annotations, and return the tagged text result without leaking state.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    preset_id: { type: 'string', description: 'Optional draft preset id (defaults to the current preset).' },
+                    mode: { type: 'string', enum: ['background', 'dialog'], description: 'Required execution mode: "background" for automatic exploration or "dialog" for multi-turn conversational building.' },
+                    targets: {
+                        type: 'array',
+                        description: 'Required for mode "background": target characters to explore.',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                name: { type: 'string' },
+                                work: { type: 'string' },
+                                hint: { type: 'string' },
+                            },
+                            required: ['name'],
+                            additionalProperties: false,
+                        },
+                    },
+                    user_turns: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Required for mode "dialog": sequential user messages for real multi-turn replies.',
+                    },
+                    initial_profile_id: { type: 'string', description: 'Optional draft character profile id to refine in mode "dialog".' },
+                    source: {
+                        type: 'object',
+                        description: 'Optional explicit local source policy (defaults to { kind: "none" }).',
+                        properties: {
+                            kind: { type: 'string', enum: ['none', 'card', 'persona'] },
+                            card_avatar: { type: 'string' },
+                        },
+                        required: ['kind'],
+                        additionalProperties: false,
+                    },
+                    user_hint: { type: 'string', description: 'Optional extra guidance for mode "background".' },
+                },
+                required: ['mode'],
+                additionalProperties: false,
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'sd_update_preset',
             description: 'Update prompt fields or visualInspection on an existing illustration preset in the draft.',
             parameters: {
@@ -234,7 +303,6 @@ const SD_ITERATE_TOOLS = Object.freeze([
                     name: { type: 'string' },
                     illustration_prompt: { type: 'string' },
                     studio_prompt: { type: 'string' },
-                    character_design_prompt: { type: 'string' },
                     exploration_prompt: { type: 'string' },
                     visual_inspection: { type: 'boolean' },
                 },
@@ -255,25 +323,23 @@ const SD_ITERATE_TOOLS = Object.freeze([
                     name: { type: 'string' },
                     aliases: { type: 'array', items: { type: 'string' } },
                     source_work: { type: 'string' },
-                    canonical_tags: { type: 'array', items: { type: 'string' } },
-                    negative_tags: { type: 'array', items: { type: 'string' } },
-                    prose_description: { type: 'string' },
-                    outfits: {
+                    description: {
+                        type: 'string',
+                        description: 'Structured plain-text visual description (appearance, attire variants, distinguishing traits, and Danbooru character tag if applicable).',
+                    },
+                    reference_images: {
                         type: 'array',
+                        description: 'Reference image entries ({ path, label? }).',
                         items: {
                             type: 'object',
                             properties: {
-                                id: { type: 'string' },
-                                name: { type: 'string' },
-                                tags: { type: 'array', items: { type: 'string' } },
-                                prose: { type: 'string' },
-                                referenceImages: { type: 'array', items: { type: 'string' } },
+                                path: { type: 'string' },
+                                label: { type: 'string' },
                             },
-                            required: ['name'],
+                            required: ['path'],
                             additionalProperties: false,
                         },
                     },
-                    default_outfit_id: { type: 'string' },
                 },
                 required: ['name'],
                 additionalProperties: false,
@@ -408,9 +474,6 @@ function formatPresetUnitText(fields) {
         `--- illustrationPrompt ---\n${fields.illustrationPrompt || ''}`,
         `--- studioPrompt ---\n${fields.studioPrompt || ''}`,
     ];
-    if (fields.characterDesignPrompt) {
-        lines.push(`--- characterDesignPrompt ---\n${fields.characterDesignPrompt}`);
-    }
     if (fields.explorationPrompt) {
         lines.push(`--- explorationPrompt ---\n${fields.explorationPrompt}`);
     }
@@ -418,19 +481,16 @@ function formatPresetUnitText(fields) {
 }
 
 function formatCharacterUnitText(fields) {
-    const outfitLines = (fields.outfits || []).map(o => (
-        `  - ${o.id}: ${o.name} | tags=[${(o.tags || []).join(', ')}] | refs=${(o.referenceImages || []).length}`
+    const refLines = (fields.referenceImages || []).map(r => (
+        r.label ? `  - ${r.path} (${r.label})` : `  - ${r.path}`
     ));
     return [
         `name: ${fields.name || ''}`,
         fields.aliases?.length ? `aliases: ${fields.aliases.join(', ')}` : '',
         fields.sourceWork ? `work: ${fields.sourceWork}` : '',
-        `canonicalTags: [${(fields.canonicalTags || []).join(', ')}]`,
-        fields.negativeTags?.length ? `negativeTags: [${fields.negativeTags.join(', ')}]` : '',
-        fields.proseDescription ? `prose: ${fields.proseDescription}` : '',
-        `defaultOutfitId: ${fields.defaultOutfitId || ''}`,
-        'outfits:',
-        ...outfitLines,
+        `description: ${fields.description || ''}`,
+        refLines.length > 0 ? 'referenceImages:' : 'referenceImages: (none)',
+        ...refLines,
     ].filter(Boolean).join('\n');
 }
 
@@ -530,7 +590,6 @@ export function buildSdUnits(doc) {
             name: String(preset.name || ''),
             illustrationPrompt: String(preset.illustrationPrompt || ''),
             studioPrompt: String(preset.studioPrompt || ''),
-            characterDesignPrompt: String(preset.characterDesignPrompt || ''),
             explorationPrompt: String(preset.explorationPrompt || ''),
             visualInspection: Boolean(preset.visualInspection),
         };
@@ -544,20 +603,18 @@ export function buildSdUnits(doc) {
     }
     for (const char of Array.isArray(doc?.characters) ? doc.characters : []) {
         if (!char?.id) continue;
+        const normalized = normalizeCharacterProfile(char);
+        if (!normalized) continue;
         const fields = {
-            name: String(char.name || ''),
-            aliases: clone(char.aliases || []),
-            sourceWork: String(char.sourceWork || ''),
-            sourceCardAvatars: clone(char.sourceCardAvatars || []),
-            canonicalTags: clone(char.canonicalTags || []),
-            negativeTags: clone(char.negativeTags || []),
-            proseDescription: String(char.proseDescription || ''),
-            outfits: clone(char.outfits || []),
-            defaultOutfitId: String(char.defaultOutfitId || ''),
+            name: normalized.name,
+            aliases: clone(normalized.aliases),
+            sourceWork: normalized.sourceWork,
+            description: normalized.description,
+            referenceImages: clone(normalized.referenceImages),
         };
-        map.set(`character:${char.id}`, {
-            key: `character:${char.id}`,
-            label: fields.name || char.id,
+        map.set(`character:${normalized.id}`, {
+            key: `character:${normalized.id}`,
+            label: fields.name || normalized.id,
             group: i18n('Character Archive'),
             fields,
             text: formatCharacterUnitText(fields),
@@ -611,15 +668,17 @@ function applyOpsToSdDoc(doc, ops) {
             }
             let target = next.presets.find(p => p.id === id);
             if (!target) {
+                const defaults = getDefaultPromptValues('tag');
                 target = {
                     id,
                     name: id,
+                    promptStyle: 'tag',
+                    promptDefaultsInitialized: true,
                     createdAt: Date.now(),
                     updatedAt: Date.now(),
-                    illustrationPrompt: '',
-                    studioPrompt: '',
-                    characterDesignPrompt: '',
-                    explorationPrompt: '',
+                    illustrationPrompt: defaults.illustrationPrompt,
+                    studioPrompt: defaults.studioPrompt,
+                    explorationPrompt: defaults.explorationPrompt,
                     llm: { apiPresetName: '', llmPresetName: '' },
                     explorationLlm: { apiPresetName: '', llmPresetName: '' },
                     visualInspection: false,
@@ -627,6 +686,11 @@ function applyOpsToSdDoc(doc, ops) {
                 next.presets.push(target);
             }
             for (const c of op.changes) {
+                if (op.kind === 'add'
+                    && (c.field === 'illustrationPrompt' || c.field === 'studioPrompt' || c.field === 'explorationPrompt')
+                    && !String(c.after ?? '').trim()) {
+                    continue;
+                }
                 target[c.field] = clone(c.after);
             }
             target.updatedAt = Date.now();
@@ -829,7 +893,7 @@ export function createSdIterateTarget(
             }
             return [
                 i18n('Refine illustration prompt instructions for consistent framing'),
-                i18n('Align character visual archive tags with bound lorebooks'),
+                i18n('Align character visual archive descriptions with bound lorebooks'),
             ];
         },
         getNativeAi() {
@@ -944,8 +1008,9 @@ export function createSdIterateTarget(
                 return (live?.characters || []).map(ch => ({
                     id: ch.id,
                     name: ch.name,
-                    sourceWork: ch.sourceWork,
-                    outfits: (ch.outfits || []).map(o => ({ id: o.id, name: o.name, refs: (o.referenceImages || []).length })),
+                    aliases: ch.aliases || [],
+                    sourceWork: ch.sourceWork || '',
+                    referenceCount: (ch.referenceImages || []).length,
                 }));
             }
             if (name === 'sd_read_character') {
@@ -1219,6 +1284,24 @@ export function createSdIterateTarget(
                 };
             }
 
+            if (name === 'sd_simulate_illustration') {
+                return await simulateSdIllustration({
+                    context: c,
+                    live,
+                    args,
+                    signal,
+                });
+            }
+
+            if (name === 'sd_simulate_exploration') {
+                return await simulateSdExploration({
+                    context: c,
+                    live,
+                    args,
+                    signal,
+                });
+            }
+
             throw new SourceError('unknown_tool', `Unknown read tool: ${name}`);
         },
         async runEdit(call, live) {
@@ -1245,7 +1328,6 @@ export function createSdIterateTarget(
                 if (args.name !== undefined) target.name = String(args.name);
                 if (args.illustration_prompt !== undefined) target.illustrationPrompt = String(args.illustration_prompt);
                 if (args.studio_prompt !== undefined) target.studioPrompt = String(args.studio_prompt);
-                if (args.character_design_prompt !== undefined) target.characterDesignPrompt = String(args.character_design_prompt);
                 if (args.exploration_prompt !== undefined) target.explorationPrompt = String(args.exploration_prompt);
                 if (args.visual_inspection !== undefined) target.visualInspection = Boolean(args.visual_inspection);
                 return next;
@@ -1261,11 +1343,8 @@ export function createSdIterateTarget(
                     name: args.name ?? prev.name,
                     aliases: args.aliases ?? prev.aliases,
                     sourceWork: args.source_work ?? prev.sourceWork,
-                    canonicalTags: args.canonical_tags ?? prev.canonicalTags,
-                    negativeTags: args.negative_tags ?? prev.negativeTags,
-                    proseDescription: args.prose_description ?? prev.proseDescription,
-                    outfits: args.outfits ?? prev.outfits,
-                    defaultOutfitId: args.default_outfit_id ?? prev.defaultOutfitId,
+                    description: args.description ?? prev.description,
+                    referenceImages: args.reference_images ?? prev.referenceImages,
                 });
                 if (!merged) {
                     throw new SourceError('invalid_args', 'Character profile requires a non-empty name.');
@@ -1471,7 +1550,7 @@ export function createSdIterateTarget(
                         }
                         const res = await c.updateGlobalState(CHARACTER_PROFILES_NAMESPACE, (cur) => ({
                             ...cur,
-                            version: 1,
+                            version: CHARACTER_PROFILES_VERSION,
                             profiles: profilesObj,
                         }), { asyncDiff: false });
                         if (!res?.ok) {

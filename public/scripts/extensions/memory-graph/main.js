@@ -32,15 +32,18 @@ import {
     buildRoundNodesSection,
     classifyExtractionMutation,
 } from './extraction-schedule.js';
-import { renderExtractionTemplate, resolveExtractionTemplate } from './prompt-units.js';
+import { readStoredPrompt, renderExtractionTemplate, resolveExtractionTemplate } from './prompt-units.js';
 export { DEFAULT_PER_TYPE_INSTRUCTIONS, computeActiveExtractionTypes };
 import {
     configure as configureCharacterOverrides,
+    getCurrentAvatar,
+    getCharacterAdvancedOverrideByAvatar,
     getEffectiveSettings,
     getEffectiveNodeTypeSchema,
     getSchemaScopeInfo,
     getAdvancedScopeInfo,
     persistCharacterAdvancedOverride,
+    persistCharacterAdvancedOverridePatch,
     removeCharacterAdvancedOverride,
 } from './character-overrides.js';
 import { registerMemoryGraphCardBindingSlot } from './card-binding-slot.js';
@@ -50,21 +53,15 @@ import {
     clearImportedStoreTransientState,
     bindImportedStoreToAssistantFloor,
 } from './import-export.js';
-import { DEFAULT_CONFIG_ITER_SYSTEM_PROMPT } from './config-iteration/system-prompt.js';
-import { DEFAULT_GRAPH_ITER_SYSTEM_PROMPT } from './graph-iteration/system-prompt.js';
 import { migrateConfigIterationPrompt } from './config-iteration/prompt-migration.js';
 import {
-    DEFAULT_EXTRACT_EDGE_RULES,
-    DEFAULT_EXTRACT_TEMPLATE,
     DEFAULT_EVENT_COMPRESS_INSTRUCTION,
-    DEFAULT_CRAWL_SYSTEM_PROMPT,
-    DEFAULT_RAG_REWRITE_SYSTEM_PROMPT,
-    DEFAULT_RECALL_FINALIZE_SYSTEM_PROMPT,
-    DEFAULT_RECALL_ROUTE_SYSTEM_PROMPT,
 } from './default-prompts.js';
 import {
     ADVANCED_SETTING_DEFAULTS,
     applyAdvancedSettings,
+    migrateAdvancedPromptSettings,
+    migrateLegacyWorldInfoToggle,
     normalizeAdvancedSettings,
     normalizeCrawlCandidateLimit,
     normalizeExtractExcludeRecentTurns,
@@ -679,16 +676,17 @@ function ensureSettings() {
         'recallInjectPositionSchemaVersion',
     );
 
+    migrateConfigIterationPrompt(extension_settings[MODULE_NAME]);
+    const migratedWorldInfo = migrateLegacyWorldInfoToggle(extension_settings[MODULE_NAME]);
     for (const [key, value] of Object.entries(defaultSettings)) {
         if (extension_settings[MODULE_NAME][key] === undefined) {
             extension_settings[MODULE_NAME][key] = cloneDefault(value);
         }
     }
 
-    // One-shot: carry a user-authored legacy schema prompt into the
-    // configuration prompt slot. Must run before the legacy normalization
-    // below rewrites the old key with the retired default.
-    migrateConfigIterationPrompt(extension_settings[MODULE_NAME]);
+    if (migrateAdvancedPromptSettings(extension_settings[MODULE_NAME]) || migratedWorldInfo) {
+        saveSettingsDebounced();
+    }
 
     const normalizedAdvanced = normalizeAdvancedSettings(extension_settings[MODULE_NAME], defaultSettings);
     for (const key of Object.keys(ADVANCED_SETTING_DEFAULTS)) {
@@ -2519,7 +2517,8 @@ function appendUniqueWorldInfoEntries(payload, field, incomingEntries = []) {
     return changed;
 }
 
-async function resolveMemoryGraphWorldInfo(context, settings, {
+async function resolveMemoryGraphWorldInfo(context, {
+    includeWorldInfo = true,
     worldInfoMessages = null,
     runtimeWorldInfo = null,
     forceWorldInfoResimulate = false,
@@ -2527,8 +2526,7 @@ async function resolveMemoryGraphWorldInfo(context, settings, {
     abortSignal = null,
     recallRunToken = 0,
 } = {}) {
-    const includeWorldInfoWithPreset = settings?.includeWorldInfoWithPreset !== false;
-    if (!includeWorldInfoWithPreset) {
+    if (includeWorldInfo === false) {
         return {};
     }
     if (!forceWorldInfoResimulate && hasEffectiveRuntimeWorldInfo(runtimeWorldInfo)) {
@@ -3089,6 +3087,7 @@ async function runFunctionCallTask(context, settings, {
     taskMessages: taskMessagesOverride = null,
     promptPresetName = '',
     apiPresetName = '',
+    includeWorldInfo = false,
     worldInfoMessages = null,
     runtimeWorldInfo = null,
     forceWorldInfoResimulate = false,
@@ -3106,7 +3105,8 @@ async function runFunctionCallTask(context, settings, {
     }
     throwIfRecallRunInvalid(recallRunToken, abortSignal, 'Memory recall aborted.');
 
-    const resolvedWorldInfo = await resolveMemoryGraphWorldInfo(context, settings, {
+    const resolvedWorldInfo = await resolveMemoryGraphWorldInfo(context, {
+        includeWorldInfo,
         worldInfoMessages,
         runtimeWorldInfo,
         forceWorldInfoResimulate,
@@ -3163,7 +3163,11 @@ function buildDynamicToolDescription(spec = {}, mode = 'create') {
     const chunks = [];
     if (normalizedMode === 'edit') {
         chunks.push(`Edit semantic node for type "${typeId}" (table "${tableName || typeId}") by node_id.`);
-        chunks.push('Provide only changed fields in set_fields. Existing fields not mentioned will stay unchanged.');
+        if (fields.includes('title')) {
+            chunks.push('Use top-level title to rename; provide other changed fields in set_fields. Existing fields not mentioned will stay unchanged.');
+        } else {
+            chunks.push('Provide only changed fields in set_fields. Existing fields not mentioned will stay unchanged.');
+        }
     } else {
         chunks.push(`Create semantic node for type "${typeId}" (table "${tableName || typeId}").`);
         chunks.push('Use this tool only for creating new nodes.');
@@ -3206,7 +3210,6 @@ function buildDynamicExtractTools(schema = [], options = {}) {
     const tools = [];
     const specByToolName = new Map();
     const usedNames = new Set();
-    const allowEditDelete = options?.allowEditDelete !== false;
     const allowLinks = options?.allowLinks !== false;
     const activeTypes = options?.activeTypes instanceof Set ? options.activeTypes : null;
 
@@ -3232,7 +3235,7 @@ function buildDynamicExtractTools(schema = [], options = {}) {
         }
         usedNames.add(createToolName);
         let editToolName = '';
-        if (isEditableType && allowEditDelete) {
+        if (isEditableType) {
             editToolName = `${baseName}_edit`;
             suffix = 2;
             while (usedNames.has(editToolName)) {
@@ -3242,7 +3245,7 @@ function buildDynamicExtractTools(schema = [], options = {}) {
             usedNames.add(editToolName);
         }
         let deleteToolName = '';
-        if (isEditableType && allowEditDelete) {
+        if (isEditableType) {
             deleteToolName = `${baseName}_delete`;
             suffix = 2;
             while (usedNames.has(deleteToolName)) {
@@ -3301,8 +3304,9 @@ function buildDynamicExtractTools(schema = [], options = {}) {
             }
             createProperties[field] = { type: 'string' };
         }
+        const nonTitleFields = filteredFields.filter(field => field !== 'title');
         const editFieldProperties = {};
-        for (const field of fieldSet) {
+        for (const field of nonTitleFields) {
             editFieldProperties[field] = { type: 'string' };
         }
 
@@ -3331,7 +3335,26 @@ function buildDynamicExtractTools(schema = [], options = {}) {
                 },
             },
         });
-        if (isEditableType && allowEditDelete) {
+        if (isEditableType) {
+            const editProperties = {
+                node_id: { type: 'string', description: 'When referencing an existing node, use only an id that appears in graph_data.nodes.' },
+                title: { type: 'string' },
+            };
+            if (nonTitleFields.length > 0) {
+                editProperties.set_fields = {
+                    type: 'object',
+                    properties: editFieldProperties,
+                    additionalProperties: false,
+                };
+                editProperties.clear_fields = {
+                    type: 'array',
+                    items: {
+                        type: 'string',
+                        enum: nonTitleFields,
+                    },
+                };
+            }
+            editProperties.reason = { type: 'string' };
             tools.push({
                 type: 'function',
                 function: {
@@ -3345,30 +3368,14 @@ function buildDynamicExtractTools(schema = [], options = {}) {
                     }, 'edit'),
                     parameters: {
                         type: 'object',
-                        properties: {
-                            node_id: { type: 'string', description: 'When referencing an existing node, use only an id that appears in graph_data.nodes.' },
-                            title: { type: 'string' },
-                            set_fields: {
-                                type: 'object',
-                                properties: editFieldProperties,
-                                additionalProperties: false,
-                            },
-                            clear_fields: {
-                                type: 'array',
-                                items: {
-                                    type: 'string',
-                                    enum: filteredFields,
-                                },
-                            },
-                            reason: { type: 'string' },
-                        },
+                        properties: editProperties,
                         required: ['node_id'],
                         additionalProperties: false,
                     },
                 },
             });
         }
-        if (isEditableType && allowEditDelete) {
+        if (isEditableType) {
             tools.push({
                 type: 'function',
                 function: {
@@ -3394,7 +3401,7 @@ function buildDynamicExtractTools(schema = [], options = {}) {
             columnHints: filteredColumnHints,
             op: 'create',
         });
-        if (isEditableType && allowEditDelete) {
+        if (isEditableType) {
             specByToolName.set(editToolName, {
                 ...spec,
                 id: typeId,
@@ -3404,7 +3411,7 @@ function buildDynamicExtractTools(schema = [], options = {}) {
                 op: 'edit',
             });
         }
-        if (isEditableType && allowEditDelete) {
+        if (isEditableType) {
             specByToolName.set(deleteToolName, {
                 ...spec,
                 id: typeId,
@@ -4079,7 +4086,6 @@ async function extractNodesWithLLM(context, store, settings, schema, messageBatc
     const extractionMaxSeq = Number.isFinite(Number(options?.maxSeq))
         ? Math.max(0, Math.floor(Number(options.maxSeq)))
         : null;
-    const rebuildCreateOnly = Boolean(options?.rebuildCreateOnly);
     const crawlGraph = options?.crawlGraph && typeof options.crawlGraph === 'object' ? options.crawlGraph : null;
     const includeEdges = options?.includeEdges !== false;
     const includeLinks = options?.includeLinks !== false;
@@ -4157,7 +4163,8 @@ async function extractNodesWithLLM(context, store, settings, schema, messageBatc
         nodesBlock: buildExtractionNodesBlock(schema, activeTypes),
         edgesBlock: includeEdges ? buildExtractionEdgesBlock(edgeRules) : '',
     });
-    const resolvedExtractWorldInfo = await resolveMemoryGraphWorldInfo(context, settings, {
+    const resolvedExtractWorldInfo = await resolveMemoryGraphWorldInfo(context, {
+        includeWorldInfo: settings?.extractIncludeWorldInfo !== false,
         worldInfoMessages: messages.map(item => ({
             role: item.role,
             content: item.text,
@@ -4167,7 +4174,6 @@ async function extractNodesWithLLM(context, store, settings, schema, messageBatc
         abortSignal: options?.abortSignal || null,
     });
     const { tools, specByToolName } = buildDynamicExtractTools(schema, {
-        allowEditDelete: !rebuildCreateOnly,
         activeTypes,
         allowLinks: includeLinks,
     });
@@ -5374,7 +5380,7 @@ async function buildExtractionCrawlGraph(context, store, settings, schema, messa
     const readKeys = new Set();
     const observations = [];
     const tools = buildExtractionCrawlTools();
-    const systemPrompt = String(settings?.extractCrawlSystemPrompt || '').trim() || DEFAULT_CRAWL_SYSTEM_PROMPT;
+    const systemPrompt = readStoredPrompt(settings?.extractCrawlSystemPrompt, 'Extraction Crawl Prompt');
     let round = 0;
     while (round < maxRounds) {
         round += 1;
@@ -5604,7 +5610,6 @@ async function processConcurrentBatch(context, store, settings, schema, extractB
     maxSeq,
     minSeq,
     abortSignal,
-    rebuildCreateOnly,
     onPhaseProgress,
 } = {}) {
     const readStore = normalizeStoreForRuntime(store);
@@ -5627,7 +5632,6 @@ async function processConcurrentBatch(context, store, settings, schema, extractB
         const operations = await extractNodesWithLLM(context, readStore, settings, schema, extractBatch, {
             maxSeq,
             abortSignal,
-            rebuildCreateOnly,
             crawlGraph: await buildCrawl(),
             types: new Set([typeId]),
             includeEdges: false,
@@ -5660,7 +5664,6 @@ async function processConcurrentBatch(context, store, settings, schema, extractB
     const edgeOperations = await extractNodesWithLLM(context, readStore, settings, schema, extractBatch, {
         maxSeq,
         abortSignal,
-        rebuildCreateOnly,
         crawlGraph: await buildCrawl(),
         types: new Set(),
         includeEdges: true,
@@ -5698,14 +5701,12 @@ async function processPendingMessageBatchWithLLM(context, store, settings, schem
             maxSeq: extractionMaxSeq,
             minSeq: extractionMinSeq,
             abortSignal: options?.abortSignal || null,
-            rebuildCreateOnly: Boolean(options?.rebuildCreateOnly),
             onPhaseProgress: options?.onPhaseProgress,
         });
     }
     const operations = await extractNodesWithLLM(context, store, settings, schema, extractBatch, {
         maxSeq: extractionMaxSeq,
         abortSignal: options?.abortSignal || null,
-        rebuildCreateOnly: Boolean(options?.rebuildCreateOnly),
         crawlGraph: String(settings?.extractMode || '').toLowerCase() === 'crawl'
             ? await buildExtractionCrawlGraph(context, store, settings, schema, extractBatch, { maxSeq: extractionMaxSeq, abortSignal: options?.abortSignal || null })
             : null,
@@ -5991,7 +5992,6 @@ async function runExtractionForStore(context, store, {
     onBatchApplied = null,
     onCompressionApplied = null,
     onPhaseProgress = null,
-    rebuildCreateOnly = false,
     getEffectiveLatestSeq = null,
 } = {}) {
     const settings = getEffectiveSettings(context, getSettings());
@@ -6103,7 +6103,6 @@ async function runExtractionForStore(context, store, {
                     {
                         compressionStats,
                         abortSignal,
-                        rebuildCreateOnly: Boolean(rebuildCreateOnly),
                         onPhaseProgress: batchOnPhaseProgress,
                     },
                 );
@@ -6423,7 +6422,7 @@ async function runQueryRewrite(context, settings, queryBundle, opts = {}) {
         return null;
     }
     const llmPresetName = String(settings?.ragRewriteLlmPresetName || '').trim();
-    const systemPrompt = String(settings?.ragRewriteSystemPrompt || '').trim() || DEFAULT_RAG_REWRITE_SYSTEM_PROMPT;
+    const systemPrompt = readStoredPrompt(settings?.ragRewriteSystemPrompt, 'Query rewrite system prompt');
     const recentMessages = Array.isArray(queryBundle?.recent_messages) ? queryBundle.recent_messages : [];
     if (recentMessages.length === 0) {
         return null;
@@ -6828,7 +6827,7 @@ function normalizeEdgeTypeList(rawTypes) {
 }
 
 async function chooseRecallRoute(context, settings, recallState) {
-    const routeSystemPrompt = String(settings?.recallRouteSystemPrompt || '').trim() || DEFAULT_RECALL_ROUTE_SYSTEM_PROMPT;
+    const routeSystemPrompt = readStoredPrompt(settings?.recallRouteSystemPrompt, 'Recall Routing Prompt');
     const alwaysInjectIds = Array.isArray(recallState?.alwaysInjectIds) ? recallState.alwaysInjectIds : [];
     const candidateSet = new Set((recallState.candidates || []).map(node => String(node?.id || '')).filter(Boolean));
     if (candidateSet.size === 0) {
@@ -6907,6 +6906,7 @@ async function chooseRecallRoute(context, settings, recallState) {
             ],
             apiPresetName: settings.recallApiPresetName || '',
             promptPresetName: String(settings.recallPresetName || '').trim(),
+            includeWorldInfo: settings?.recallIncludeWorldInfo !== false,
             worldInfoMessages: Array.isArray(recallState?.worldInfoMessages) ? recallState.worldInfoMessages : null,
             runtimeWorldInfo: recallState?.runtimeWorldInfo && typeof recallState.runtimeWorldInfo === 'object'
                 ? recallState.runtimeWorldInfo
@@ -7067,7 +7067,7 @@ export function expandRouteCandidates(store, route, rootCandidates) {
 }
 
 async function chooseFocusNodes(context, settings, recallState) {
-    const finalizeSystemPrompt = String(settings?.recallFinalizeSystemPrompt || '').trim() || DEFAULT_RECALL_FINALIZE_SYSTEM_PROMPT;
+    const finalizeSystemPrompt = readStoredPrompt(settings?.recallFinalizeSystemPrompt, 'Recall Selection Prompt');
     const alwaysInjectIds = Array.isArray(recallState?.alwaysInjectIds) ? recallState.alwaysInjectIds : [];
     const candidateSet = new Set((recallState.candidates || []).map(node => String(node?.id || '')).filter(Boolean));
     if (candidateSet.size === 0) {
@@ -7113,6 +7113,7 @@ async function chooseFocusNodes(context, settings, recallState) {
             ],
             apiPresetName: settings.recallApiPresetName || '',
             promptPresetName: String(settings.recallPresetName || '').trim(),
+            includeWorldInfo: settings?.recallIncludeWorldInfo !== false,
             worldInfoMessages: Array.isArray(recallState?.worldInfoMessages) ? recallState.worldInfoMessages : null,
             runtimeWorldInfo: recallState?.runtimeWorldInfo && typeof recallState.runtimeWorldInfo === 'object'
                 ? recallState.runtimeWorldInfo
@@ -8110,7 +8111,6 @@ async function rebuildStoreFromCurrentChat(context, { abortSignal = null, onBatc
                 { syncPersistentProjection: true, floor: seqToFloor(context, batchEndSeq) },
             );
         },
-        rebuildCreateOnly: true,
     });
     const latestSeq = Math.max(0, Number(rebuilt?.lastExtractionDebug?.latestSeq || 0));
     if (!extracted && latestSeq > 0 && String(rebuilt?.lastExtractionDebug?.reason || '') !== 'no_graph_changes') {
@@ -9625,20 +9625,6 @@ export function setMemorySetting(key, value) {
     return settings[key];
 }
 
-function withAdvancedPromptDefaults(source) {
-    return {
-        ...source,
-        extractTemplate: source.extractTemplate || DEFAULT_EXTRACT_TEMPLATE,
-        extractEdgeRules: source.extractEdgeRules || DEFAULT_EXTRACT_EDGE_RULES,
-        extractCrawlSystemPrompt: source.extractCrawlSystemPrompt || DEFAULT_CRAWL_SYSTEM_PROMPT,
-        recallRouteSystemPrompt: source.recallRouteSystemPrompt || DEFAULT_RECALL_ROUTE_SYSTEM_PROMPT,
-        recallFinalizeSystemPrompt: source.recallFinalizeSystemPrompt || DEFAULT_RECALL_FINALIZE_SYSTEM_PROMPT,
-        ragRewriteSystemPrompt: source.ragRewriteSystemPrompt || DEFAULT_RAG_REWRITE_SYSTEM_PROMPT,
-        graphIterSystemPrompt: source.graphIterSystemPrompt || DEFAULT_GRAPH_ITER_SYSTEM_PROMPT,
-        configIterSystemPrompt: source.configIterSystemPrompt || DEFAULT_CONFIG_ITER_SYSTEM_PROMPT,
-    };
-}
-
 /** Everything the settings page shows: values, choices and the advanced scope. */
 export function getMemorySettingsView(context) {
     const settings = getSettings();
@@ -9654,8 +9640,8 @@ export function getMemorySettingsView(context) {
             compressibleTypes: getCompressibleTypeSpecs(getEffectiveSettings(context, settings), context),
         },
         advanced: {
-            values: withAdvancedPromptDefaults(info.settings),
-            defaults: withAdvancedPromptDefaults(normalizeAdvancedSettings(defaultSettings, defaultSettings)),
+            values: info.settings,
+            defaults: normalizeAdvancedSettings(defaultSettings, defaultSettings),
             scope: info.scope,
             hasAvatar: info.hasAvatar,
             hasOverride: info.hasOverride,
@@ -10718,7 +10704,25 @@ export function _setPersistentDrainHookForTest(hook) {
 }
 export { buildRoleSplitChatMessages as _buildRoleSplitChatMessagesForTest };
 
-jQuery(() => {
+async function initializeCharacterPromptDefaults(context) {
+    try {
+        const avatar = getCurrentAvatar(context);
+        const override = avatar ? getCharacterAdvancedOverrideByAvatar(context, avatar) : null;
+        if (!override) return;
+        const migratedPrompts = migrateAdvancedPromptSettings(override, { sparse: true });
+        const migratedWorldInfo = migrateLegacyWorldInfoToggle(override);
+        if (!migratedPrompts && !migratedWorldInfo) return;
+        const patch = migratedWorldInfo
+            ? { set: override, unset: ['includeWorldInfoWithPreset'] }
+            : { set: override };
+        await persistCharacterAdvancedOverridePatch(context, avatar, patch, { requireSaved: true });
+    } catch (error) {
+        console.error(`[${MODULE_NAME}] Character prompt initialization failed`, error);
+        toastr.error(String(error?.message || error), i18n('Failed to initialize character prompt defaults.'));
+    }
+}
+
+jQuery(async () => {
     const context = getContext();
     registerLocaleData();
     import('./lens/index.js')
@@ -10732,6 +10736,7 @@ jQuery(() => {
         normalizeAdvancedSettings,
         getSettings,
     });
+    await initializeCharacterPromptDefaults(context);
     registerMemoryGraphCardBindingSlot(getContext());
     generationVisibleHistoryRegexProvider = getContext().regex.registerManagedRegexProvider(GENERATION_VISIBLE_HISTORY_REGEX_PROVIDER_ID);
     syncGenerationVisibleHistoryRuntimeRegexScripts();
@@ -10756,6 +10761,7 @@ jQuery(() => {
     // early on every chat switch; (b) run an explicit migration for the
     // initial chat before mounting the singleton.
     context.eventSource.on(context.eventTypes.CHAT_CHANGED, async () => {
+        await initializeCharacterPromptDefaults(getContext());
         latestRecallSnapshot = null;
         void ensureMemoryStoreLoaded(getContext()).catch(() => {});
         const runtimeContext = getContext();

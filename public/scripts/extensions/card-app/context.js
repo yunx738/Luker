@@ -121,6 +121,11 @@ export function buildContext(container, charId, config) {
          */
         get lukerContext() { return getContext(); },
 
+        /** Capture fixed prompt inputs for an independent generation task. */
+        captureTaskPromptContext(options) {
+            return getContext().captureTaskPromptContext(options);
+        },
+
         /**
          * Skills API namespace. Mirrors `getContext().skills` so CardApp
          * authors can list/read/install/write/transport skills without
@@ -830,11 +835,12 @@ export function buildContext(container, charId, config) {
          *
          * Returns `[]` when no character is active, or when the character has
          * no auxiliary books configured.
+         * @param {{storedOnly?: boolean}} [options] - Read the saved binding instead of the active creation draft.
          * @returns {string[]}
          */
-        getCharacterAuxWorldBooks() {
+        getCharacterAuxWorldBooks(options = {}) {
             const fileName = getCharaFilename(__ctx.characterId);
-            return getCharaAuxWorlds(fileName);
+            return getCharaAuxWorlds(fileName, options);
         },
 
         /**

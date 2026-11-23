@@ -101,10 +101,16 @@ export function mountMemoryLens({ source, container, hostApp = null, opts = null
         focusEntity(id) {
             store.set({ filters: { ...store.get().filters, focusEntityId: id }, view: 'timeline', drawer: '' });
         },
-        locate(id) {
-            const view = views[store.get().view];
-            if (store.get().compact) store.set({ drawer: '' });
-            view.locate?.(id);
+        locate(id, { inGraph = false } = {}) {
+            const targetId = String(id || '');
+            if (!targetId) return;
+            if (store.get().compact && store.get().drawer) store.set({ drawer: '' });
+            const state = store.get();
+            if (!inGraph && state.view !== 'graph' && views[state.view]?.locate?.(targetId)) {
+                return;
+            }
+            if (state.view !== 'graph') store.set({ view: 'graph' });
+            views.graph.locate?.(targetId);
         },
         fitGraph: () => views.graph.fit?.(),
         toggleTheme() {
@@ -251,7 +257,7 @@ export function mountMemoryLens({ source, container, hostApp = null, opts = null
             { value: 'settings', label: i18n('Settings'), icon: 'gear', dirty: Number(views.settings.dirtyCount?.() || 0) > 0 },
         ], state.view, (value) => store.set({ view: value }), { ariaLabel: i18n('Display'), iconOnlyMobile: true }));
         put(clear(topbarRight),
-            h('button', { type: 'button', class: 'ml-searchbtn', onClick: () => palette.open(), 'aria-label': i18n('Search') },
+            h('button', { type: 'button', class: 'ml-searchbtn', onClick: () => palette.open(), 'aria-label': i18n('Search'), title: i18n('Search nodes, characters, events…') },
                 icon('search', { size: 15 }), h('span', { class: 'ml-searchbtn-text', text: i18n('Search nodes, characters, events…') }), kbd('Mod', 'K')),
             syncDot,
             iconButton('refresh', i18n('Refresh'), () => load({ manual: true }), { className: state.syncing ? 'is-spinning' : '' }),
@@ -419,7 +425,14 @@ export function mountMemoryLens({ source, container, hostApp = null, opts = null
         if (w > 0) return w <= 860;
         return Boolean(compactMql?.matches || hostApp?.isCompact?.());
     };
+    const syncWidthTier = () => {
+        const w = root.clientWidth;
+        if (w <= 0) return;
+        const tier = w <= 1060 ? 'narrow' : (w <= 1300 ? 'mid' : 'wide');
+        if (root.dataset.widthTier !== tier) root.dataset.widthTier = tier;
+    };
     const syncCompact = () => {
+        syncWidthTier();
         const next = computeCompact();
         if (next !== store.get().compact) store.set({ compact: next, drawer: '' });
     };
@@ -429,7 +442,10 @@ export function mountMemoryLens({ source, container, hostApp = null, opts = null
         views.graph.onResize?.();
     }, 120);
     globalThis.addEventListener('resize', onResize);
-    const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(() => onResize()) : null;
+    const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(() => {
+        syncWidthTier();
+        onResize();
+    }) : null;
     resizeObserver?.observe(root);
 
     function isTypingTarget(target) {
@@ -481,6 +497,7 @@ export function mountMemoryLens({ source, container, hostApp = null, opts = null
 
     // ----- Mount ----------------------------------------------------------
     container.appendChild(root);
+    syncWidthTier();
     const hostThemeTarget = hostApp ? root.closest('[data-theme]') : null;
     const hostThemeObserver = hostThemeTarget && typeof MutationObserver === 'function'
         ? new MutationObserver(() => {

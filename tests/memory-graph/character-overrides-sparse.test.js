@@ -105,6 +105,15 @@ describe('getEffectiveAdvancedSettings', () => {
         expect(effective.recallMaxIterations).toBe(4);
         expect(effective.extractContextTurns).toBe(2);
     });
+
+    test('upgrades legacy includeWorldInfoWithPreset in a character override into both split flags', () => {
+        const ctx = makeContext({ includeWorldInfoWithPreset: false });
+        const effective = getEffectiveAdvancedSettings(ctx, { extractIncludeWorldInfo: true, recallIncludeWorldInfo: true });
+
+        expect(effective.extractIncludeWorldInfo).toBe(false);
+        expect(effective.recallIncludeWorldInfo).toBe(false);
+        expect('includeWorldInfoWithPreset' in effective).toBe(false);
+    });
 });
 
 describe('getAdvancedScopeInfo', () => {
@@ -144,12 +153,12 @@ describe('persistCharacterAdvancedOverridePatch', () => {
             'memory_graph',
             expect.objectContaining({
                 schemaOverride: [{ id: 'event' }],
-                advancedOverride: { recallMaxIterations: 6 },
+                advancedOverride: { recallMaxIterations: 6, promptDefaultsInitialized: true },
             }),
         );
         const written = ctx.writeExtensionField.mock.calls[0][2];
-        expect(written.advancedOverride).toEqual({ recallMaxIterations: 6 });
-        expect(Object.keys(written.advancedOverride)).toHaveLength(1);
+        expect(written.advancedOverride).toEqual({ recallMaxIterations: 6, promptDefaultsInitialized: true });
+        expect(Object.keys(written.advancedOverride)).toHaveLength(2);
     });
 
     test('keeps untouched sparse keys and removes unset keys', async () => {
@@ -160,7 +169,7 @@ describe('persistCharacterAdvancedOverridePatch', () => {
         });
 
         const written = ctx.writeExtensionField.mock.calls[0][2];
-        expect(written.advancedOverride).toEqual({ recallMaxIterations: 6 });
+        expect(written.advancedOverride).toEqual({ recallMaxIterations: 6, promptDefaultsInitialized: true });
     });
 
     test('creates a sparse override when the card has none', async () => {
@@ -171,7 +180,7 @@ describe('persistCharacterAdvancedOverridePatch', () => {
         });
 
         const written = ctx.writeExtensionField.mock.calls[0][2];
-        expect(written.advancedOverride).toEqual({ updateEvery: 4 });
+        expect(written.advancedOverride).toEqual({ updateEvery: 4, promptDefaultsInitialized: true });
         expect(written.schemaOverride).toEqual([{ id: 'event' }]);
     });
 
@@ -203,6 +212,22 @@ describe('persistCharacterAdvancedOverridePatch', () => {
             .resolves.toBe(false);
     });
 
+    test('migrates and removes legacy includeWorldInfoWithPreset when patching a character override', async () => {
+        const ctx = makeContext({ includeWorldInfoWithPreset: false });
+        await persistCharacterAdvancedOverridePatch(ctx, 'a.png', {
+            set: { recallIncludeWorldInfo: true },
+            unset: [],
+        });
+
+        const written = ctx.writeExtensionField.mock.calls[0][2];
+        expect(written.advancedOverride).toEqual({
+            extractIncludeWorldInfo: false,
+            recallIncludeWorldInfo: true,
+            promptDefaultsInitialized: true,
+        });
+        expect('includeWorldInfoWithPreset' in written.advancedOverride).toBe(false);
+    });
+
     test('propagates write failures instead of swallowing them', async () => {
         const ctx = makeContext({ recallMaxIterations: 5 });
         ctx.writeExtensionField.mockRejectedValueOnce(new Error('write failed'));
@@ -220,13 +245,13 @@ describe('persistCharacterAdvancedOverride', () => {
 
         const written = ctx.writeExtensionField.mock.calls[0][2];
         expect(Object.keys(written.advancedOverride)).toHaveLength(
-            Object.keys(CONFIG_FIELDS).length,
+            Object.keys(CONFIG_FIELDS).length + 1,
         );
         expect(written.advancedOverride.recallMaxIterations).toBe(6);
         expect(written.schemaOverride).toEqual([{ id: 'event' }]);
     });
 
-    test('normalizeAdvancedSettings clears unseeded prompt fields when equal to code defaults', () => {
+    test('normalizeAdvancedSettings keeps stored prompt defaults', () => {
         const defaults = {
             extractTemplate: CONFIG_FIELDS['settings.extractTemplate'].defaultValue,
             extractEdgeRules: CONFIG_FIELDS['settings.extractEdgeRules'].defaultValue,
@@ -234,9 +259,8 @@ describe('persistCharacterAdvancedOverride', () => {
             configIterSystemPrompt: CONFIG_FIELDS['settings.configIterSystemPrompt'].defaultValue,
         };
         const normalized = normalizeAdvancedSettings(defaults, {});
-        expect(normalized.extractTemplate).toBe('');
-        expect(normalized.extractEdgeRules).toBe('');
-        expect(normalized.graphIterSystemPrompt).toBe('');
-        expect(normalized.configIterSystemPrompt).toBe('');
+        for (const [key, value] of Object.entries(defaults)) {
+            expect(normalized[key]).toBe(value);
+        }
     });
 });

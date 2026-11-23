@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { transientSessionHeaders } from '../../lib/transient-session.js';
+
 function normalizeSpace(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
 }
@@ -11,11 +13,12 @@ export function formatCharacterSourceCandidates(source, candidates = []) {
     return candidates.map((item, idx) => {
         const parts = [`${idx + 1}: [${source}] ${normalizeSpace(item.name || 'Unknown')}`];
         if (item.work) parts.push(`work=${normalizeSpace(item.work)}`);
+        if (item.characterTag) parts.push(`character_tag=${normalizeSpace(item.characterTag)}`);
         if (Array.isArray(item.aliases) && item.aliases.length > 0) {
             parts.push(`aliases=${item.aliases.join(',')}`);
         }
-        if (Array.isArray(item.canonicalTags) && item.canonicalTags.length > 0) {
-            parts.push(`tags=${item.canonicalTags.join(',')}`);
+        if (Array.isArray(item.tags) && item.tags.length > 0) {
+            parts.push(`tags=${item.tags.join(',')}`);
         }
         if (Array.isArray(item.imageUrls) && item.imageUrls.length > 0) {
             parts.push(`images=${item.imageUrls.join(',')}`);
@@ -75,7 +78,7 @@ export async function searchCharacterSources({
             name: String(item?.title || cleanQuery),
             aliases: [],
             work: String(work || ''),
-            canonicalTags: [],
+            tags: [],
             imageUrls: item?.imageUrl ? [item.imageUrl] : [],
             pageUrl: String(item?.pageUrl || ''),
             summary: item?.width && item?.height ? `${item.width}x${item.height}` : '',
@@ -154,15 +157,21 @@ export async function visitCharacterPage({ context, url, abortSignal = null }) {
     };
 }
 
-export async function fetchReferenceImage({ context, imageUrl, refererUrl = '', profileId = 'char', abortSignal = null }) {
+export async function fetchReferenceImage({
+    context, imageUrl, refererUrl = '', profileId = 'char', abortSignal = null, staging = false, transientSessionId,
+}) {
     const res = await fetch('/api/sd/character-sources/fetch-image', {
         method: 'POST',
-        headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+        headers: {
+            ...(context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' }),
+            ...transientSessionHeaders(transientSessionId),
+        },
         signal: abortSignal || undefined,
         body: JSON.stringify({
             imageUrl,
             refererUrl: refererUrl || undefined,
             profileId,
+            staging,
         }),
     });
     const data = await res.json().catch(() => ({}));
@@ -174,14 +183,20 @@ export async function fetchReferenceImage({ context, imageUrl, refererUrl = '', 
     return data;
 }
 
-export async function promoteLocalReferenceImage({ context, sourcePath, profileId = 'char', abortSignal = null }) {
+export async function promoteLocalReferenceImage({
+    context, sourcePath, profileId = 'char', abortSignal = null, staging = false, transientSessionId,
+}) {
     const res = await fetch('/api/sd/character-sources/promote-local-image', {
         method: 'POST',
-        headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+        headers: {
+            ...(context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' }),
+            ...transientSessionHeaders(transientSessionId),
+        },
         signal: abortSignal || undefined,
         body: JSON.stringify({
             sourcePath,
             profileId,
+            staging,
         }),
     });
     const data = await res.json().catch(() => ({}));

@@ -5,15 +5,15 @@
  * Structural tests for the advanced-settings normalizer.
  *
  * `normalizeAdvancedSettings` mirrors the clamp semantics the Advanced panel
- * and the Layer-2 API rely on. `ADVANCED_SETTING_DEFAULTS` only carries the
- * keys that are seeded into `defaultSettings`; the five unseeded keys stay
- * out so code constants can keep driving their defaults.
+ * and the Layer-2 API rely on. Built-in prompt defaults are stored in full;
+ * subsequent normalization preserves exact edited values.
  */
 
 import { describe, test, expect } from '@jest/globals';
 
 import {
     ADVANCED_SETTING_DEFAULTS,
+    migrateLegacyWorldInfoToggle,
     normalizeAdvancedSettings,
     applyAdvancedSettings,
     normalizeExtractExcludeRecentTurns,
@@ -21,28 +21,20 @@ import {
 } from '../../public/scripts/extensions/memory-graph/config-iteration/advanced-settings.js';
 import {
     DEFAULT_CRAWL_SYSTEM_PROMPT,
+    DEFAULT_EXTRACT_TEMPLATE,
     DEFAULT_RECALL_FINALIZE_SYSTEM_PROMPT,
     DEFAULT_RECALL_ROUTE_SYSTEM_PROMPT,
 } from '../../public/scripts/extensions/memory-graph/default-prompts.js';
 import { DEFAULT_CONFIG_ITER_SYSTEM_PROMPT } from '../../public/scripts/extensions/memory-graph/config-iteration/system-prompt.js';
-
-const UNSEDDED_KEYS = [
-    'extractTemplate',
-    'extractEdgeRules',
-    'extractConcurrent',
-    'graphIterSystemPrompt',
-    'configIterSystemPrompt',
-];
+import { CONFIG_FIELDS } from '../../public/scripts/extensions/memory-graph/config-iteration/fields.js';
 
 describe('ADVANCED_SETTING_DEFAULTS', () => {
-    test('contains exactly the 19 seeded keys', () => {
-        expect(Object.keys(ADVANCED_SETTING_DEFAULTS)).toHaveLength(19);
+    test('seeds the registered defaults except the inherited concurrency field', () => {
+        expect(Object.keys(ADVANCED_SETTING_DEFAULTS)).toHaveLength(Object.keys(CONFIG_FIELDS).length - 1);
     });
 
     test('leaves the unseeded keys out', () => {
-        for (const key of UNSEDDED_KEYS) {
-            expect(ADVANCED_SETTING_DEFAULTS).not.toHaveProperty(key);
-        }
+        expect(ADVANCED_SETTING_DEFAULTS).not.toHaveProperty('extractConcurrent');
     });
 
     test('seeds the prompt keys with the moved constants', () => {
@@ -53,17 +45,20 @@ describe('ADVANCED_SETTING_DEFAULTS', () => {
 });
 
 describe('normalizeAdvancedSettings', () => {
-    test('returns the 24 registered keys with defaults when both sources are empty', () => {
+    test('returns the 25 registered keys with defaults when both sources are empty', () => {
         const normalized = normalizeAdvancedSettings({}, {});
-        expect(Object.keys(normalized)).toHaveLength(24);
+        expect(Object.keys(normalized)).toHaveLength(25);
         expect(normalized).toMatchObject({
             extractMode: 'oneshot',
             extractContextTurns: 2,
             extractConcurrent: false,
-            extractTemplate: '',
-            configIterSystemPrompt: '',
+            extractIncludeWorldInfo: true,
+            recallIncludeWorldInfo: true,
+            extractTemplate: DEFAULT_EXTRACT_TEMPLATE,
+            configIterSystemPrompt: DEFAULT_CONFIG_ITER_SYSTEM_PROMPT,
             recallRouteSystemPrompt: DEFAULT_RECALL_ROUTE_SYSTEM_PROMPT,
         });
+        expect(normalized).not.toHaveProperty('includeWorldInfoWithPreset');
     });
 
     test('clamps integers to the field bounds', () => {
@@ -82,8 +77,10 @@ describe('normalizeAdvancedSettings', () => {
 
     test('accepts only booleans and otherwise falls back to base then default', () => {
         expect(normalizeAdvancedSettings({ extractConcurrent: 'yes' }, { extractConcurrent: true }).extractConcurrent).toBe(true);
-        expect(normalizeAdvancedSettings({ includeWorldInfoWithPreset: 'no' }, {}).includeWorldInfoWithPreset).toBe(true);
-        expect(normalizeAdvancedSettings({ includeWorldInfoWithPreset: false }, {}).includeWorldInfoWithPreset).toBe(false);
+        expect(normalizeAdvancedSettings({ extractIncludeWorldInfo: 'no' }, {}).extractIncludeWorldInfo).toBe(true);
+        expect(normalizeAdvancedSettings({ extractIncludeWorldInfo: false }, {}).extractIncludeWorldInfo).toBe(false);
+        expect(normalizeAdvancedSettings({ recallIncludeWorldInfo: 'no' }, {}).recallIncludeWorldInfo).toBe(true);
+        expect(normalizeAdvancedSettings({ recallIncludeWorldInfo: false }, {}).recallIncludeWorldInfo).toBe(false);
     });
 
     test('trims and lowercases enum input, falling back for unknown values', () => {
@@ -92,25 +89,25 @@ describe('normalizeAdvancedSettings', () => {
         expect(normalizeAdvancedSettings({ extractMode: 'bogus' }, {}).extractMode).toBe('oneshot');
     });
 
-    test('keeps empty slots empty for user-edited templates', () => {
+    test('preserves whitespace and empty edits in stored templates', () => {
         const normalized = normalizeAdvancedSettings({ extractTemplate: '   ', extractEdgeRules: '' }, {});
-        expect(normalized.extractTemplate).toBe('');
+        expect(normalized.extractTemplate).toBe('   ');
         expect(normalized.extractEdgeRules).toBe('');
     });
 
-    test('trims user-entered template text', () => {
+    test('preserves user-entered template text verbatim', () => {
         const normalized = normalizeAdvancedSettings({ extractTemplate: '  custom {{nodes}} {{edges}}  ' }, {});
-        expect(normalized.extractTemplate).toBe('custom {{nodes}} {{edges}}');
+        expect(normalized.extractTemplate).toBe('  custom {{nodes}} {{edges}}  ');
     });
 
-    test('fills the crawl and recall prompts from base or default', () => {
-        expect(normalizeAdvancedSettings({ extractCrawlSystemPrompt: '' }, {}).extractCrawlSystemPrompt).toBe(DEFAULT_CRAWL_SYSTEM_PROMPT);
+    test('preserves cleared prompts and inherits absent prompts from base or default', () => {
+        expect(normalizeAdvancedSettings({ extractCrawlSystemPrompt: '' }, {}).extractCrawlSystemPrompt).toBe('');
         expect(normalizeAdvancedSettings({}, { recallRouteSystemPrompt: 'base route' }).recallRouteSystemPrompt).toBe('base route');
         expect(normalizeAdvancedSettings({}, {}).recallFinalizeSystemPrompt).toBe(DEFAULT_RECALL_FINALIZE_SYSTEM_PROMPT);
     });
 
-    test('clears configIterSystemPrompt when it equals the code default', () => {
-        expect(normalizeAdvancedSettings({ configIterSystemPrompt: DEFAULT_CONFIG_ITER_SYSTEM_PROMPT }, {}).configIterSystemPrompt).toBe('');
+    test('keeps default and custom configuration prompts in storage', () => {
+        expect(normalizeAdvancedSettings({ configIterSystemPrompt: DEFAULT_CONFIG_ITER_SYSTEM_PROMPT }, {}).configIterSystemPrompt).toBe(DEFAULT_CONFIG_ITER_SYSTEM_PROMPT);
         expect(normalizeAdvancedSettings({ configIterSystemPrompt: 'custom config prompt' }, {}).configIterSystemPrompt).toBe('custom config prompt');
     });
 
@@ -121,14 +118,15 @@ describe('normalizeAdvancedSettings', () => {
 });
 
 describe('applyAdvancedSettings', () => {
-    test('writes all 24 keys so the old whole-object semantics hold', () => {
+    test('writes all 25 keys so the old whole-object semantics hold', () => {
         const target = {};
-        applyAdvancedSettings(target, { extractMode: 'crawl', includeWorldInfoWithPreset: false });
+        applyAdvancedSettings(target, { extractMode: 'crawl', extractIncludeWorldInfo: false, recallIncludeWorldInfo: false });
         expect(target.extractMode).toBe('crawl');
-        expect(target.includeWorldInfoWithPreset).toBe(false);
-        expect(target.configIterSystemPrompt).toBe('');
-        expect(target.extractTemplate).toBe('');
-        expect(Object.keys(target)).toHaveLength(24);
+        expect(target.extractIncludeWorldInfo).toBe(false);
+        expect(target.recallIncludeWorldInfo).toBe(false);
+        expect(target.configIterSystemPrompt).toBe(DEFAULT_CONFIG_ITER_SYSTEM_PROMPT);
+        expect(target.extractTemplate).toBe(DEFAULT_EXTRACT_TEMPLATE);
+        expect(Object.keys(target)).toHaveLength(25);
     });
 
     test('reads the existing target as the fallback source', () => {
@@ -139,6 +137,27 @@ describe('applyAdvancedSettings', () => {
 
     test('ignores a non-object target', () => {
         expect(() => applyAdvancedSettings(null, { extractMode: 'crawl' })).not.toThrow();
+    });
+});
+
+describe('migrateLegacyWorldInfoToggle', () => {
+    test('migrates false legacy toggle into both new flags and deletes legacy key', () => {
+        const s = { includeWorldInfoWithPreset: false };
+        expect(migrateLegacyWorldInfoToggle(s)).toBe(true);
+        expect(s).toEqual({ extractIncludeWorldInfo: false, recallIncludeWorldInfo: false });
+        expect('includeWorldInfoWithPreset' in s).toBe(false);
+    });
+
+    test('preserves already-set split flags while removing legacy key', () => {
+        const s = { includeWorldInfoWithPreset: false, extractIncludeWorldInfo: true };
+        expect(migrateLegacyWorldInfoToggle(s)).toBe(true);
+        expect(s).toEqual({ extractIncludeWorldInfo: true, recallIncludeWorldInfo: false });
+    });
+
+    test('returns false when legacy key is absent', () => {
+        const s = { extractIncludeWorldInfo: true };
+        expect(migrateLegacyWorldInfoToggle(s)).toBe(false);
+        expect(s).toEqual({ extractIncludeWorldInfo: true });
     });
 });
 
