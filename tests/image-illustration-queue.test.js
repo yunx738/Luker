@@ -44,3 +44,34 @@ test('schedules the bridge with prompt, character and signal', async () => {
         characterName: 'Seraphina', signal: controller.signal,
     });
 });
+
+test('aborting a queued task rejects immediately without waiting for active work', async () => {
+    const queue = new GenerationQueue({ maxConcurrent: 1, minInterval: 0 });
+    let releaseFirst;
+    const first = queue.schedule(() => new Promise(resolve => { releaseFirst = resolve; }));
+    const controller = new AbortController();
+    const secondWork = jest.fn(async () => 'second');
+    const second = queue.schedule(secondWork, { signal: controller.signal });
+    expect(queue.activeCount).toBe(1);
+    expect(queue.pendingCount).toBe(1);
+
+    controller.abort('cancelled');
+    await expect(second).rejects.toMatchObject({ name: 'AbortError' });
+    expect(queue.pendingCount).toBe(0);
+    expect(secondWork).not.toHaveBeenCalled();
+
+    releaseFirst('first');
+    await expect(first).resolves.toBe('first');
+});
+
+test('getCapabilitiesSnapshot delegates to bridge snapshot without calling async getCapabilities', () => {
+    const snapshot = { supportsSourceImage: true, supportsCharacterReference: false };
+    const bridge = {
+        getCapabilities: jest.fn(async () => { throw new Error('must not call async'); }),
+        getCapabilitiesSnapshot: jest.fn(() => snapshot),
+        generateImage: jest.fn(),
+    };
+    const service = createImageService({ bridge, queue: new GenerationQueue() });
+    expect(service.getCapabilitiesSnapshot()).toBe(snapshot);
+    expect(bridge.getCapabilities).not.toHaveBeenCalled();
+});

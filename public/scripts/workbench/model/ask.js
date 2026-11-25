@@ -5,6 +5,11 @@
 // 纯模块（无 DOM 依赖）：读取函数由外部注入，便于在单测中直接使用夹具验证。
 
 import { i18n } from '../i18n.js';
+import {
+    extractTextContent,
+    hydrateMessagesForLlm,
+    normalizeImageAttachments,
+} from '../../lib/multimodal-messages.js';
 
 export const MAX_ROUNDS = 10; // cap-ok: 只读问答工具循环轮数上限，最后一轮引导调用 wb_answer 收尾
 const MAX_TOOL_CHARS = 16000; // cap-ok: 单次工具返回字符上限，防止单条大读取挤爆模型上下文窗口
@@ -176,7 +181,8 @@ export function buildAskHistory(turns, maxTurns = 10) {
         if (!t) continue;
         if (t.role === 'user') {
             const text = String(t.text || '').trim();
-            if (!text) continue;
+            const attachments = normalizeImageAttachments(t.attachments);
+            if (!text && !attachments.length) continue;
             const next = list[i + 1];
             // 配对的 AI 回合失败或为空时，连同该条未回答问题一起跳过。
             if (next && next.role !== 'user' && (next.error || !String(next.answer || '').trim())) {
@@ -184,7 +190,11 @@ export function buildAskHistory(turns, maxTurns = 10) {
                 continue;
             }
             if (!next) continue;
-            out.push({ role: 'user', content: text });
+            out.push({
+                role: 'user',
+                content: text,
+                ...(attachments.length ? { attachments } : {}),
+            });
         } else {
             const answer = String(t.answer || '').trim();
             if (t.error || !answer) continue;
@@ -208,16 +218,37 @@ function isNoToolCallsError(err) {
  *           sources?, extraTools?: any[], history?: object[], onStep?(step), signal? }} opts
  * @returns {Promise<{ answer: string, suggest: string, fixPrompt: string, requestIds: string[], reads: { name, args, chars }[], sent: number }>}
  */
-export async function runAsk({ question, overview, readers, request, sources = {}, extraTools = [], history = [], onStep = null, signal = null }) {
+export async function runAsk({
+    question,
+    attachments = [],
+    overview,
+    readers,
+    request,
+    sources = {},
+    extraTools = [],
+    history = [],
+    context = null,
+    loadDataUrl = null,
+    onStep = null,
+    signal = null,
+}) {
     const tools = askTools(sources, extraTools);
     const allowedReadNames = new Set(tools.map(t => t.function.name).filter(name => name !== 'wb_answer'));
+    const currentAttachments = normalizeImageAttachments(attachments);
+    const promptQuestion = String(question || '').trim() || (currentAttachments.length ? i18n('[Image]') : '');
     const messages = [
         { role: 'system', content: askSystemPrompt() },
         ...history,
-        { role: 'user', content: askUserMessage(question, overview) },
+        {
+            role: 'user',
+            content: askUserMessage(promptQuestion, overview),
+            ...(currentAttachments.length ? { attachments: currentAttachments } : {}),
+        },
     ];
+    const hasAttachments = messages.some(m => Array.isArray(m?.attachments) && m.attachments.length > 0);
+    const imageCache = new Map();
     const reads = [];
-    let sent = messages.reduce((n, m) => n + String(m.content || '').length, 0);
+    let sent = messages.reduce((n, m) => n + extractTextContent(m.content).length, 0);
     let lastAssistantText = '';
     for (let round = 0; round < MAX_ROUNDS; round++) {
         if (signal?.aborted) throw new Error(i18n('Stopped'));
@@ -225,7 +256,15 @@ export async function runAsk({ question, overview, readers, request, sources = {
         const offered = lastRound ? tools.filter(t => t.function.name === 'wb_answer') : tools;
         let resp;
         try {
-            resp = await request(messages, offered);
+            const outbound = hasAttachments
+                ? await hydrateMessagesForLlm(messages, {
+                    context,
+                    loadDataUrl,
+                    cache: imageCache,
+                    signal,
+                })
+                : messages;
+            resp = await request(outbound, offered);
         } catch (err) {
             if (lastRound && !signal?.aborted && isNoToolCallsError(err)) {
                 return {
@@ -239,6 +278,7 @@ export async function runAsk({ question, overview, readers, request, sources = {
             }
             throw err;
         }
+        if (signal?.aborted) throw new Error(i18n('Stopped'));
         const text = String(resp?.text || '');
         if (text.trim()) lastAssistantText = text.trim();
         const calls = Array.isArray(resp?.calls) ? resp.calls : [];
@@ -278,6 +318,13 @@ export async function runAsk({ question, overview, readers, request, sources = {
         const assistantMsg = {
             role: 'assistant',
             content: text || '',
+            ...(typeof resp?.reasoning === 'string' && resp.reasoning.length > 0 ? { reasoning: resp.reasoning } : {}),
+            ...(resp?.signature ? { signature: resp.signature } : {}),
+            ...(Array.isArray(resp?.reasoningBlocks) && resp.reasoningBlocks.length ? { reasoning_blocks: resp.reasoningBlocks } : {}),
+            ...(Array.isArray(resp?.reasoningDetails) && resp.reasoningDetails.length ? { reasoning_details: resp.reasoningDetails } : {}),
+            ...(Array.isArray(resp?.nativeParts) && resp.nativeParts.length ? { native_parts: resp.nativeParts } : {}),
+            ...(Array.isArray(resp?.nativeContentBlocks) && resp.nativeContentBlocks.length ? { native_content_blocks: resp.nativeContentBlocks } : {}),
+            ...(Array.isArray(resp?.responsesOutputItems) && resp.responsesOutputItems.length ? { responses_output_items: resp.responsesOutputItems } : {}),
             tool_calls: executedCalls.map(c => ({
                 id: c.id,
                 type: 'function',
@@ -286,17 +333,9 @@ export async function runAsk({ question, overview, readers, request, sources = {
                 ...(c.extra_content ? { extra_content: c.extra_content } : {}),
             })),
         };
-        if (typeof resp?.reasoning === 'string' && resp.reasoning.length > 0) {
-            assistantMsg.reasoning = resp.reasoning;
-        }
-        if (Array.isArray(resp?.reasoningBlocks) && resp.reasoningBlocks.length) {
-            assistantMsg.reasoning_blocks = resp.reasoningBlocks;
-        }
-        if (Array.isArray(resp?.reasoningDetails) && resp.reasoningDetails.length) {
-            assistantMsg.reasoning_details = resp.reasoningDetails;
-        }
         messages.push(assistantMsg);
         for (const call of executedCalls) {
+            if (signal?.aborted) throw new Error(i18n('Stopped'));
             if (call.name === 'wb_answer') {
                 const deferredContent = JSON.stringify({
                     deferred: true,
@@ -314,6 +353,7 @@ export async function runAsk({ question, overview, readers, request, sources = {
             }
             let result;
             try { result = await readers[call.name](call.args || {}); } catch (err) { result = { error: String(err?.message || err) }; }
+            if (signal?.aborted) throw new Error(i18n('Stopped'));
             const content = clip(result);
             sent += content.length;
             reads.push({ name: call.name, args: call.args || {}, chars: content.length });

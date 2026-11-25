@@ -1,5 +1,5 @@
-import { test, expect } from '@playwright/test';
-import { startServer, tearDownServer } from '../_lib/server.js';
+import { test, expect } from '../../harness/playwright.js';
+import { startServer } from '../../harness/server.js';
 import { startMockLLM } from '../_lib/mockLLM.js';
 import { bootstrapCustomBackend, appendConnectionProfile, markOnboarded } from '../_lib/fixtures.js';
 import {
@@ -13,7 +13,8 @@ const IMAGE_PROMPT = '1girl, brass spyglass, dusk';
 
 let server, mock, sdMock;
 
-test.beforeAll(async () => {
+test.beforeAll(async ({ workerResources }, testInfo) => {
+    const scope = await workerResources.scenario(testInfo.file);
     sdMock = await startSdWebUiMock();
     mock = await startMockLLM();
     mock.scriptCompletion(({ toolNames, userMessages }) => {
@@ -46,14 +47,13 @@ test.beforeAll(async () => {
         }
         return { text: MAIN_REPLY };
     });
-    server = await startServer({ batchKey: 'image-illustration', scenarioId: '04-actions' });
+    server = await startServer({ scope, batchKey: 'image-illustration', scenarioId: '04-actions' });
     markOnboarded({ dataRoot: server.dataRoot });
     bootstrapCustomBackend({ dataRoot: server.dataRoot, baseURL: mock.baseURL });
     appendConnectionProfile({ dataRoot: server.dataRoot, baseURL: mock.baseURL, api: 'custom' });
 });
 
 test.afterAll(async () => {
-    await tearDownServer(server);
     await mock?.stop();
     await sdMock?.stop();
 });
@@ -351,5 +351,102 @@ test.describe('illustration actions', () => {
         expect(replaced.mes).not.toContain(`data-illustration-id="${firstRecord.id}"`);
         expect(replaced.swipes[replaced.swipeId]).toBe(replaced.mes);
         expect(replaced.swipeInfo[replaced.swipeId].extra.illustrations).toHaveLength(1);
+    });
+
+    test('concurrent regenerations in one message show activity pill progress, never interrupt each other, and open popup without fetching ComfyUI workflow', async ({ page }) => {
+        await awaitMainUI(page, server.baseURL);
+        await selectCharacterByName(page, 'Seraphina');
+        await page.evaluate(() => document.querySelector('#api_button_openai').click());
+        await page.locator('#send_but:not(.displayNone)').waitFor({ state: 'visible', timeout: 30_000 });
+        await configureSd(page);
+
+        await openExtensionsDrawer(page);
+        await openInlineDrawer(page, 'sd_illustration_container');
+        await page.locator('#sd_illustration_enabled').check();
+        await page.locator('#sd_illustration_auto_generate').check();
+        await page.locator('#sd_illustration_max_concurrent').fill('2');
+        await page.locator('#sd_illustration_max_concurrent').dispatchEvent('input');
+        await expect.poll(
+            () => page.evaluate(() => window.Luker.getContext().extensionSettings.sd.illustration.maxConcurrentGenerations),
+            { timeout: 5000 },
+        ).toBe(2);
+        await closeAnyOpenTopSettingsDrawer(page);
+
+        await sendMessageAndAwaitReply(page, 'Two prompts');
+        await page.waitForFunction(() => {
+            const message = window.Luker.getContext().chat.at(-1);
+            return (message?.extra?.illustrations || []).length === 2;
+        }, null, { timeout: 60_000 });
+
+        const initial = await latestMessageState(page);
+        const [recA, recB] = initial.records;
+
+        // Let post-illustration debounced listeners (e.g. Workbench 400ms snapshot reload) settle while still on auto.
+        await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 600)));
+
+        // Verify clicking an illustration opens the popup from local settings without calling /api/sd/comfy/workflow.
+        const workflowRequests = [];
+        const workflowRouteHandler = async route => {
+            workflowRequests.push(route.request().url());
+            await route.continue();
+        };
+        await page.route('**/api/sd/comfy/workflow', workflowRouteHandler);
+        await page.evaluate(() => {
+            const sd = window.Luker.getContext().extensionSettings.sd;
+            sd.source = 'comfy';
+            sd.comfy_type = 'standard';
+            sd.comfy_workflow = 'Default_Comfy_Workflow.json';
+            sd.img2img_enabled = true;
+        });
+        await page.locator(`.mes_text img[data-illustration-id="${recA.id}"]`).click();
+        await expect(page.locator('#sd_illustration_actions')).toBeVisible();
+        await expect(page.locator('#sd_illustration_action_edit_from_image')).toBeVisible();
+        expect(workflowRequests).toEqual([]);
+        await page.locator('dialog.popup[open] .popup-button-close').last().click();
+        await expect(page.locator('#sd_illustration_actions')).toHaveCount(0, { timeout: 10_000 });
+        await page.unroute('**/api/sd/comfy/workflow', workflowRouteHandler);
+
+        // Restore mock WebUI backend for regeneration
+        await configureSd(page);
+
+        sdMock.setTxt2imgDelayMs(1500);
+        try {
+            // Start regenerating the first image
+            await page.locator(`.mes_text img[data-illustration-id="${recA.id}"]`).click();
+            await expect(page.locator('#sd_illustration_actions')).toBeVisible();
+            await page.locator('#sd_illustration_action_regenerate').click();
+
+            const pill = page.locator('#luker-sd-run-panel-pill');
+            await expect(pill).toBeVisible({ timeout: 5000 });
+            await expect(pill.locator('.activity-pill-label')).toContainText('Generating image');
+
+            // Immediately start regenerating the second image in the same message
+            await page.locator(`.mes_text img[data-illustration-id="${recB.id}"]`).click();
+            await expect(page.locator('#sd_illustration_actions')).toBeVisible();
+            await page.locator('#sd_illustration_action_regenerate').click();
+
+            await expect(pill.locator('.activity-pill-label')).toContainText('· 2', { timeout: 5000 });
+
+            // Wait for both regenerations to finish
+            await page.waitForFunction(() => {
+                const message = window.Luker.getContext().chat.at(-1);
+                return (message?.extra?.illustrations || []).length === 4;
+            }, null, { timeout: 60_000 });
+        } finally {
+            sdMock.setTxt2imgDelayMs(0);
+        }
+
+        await expect(page.locator('#luker-sd-run-panel-pill')).toBeHidden({ timeout: 10_000 });
+
+        const finalState = await latestMessageState(page);
+        expect(finalState.records).toHaveLength(4);
+        const childA = finalState.records.find(r => r.parentId === recA.id);
+        const childB = finalState.records.find(r => r.parentId === recB.id);
+        expect(childA).toBeTruthy();
+        expect(childB).toBeTruthy();
+        expect(finalState.mes).toContain(`data-illustration-id="${childA.id}"`);
+        expect(finalState.mes).toContain(`data-illustration-id="${childB.id}"`);
+        expect(finalState.mes).not.toContain(`data-illustration-id="${recA.id}"`);
+        expect(finalState.mes).not.toContain(`data-illustration-id="${recB.id}"`);
     });
 });

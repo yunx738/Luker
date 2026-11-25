@@ -7,6 +7,10 @@ import {
     makeRuntimeToolCallId,
     requestToolCallsWithRetry,
 } from '../../../lib/iter-tool-calling.js';
+import {
+    hydrateMessagesForLlm,
+    loadManagedImageDataUrl,
+} from '../../../lib/multimodal-messages.js';
 import { makeIllustrationId } from '../illustration/presets.js';
 import {
     GENERATE_IMAGE_TOOL,
@@ -15,6 +19,7 @@ import {
 } from '../illustration/tools.js';
 import { i18n } from '../lens/i18n.js';
 import { defaultLoadVisualPreviewDataUrl, resolveExplorationLlm } from './agent.js';
+import { isStagedTempImagePath } from './dialog-draft.js';
 import { assertSourceImagePath } from './source-policy.js';
 import {
     EXPLORATION_TOOL_NAMES,
@@ -23,13 +28,36 @@ import {
 } from './tools.js';
 
 export const STAGE_CHARACTER_PROFILE_TOOL_NAME = 'stage_character_profile';
+export const INSPECT_IMAGE_TOOL_NAME = 'inspect_image';
 
 export const DIALOG_EXPLORATION_TOOL_INSTRUCTIONS = [
     'Use stage_character_profile to update the editable draft shown beside this conversation.',
     'Pass only the fields you want to add or change; omitted fields remain intact.',
     'Do not attempt to write directly to the formal archive; the user reviews and confirms the draft.',
     'You can search public sources, fetch reference images, or call generate_image to produce candidate portraits and reference sheets, then attach returned image paths with short labels in reference_images via stage_character_profile.',
+    'When the user attaches images in chat, inspect them directly and use their annotated managed paths in stage_character_profile or generate_image if requested. Call inspect_image to visually inspect existing draft, archive, or selected source reference images on demand.',
 ].join(' ');
+
+export const INSPECT_IMAGE_TOOL = Object.freeze({
+    type: 'function',
+    function: {
+        name: INSPECT_IMAGE_TOOL_NAME,
+        description: 'Visually inspect one or more managed local reference images (from the current draft, saved profiles, or the explicitly selected source card/persona) in lossless detail.',
+        parameters: {
+            type: 'object',
+            properties: {
+                image_paths: {
+                    type: 'array',
+                    minItems: 1,
+                    items: { type: 'string' },
+                    description: 'Managed local image paths (/user/images/... or selected source assets) or generated image_ids to inspect.',
+                },
+            },
+            required: ['image_paths'],
+            additionalProperties: false,
+        },
+    },
+});
 
 export const STAGE_CHARACTER_PROFILE_TOOL = Object.freeze({
     type: 'function',
@@ -87,6 +115,7 @@ export function buildCharacterBuilderToolDefs({
     return [
         ...baseTools,
         generateTool,
+        JSON.parse(JSON.stringify(INSPECT_IMAGE_TOOL)),
         JSON.parse(JSON.stringify(STAGE_CHARACTER_PROFILE_TOOL)),
     ];
 }
@@ -149,6 +178,7 @@ export async function runCharacterBuilderTurn({
     onTrace = null,
     onDraftChange = null,
     loadVisualPreviewDataUrl = defaultLoadVisualPreviewDataUrl,
+    loadOriginalImageDataUrl = null,
     abortSignal = null,
 } = {}) {
     throwIfAborted(abortSignal, 'Character builder turn aborted.');
@@ -175,6 +205,23 @@ export async function runCharacterBuilderTurn({
     const previewLoader = typeof media?.preview === 'function'
         ? imagePath => media.preview(imagePath)
         : imagePath => loadVisualPreviewDataUrl(imagePath, context);
+    const losslessImageCache = new Map();
+    const losslessLoader = (imagePath) => {
+        if (typeof loadOriginalImageDataUrl === 'function') {
+            return loadOriginalImageDataUrl(imagePath, context);
+        }
+        if (typeof media?.preview === 'function' && isStagedTempImagePath(imagePath)) {
+            return media.preview(imagePath);
+        }
+        if (typeof media?.preview === 'function') {
+            return media.preview(imagePath);
+        }
+        return loadManagedImageDataUrl(imagePath, {
+            context,
+            signal: abortSignal,
+            cache: losslessImageCache,
+        });
+    };
 
     const existingProfiles = await profileStore.listProfiles();
     const existingIndex = profileStore.buildCompactProfileIndex(existingProfiles);
@@ -190,9 +237,16 @@ export async function runCharacterBuilderTurn({
     ].join('\n\n');
 
     const incomingHistory = sanitizeHistoryMessages(messages);
+    const hydratedHistory = await hydrateMessagesForLlm(incomingHistory, {
+        context,
+        loadDataUrl: losslessLoader,
+        includePathAnnotations: true,
+        signal: abortSignal,
+        cache: losslessImageCache,
+    });
     const taskMessages = [
         { role: 'system', content: systemPrompt },
-        ...incomingHistory,
+        ...hydratedHistory,
     ];
     const nextHistory = [...incomingHistory];
 
@@ -270,14 +324,28 @@ export async function runCharacterBuilderTurn({
             roundIndex,
             assistantText,
             reasoning,
+            signature: response?.signature || null,
             reasoningBlocks: response?.reasoningBlocks || null,
             reasoningDetails: response?.reasoningDetails || null,
+            nativeParts: response?.nativeParts || null,
+            nativeContentBlocks: response?.nativeContentBlocks || null,
+            responsesOutputItems: response?.responsesOutputItems || null,
             toolCalls: calls,
         });
 
         if (calls.length === 0) {
             finalText = assistantText;
-            nextHistory.push({ role: 'assistant', content: finalText });
+            nextHistory.push({
+                role: 'assistant',
+                content: finalText,
+                ...(reasoning ? { reasoning } : {}),
+                ...(response?.signature ? { signature: response.signature } : {}),
+                ...(Array.isArray(response?.reasoningBlocks) && response.reasoningBlocks.length > 0 ? { reasoning_blocks: response.reasoningBlocks } : {}),
+                ...(Array.isArray(response?.reasoningDetails) && response.reasoningDetails.length > 0 ? { reasoning_details: response.reasoningDetails } : {}),
+                ...(Array.isArray(response?.nativeParts) && response.nativeParts.length > 0 ? { native_parts: response.nativeParts } : {}),
+                ...(Array.isArray(response?.nativeContentBlocks) && response.nativeContentBlocks.length > 0 ? { native_content_blocks: response.nativeContentBlocks } : {}),
+                ...(Array.isArray(response?.responsesOutputItems) && response.responsesOutputItems.length > 0 ? { responses_output_items: response.responsesOutputItems } : {}),
+            });
             trace.rounds.push(roundRecord);
             onTrace?.({ type: 'round_end', roundIndex, status: 'done' });
             break;
@@ -285,6 +353,7 @@ export async function runCharacterBuilderTurn({
 
         const executedCalls = [];
         const imagesForPreview = [];
+        const inspectedImages = [];
 
         for (const rawCall of calls) {
             throwIfAborted(abortSignal, 'Character builder turn aborted.');
@@ -297,6 +366,29 @@ export async function runCharacterBuilderTurn({
             try {
                 if (callName === EXPLORATION_TOOL_NAMES.SAVE_CHARACTER_PROFILE) {
                     throw new Error(`${callName}: not_allowed — use stage_character_profile to update the draft`);
+                } else if (callName === INSPECT_IMAGE_TOOL_NAME) {
+                    const rawPaths = callArgs.image_paths;
+                    if (!Array.isArray(rawPaths) || rawPaths.length === 0) {
+                        throw new Error('inspect_image: invalid_args — image_paths must be a non-empty array of local image paths');
+                    }
+                    const resolvedPaths = [];
+                    const seenInspect = new Set();
+                    for (const token of rawPaths) {
+                        const raw = typeof token === 'string' ? token.trim() : '';
+                        if (!raw) {
+                            throw new Error('inspect_image: invalid_args — every image_paths entry must be a non-empty string');
+                        }
+                        const resolved = resolveBuilderImageToken(raw, generatedById, sourcePolicy, INSPECT_IMAGE_TOOL_NAME);
+                        if (!seenInspect.has(resolved)) {
+                            seenInspect.add(resolved);
+                            resolvedPaths.push(resolved);
+                            inspectedImages.push(resolved);
+                        }
+                    }
+                    toolResult = {
+                        ok: true,
+                        image_paths: resolvedPaths,
+                    };
                 } else if (callName === GENERATE_IMAGE_TOOL.function.name) {
                     if (typeof media?.generate !== 'function') {
                         throw new Error('generate_image: unavailable — image generation media port is missing');
@@ -464,25 +556,46 @@ export async function runCharacterBuilderTurn({
                 name: callName,
                 args: callArgs,
                 result: toolResult,
+                raw: rawCall?.raw,
+                signature: rawCall?.signature,
+                extra_content: rawCall?.extra_content,
             });
         }
 
-        appendStandardToolRoundMessages(taskMessages, executedCalls, assistantText, {
+        const roundMeta = {
             reasoning,
+            signature: response?.signature,
             reasoningBlocks: response?.reasoningBlocks,
             reasoningDetails: response?.reasoningDetails,
-        });
-        appendStandardToolRoundMessages(nextHistory, executedCalls, assistantText, {
-            reasoning,
-            reasoningBlocks: response?.reasoningBlocks,
-            reasoningDetails: response?.reasoningDetails,
-        });
+            nativeParts: response?.nativeParts,
+            nativeContentBlocks: response?.nativeContentBlocks,
+            responsesOutputItems: response?.responsesOutputItems,
+        };
+        appendStandardToolRoundMessages(taskMessages, executedCalls, assistantText, roundMeta);
+        appendStandardToolRoundMessages(nextHistory, executedCalls, assistantText, roundMeta);
 
-        if (visualInspection && imagesForPreview.length > 0) {
-            const previewParts = [];
+        const previewQueue = [];
+        const seenPreviewPaths = new Set();
+        for (const imagePath of inspectedImages) {
+            if (seenPreviewPaths.has(imagePath)) continue;
+            seenPreviewPaths.add(imagePath);
+            previewQueue.push({ imagePath, mode: 'inspect' });
+        }
+        if (visualInspection) {
             for (const imagePath of imagesForPreview) {
+                if (seenPreviewPaths.has(imagePath)) continue;
+                seenPreviewPaths.add(imagePath);
+                previewQueue.push({ imagePath, mode: 'auto' });
+            }
+        }
+
+        if (previewQueue.length > 0) {
+            const previewParts = [];
+            for (const { imagePath, mode } of previewQueue) {
                 try {
-                    const dataUrl = await previewLoader(imagePath);
+                    const dataUrl = mode === 'inspect'
+                        ? await losslessLoader(imagePath)
+                        : await previewLoader(imagePath);
                     const previewEntry = { roundIndex, imagePath, dataUrl: dataUrl || '', error: '' };
                     trace.visualPreviews.push(previewEntry);
                     roundRecord.visualPreviews.push(previewEntry);
@@ -490,7 +603,9 @@ export async function runCharacterBuilderTurn({
                     if (dataUrl) {
                         previewParts.push({
                             type: 'text',
-                            text: `[Visual inspection preview for ${imagePath} — verify appearance and visual clarity before keeping it in stage_character_profile]`,
+                            text: mode === 'inspect'
+                                ? `[Inspected image: ${imagePath}]`
+                                : `[Visual inspection preview for ${imagePath} — verify appearance and visual clarity before keeping it in stage_character_profile]`,
                         });
                         previewParts.push({
                             type: 'image_url',

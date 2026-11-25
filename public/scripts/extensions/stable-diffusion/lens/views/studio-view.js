@@ -15,6 +15,15 @@ import {
     makeRuntimeToolCallId,
     requestToolCallsWithRetry,
 } from '../../../../lib/iter-tool-calling.js';
+import { hydrateMessagesForLlm } from '../../../../lib/multimodal-messages.js';
+import {
+    deleteChatAttachments,
+    uploadChatAttachments,
+} from '../../../../lib/chat-attachments-store.js';
+import {
+    createImageAttachmentTray,
+    renderMessageAttachments,
+} from '../../../../lens-shared/image-attachments.js';
 import {
     buildCompactProfileIndex,
     createCharacterProfileStore,
@@ -88,6 +97,30 @@ export function createStudioView(app) {
     let draftInput = '';
     let busy = false;
     let abortController = null;
+
+    const composerEl = h('div', { class: 'sdlens-studio-compose' });
+    const composerRowEl = h('div', { class: 'sdlens-compose-row' });
+    const inputEl = h('textarea', {
+        class: 'sdlens-textarea',
+        rows: 2,
+        placeholder: i18n('Describe the scene or feedback for the next image…'),
+        dataset: { sdRole: 'studio-input' },
+        onInput: (e) => { draftInput = e.target.value; },
+        onKeydown: (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                void runTurn(e.target.value);
+            }
+        },
+    });
+    const attachmentTray = createImageAttachmentTray({
+        composerEl,
+        textareaEl: inputEl,
+        onError: (msg) => app.toast(msg, { error: true }),
+    });
+    const sendSlotEl = h('div', { class: 'sdlens-compose-action' });
+    put(composerRowEl, attachmentTray.attachButton, attachmentTray.fileInput, inputEl, sendSlotEl);
+    put(composerEl, attachmentTray.trayEl, composerRowEl);
 
     function getCtx() {
         return app.getContext();
@@ -442,7 +475,8 @@ export function createStudioView(app) {
 
     async function runTurn(rawText) {
         const text = String(rawText || '').trim();
-        if (!text || busy) return;
+        const hasPendingImages = attachmentTray.hasItems();
+        if ((!text && !hasPendingImages) || busy) return;
 
         const ctx = getCtx();
         const preset = resolveActivePreset();
@@ -463,6 +497,7 @@ export function createStudioView(app) {
         paint();
 
         let appendedUserMessage = false;
+        let uploadedAttachmentPaths = [];
         await runWithStudioActivity(ctx, async () => {
             try {
                 const imageBackend = resolveImageBackend();
@@ -479,6 +514,18 @@ export function createStudioView(app) {
                     return;
                 }
 
+                let attachments = [];
+                if (hasPendingImages) {
+                    attachments = await attachmentTray.commit(
+                        async (files) => {
+                            const uploaded = await uploadChatAttachments(ctx, files, { signal: abortController.signal });
+                            uploadedAttachmentPaths = uploaded.map(item => item.path);
+                            return uploaded;
+                        },
+                        { clearAfter: false },
+                    );
+                }
+
                 let characterArchiveIndex;
                 if (capabilities?.characterReferenceEnabled) {
                     characterArchiveIndex = buildCompactProfileIndex(profiles, {
@@ -488,16 +535,26 @@ export function createStudioView(app) {
                 const systemPrompt = buildStudioSystemPrompt(preset, { capabilities, characterArchiveIndex });
 
                 draftInput = '';
-                appendStudioUserMessage(turnSession, text);
+                appendStudioUserMessage(turnSession, text, { attachments });
                 appendedUserMessage = true;
+                if (hasPendingImages) {
+                    attachmentTray.clear();
+                }
                 paint();
 
                 const tools = buildStudioTools(loraState, capabilities);
                 const allowedNames = tools.map(t => t.function.name);
-                const taskMessages = [
+                const rawTaskMessages = [
                     { role: 'system', content: systemPrompt },
                     ...buildStudioHistoryMessages(turnSession),
                 ];
+                const imageCache = new Map();
+                const taskMessages = await hydrateMessagesForLlm(rawTaskMessages, {
+                    context: ctx,
+                    includePathAnnotations: true,
+                    cache: imageCache,
+                    signal: abortController.signal,
+                });
 
                 while (true) {
                     const response = await requestToolCallsWithRetry(ctx, { toolCallRetryMax: 1 }, {
@@ -522,6 +579,13 @@ export function createStudioView(app) {
                                 toolCalls: [],
                                 toolResults: [],
                                 images: [],
+                                reasoning: response?.reasoning,
+                                signature: response?.signature,
+                                reasoningBlocks: response?.reasoningBlocks,
+                                reasoningDetails: response?.reasoningDetails,
+                                nativeParts: response?.nativeParts,
+                                nativeContentBlocks: response?.nativeContentBlocks,
+                                responsesOutputItems: response?.responsesOutputItems,
                             });
                         }
                         break;
@@ -558,6 +622,9 @@ export function createStudioView(app) {
                             name: call.name,
                             args: call.args,
                             result: toolResult,
+                            raw: call?.raw,
+                            signature: call?.signature,
+                            extra_content: call?.extra_content,
                         });
                         if (generatedImage) {
                             roundImages.push(generatedImage);
@@ -573,9 +640,19 @@ export function createStudioView(app) {
                             id: toolResultsForPersist[idx].tool_call_id,
                             name: c.name,
                             arguments: c.args,
+                            raw: c?.raw,
+                            signature: c?.signature,
+                            extra_content: c?.extra_content,
                         })),
                         toolResults: toolResultsForPersist,
                         images: roundImages,
+                        reasoning: response?.reasoning,
+                        signature: response?.signature,
+                        reasoningBlocks: response?.reasoningBlocks,
+                        reasoningDetails: response?.reasoningDetails,
+                        nativeParts: response?.nativeParts,
+                        nativeContentBlocks: response?.nativeContentBlocks,
+                        responsesOutputItems: response?.responsesOutputItems,
                     });
 
                     if (roundImages.length > 0 && session === turnSession) {
@@ -584,8 +661,12 @@ export function createStudioView(app) {
 
                     appendStandardToolRoundMessages(taskMessages, executedForHistory, assistantText, {
                         reasoning: response?.reasoning,
+                        signature: response?.signature,
                         reasoningBlocks: response?.reasoningBlocks,
                         reasoningDetails: response?.reasoningDetails,
+                        nativeParts: response?.nativeParts,
+                        nativeContentBlocks: response?.nativeContentBlocks,
+                        responsesOutputItems: response?.responsesOutputItems,
                     });
 
                     if (turnSession.visualReview && generatedPathsForPreview.length > 0) {
@@ -626,6 +707,8 @@ export function createStudioView(app) {
                 }
                 if (appendedUserMessage) {
                     await persistCurrentSession(turnSession);
+                } else if (uploadedAttachmentPaths.length > 0) {
+                    await deleteChatAttachments(ctx, uploadedAttachmentPaths).catch(() => {});
                 }
             } finally {
                 busy = false;
@@ -643,8 +726,15 @@ export function createStudioView(app) {
         await runWithStudioActivity(ctx, async () => {
             try {
                 const imageBackend = resolveImageBackend();
-                const freshCapabilities = (await imageBackend.getCapabilities?.()) ?? null;
-                currentCapabilities = freshCapabilities;
+                const hasSavedRefs = Boolean(image.sourceImageId)
+                    || (Array.isArray(image.characterImageIds) && image.characterImageIds.length > 0)
+                    || (Array.isArray(image.characterRefs) && image.characterRefs.length > 0);
+                const freshCapabilities = hasSavedRefs
+                    ? ((await imageBackend.getCapabilities?.()) ?? null)
+                    : currentCapabilities;
+                if (hasSavedRefs) {
+                    currentCapabilities = freshCapabilities;
+                }
 
                 const savedLoras = Array.isArray(image.loras) ? image.loras : [];
                 let loras = [];
@@ -757,6 +847,59 @@ export function createStudioView(app) {
 
     function renderSessionsPane() {
         const ill = getIllSettings();
+        const newBtn = button(i18n('New session'), () => { void startNewSession(); }, {
+            small: true,
+            iconName: 'plus',
+            renderIcon: icon,
+            disabled: busy,
+            title: i18n('New studio session'),
+        });
+        newBtn.dataset.sdRole = 'studio-new-session';
+
+        const sessionListContent = sessions.length > 0
+            ? sessions.map(entry => h('div', {
+                class: `sdlens-session-item ${entry.id === session?.id ? 'is-active' : ''}`.trim(),
+                dataset: { studioSessionId: entry.id },
+                onClick: async (e) => {
+                    if (busy || e.target.closest?.('[data-studio-session-delete]')) return;
+                    const loaded = await createStudioSessionStore(getCtx()).getSession(entry.id);
+                    if (loaded) {
+                        session = loaded;
+                        selectedImageId = session.images.at(-1)?.id || '';
+                        paint();
+                    }
+                },
+            },
+            h('span', {
+                style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '12.5px' },
+                text: entry.title || entry.id,
+            }),
+            iconButton('trash', i18n('Delete'), async (e) => {
+                e.stopPropagation();
+                if (busy) return;
+                await createStudioSessionStore(getCtx()).deleteSession(entry.id);
+                await refreshLists();
+                if (session?.id === entry.id) {
+                    session = sessions[0] ? JSON.parse(JSON.stringify(sessions[0])) : createStudioSession({ presetId: ill?.currentPresetId || '' });
+                    selectedImageId = session.images.at(-1)?.id || '';
+                }
+                paint();
+            }, { className: 'is-sm', renderIcon: icon, disabled: busy })))
+            : [h('div', {
+                class: 'sdlens-studio-list-empty',
+                dataset: { sdRole: 'studio-sessions-empty' },
+                text: i18n('No saved Studio sessions yet'),
+            })];
+
+        return h('aside', { class: 'sdlens-studio-sessions' },
+            h('div', { class: 'sdlens-studio-sessions-head' },
+                h('span', { class: 'sdlens-studio-sessions-title', text: i18n('Studio sessions') }),
+                newBtn),
+            h('div', { class: 'sdlens-studio-list' }, ...sessionListContent));
+    }
+
+    function renderCenterPane() {
+        const ill = getIllSettings();
         const presetOpts = (ill?.presets || []).map(p => ({ value: p.id, label: p.name || p.id }));
         const presetSelect = selectInput(
             presetOpts.length > 0 ? presetOpts : [{ value: '', label: '—' }],
@@ -765,6 +908,7 @@ export function createStudioView(app) {
                 if (!ill || busy) return;
                 try {
                     selectPreset(ill, nextId);
+                    getCtx()?.saveSettingsDebounced?.();
                     if (session) session.presetId = nextId;
                     await Promise.all([persistCurrentSession(), refreshCapabilities()]);
                     paint();
@@ -772,53 +916,15 @@ export function createStudioView(app) {
                     app.toast(String(err?.message || err), { error: true });
                 }
             },
-            { ariaLabel: i18n('Preset'), disabled: busy },
+            { ariaLabel: i18n('Prompt preset'), disabled: busy },
         );
         presetSelect.dataset.sdRole = 'studio-preset';
 
-        const newBtn = iconButton('plus', i18n('New studio session'), () => { void startNewSession(); }, {
-            disabled: busy,
-            renderIcon: icon,
-        });
-        newBtn.dataset.sdRole = 'studio-new-session';
-
-        return h('aside', { class: 'sdlens-studio-sessions' },
-            h('div', { style: { display: 'flex', gap: '6px', padding: '10px', borderBottom: '1px solid var(--lw-border)' } },
-                presetSelect,
-                newBtn),
-            h('div', { class: 'sdlens-studio-list' },
-                sessions.map(entry => h('div', {
-                    class: `sdlens-session-item ${entry.id === session?.id ? 'is-active' : ''}`.trim(),
-                    dataset: { studioSessionId: entry.id },
-                    onClick: async (e) => {
-                        if (busy || e.target.closest?.('[data-studio-session-delete]')) return;
-                        const loaded = await createStudioSessionStore(getCtx()).getSession(entry.id);
-                        if (loaded) {
-                            session = loaded;
-                            selectedImageId = session.images.at(-1)?.id || '';
-                            paint();
-                        }
-                    },
-                },
-                h('span', {
-                    style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '12.5px' },
-                    text: entry.title || entry.id,
-                }),
-                iconButton('trash', i18n('Delete'), async (e) => {
-                    e.stopPropagation();
-                    if (busy) return;
-                    await createStudioSessionStore(getCtx()).deleteSession(entry.id);
-                    await refreshLists();
-                    if (session?.id === entry.id) {
-                        session = sessions[0] ? JSON.parse(JSON.stringify(sessions[0])) : createStudioSession({ presetId: ill?.currentPresetId || '' });
-                        selectedImageId = session.images.at(-1)?.id || '';
-                    }
-                    paint();
-                }, { className: 'is-sm', renderIcon: icon, disabled: busy })))));
-    }
-
-    function renderCenterPane() {
-        const toolbarItems = [];
+        const toolbarItems = [
+            h('div', { class: 'sdlens-studio-preset-field' },
+                h('span', { class: 'sdlens-studio-preset-label', text: i18n('Prompt preset') }),
+                presetSelect),
+        ];
         if (session) {
             const visualSwitch = switchControl(i18n('Visual review'), Boolean(session.visualReview), (next) => {
                 session.visualReview = next;
@@ -844,6 +950,7 @@ export function createStudioView(app) {
                 paint();
             }, { className: 'is-sm', renderIcon: icon, disabled: busy })),
         msg.content ? h('div', { style: { whiteSpace: 'pre-wrap' }, text: msg.content }) : null,
+        msg.role === 'user' ? renderMessageAttachments(msg.attachments) : null,
         Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0
             ? h('details', null,
                 h('summary', { style: { cursor: 'pointer', fontSize: '12px', color: 'var(--lw-muted)' }, text: i18nFormat('${0} tool call(s)', msg.tool_calls.length) }),
@@ -852,6 +959,16 @@ export function createStudioView(app) {
                     text: `${tc.function?.name || tc.name}(${tc.function?.arguments || ''})\n→ ${msg.tool_results?.[tcIdx]?.content || ''}`,
                 })))
             : null));
+
+        const messagesContent = messageNodes.length > 0
+            ? messageNodes
+            : [emptyState(
+                'spark',
+                i18n('Start a Studio conversation'),
+                i18n('Describe an image below to generate it with Studio AI. Images generated in chat appear in chat messages, Show Gallery, or Run Traces instead of here.'),
+                null,
+                { renderIcon: icon },
+            )];
 
         const allowSourceImage = !currentCapabilities || Boolean(currentCapabilities.supportsSourceImage);
         const attachedSource = allowSourceImage
@@ -866,20 +983,9 @@ export function createStudioView(app) {
                 }, { className: 'is-sm', renderIcon: icon }))
             : null;
 
-        const inputEl = h('textarea', {
-            class: 'sdlens-textarea',
-            rows: 2,
-            placeholder: i18n('Describe the scene or feedback for the next image…'),
-            dataset: { sdRole: 'studio-input' },
-            onInput: (e) => { draftInput = e.target.value; },
-            onKeydown: (e) => {
-                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                    e.preventDefault();
-                    void runTurn(e.target.value);
-                }
-            },
-        });
         inputEl.value = draftInput;
+        inputEl.disabled = busy;
+        attachmentTray.setDisabled(busy);
 
         const sendOrStopBtn = busy
             ? (() => {
@@ -900,12 +1006,14 @@ export function createStudioView(app) {
                 b.dataset.sdRole = 'studio-send';
                 return b;
             })();
+        clear(sendSlotEl);
+        put(sendSlotEl, sendOrStopBtn);
 
         return h('section', { class: 'sdlens-studio-main' },
             h('div', { class: 'sdlens-studio-toolbar' }, ...toolbarItems),
-            h('div', { class: 'sdlens-studio-messages' }, ...messageNodes),
+            h('div', { class: 'sdlens-studio-messages' }, ...messagesContent),
             attachedBanner,
-            h('div', { class: 'sdlens-studio-compose' }, inputEl, sendOrStopBtn));
+            composerEl);
     }
 
     function renderGalleryPane() {
@@ -915,7 +1023,13 @@ export function createStudioView(app) {
         if (images.length === 0) {
             return h('aside', { class: 'sdlens-studio-gallery' },
                 sectionTitle(i18n('Studio gallery')),
-                emptyState('image', i18n('No images generated in this session yet'), '', null, { renderIcon: icon }));
+                emptyState(
+                    'image',
+                    i18n('No images in this Studio session yet'),
+                    i18n('Only images created inside this Studio session appear here. Chat illustrations stay in the chat, Show Gallery, and Run Traces.'),
+                    null,
+                    { renderIcon: icon },
+                ));
         }
 
         const previewBlock = selected
@@ -982,6 +1096,7 @@ export function createStudioView(app) {
             void ensureSessionLoaded();
         },
         destroy() {
+            attachmentTray.destroy();
             abortController?.abort('Studio closed');
         },
     };

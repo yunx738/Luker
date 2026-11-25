@@ -8,10 +8,7 @@ CardApp Studio 是角色卡編輯助手的完整開發環境，專為內嵌了 [
 
 ## 開啟方式
 
-兩條路徑均會進入 Studio:
-
-1. **擴充功能面板 → 角色卡編輯助手 → 「&lt;/&gt; CardApp Studio」按鈕**
-2. 當前角色含 CardApp 時，**「開啟編輯器」會直接進入 Studio**；不含 CardApp 的角色卡進入[普通彈窗](/zh-TW/features/card-editor/popup)
+透過**擴充功能面板 → 角色卡編輯助手**中的「CardApp Studio」按鈕開啟 Studio。無論角色卡是否已含 CardApp，Studio 均作用於當前角色。
 
 ## 介面佈局
 
@@ -25,7 +22,7 @@ Studio 採用三欄佈局，覆蓋在 Luker 主介面之上：
 
 ### 左側：AI 對話與會話
 
-左側是 Studio 的 AI 助手對話區。所有對 CardApp 的修改均從這裡發起：
+左側是 Studio 的 AI 助手對話區。所有對 CardApp 的修改均從這裡發起，支援透過**新增圖片**、貼上或拖曳附帶介面草圖或截圖；圖片會隨多輪對話保留在上下文中，清空對話或刪除會話時自動清理：
 
 ![Studio AI 助手對話區](/images/cardapp-studio/studio-ai-chat.png)
 
@@ -101,7 +98,7 @@ AI 對檔案的每次修改均需要審批。與普通彈窗一樣，介面會�
 ## 會話管理
 
 - 多個開發會話，可建立 / 切換 / 刪除
-- 每個角色最多保留 **20** 個會話（普通彈窗是 24 個）
+- 每個角色最多保留 **20** 個會話
 - 會話內容持久化保存在角色狀態中，關閉 Studio 後重新開啟不遺失
 
 ## 版本歷史 {#version-history-git}

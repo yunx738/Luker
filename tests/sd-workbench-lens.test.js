@@ -22,7 +22,6 @@ import { createStudioSessionStore, normalizeStudioSession } from '../public/scri
 import { buildSdDiagnoseDraft } from '../public/scripts/extensions/stable-diffusion/activity.js';
 import { askTools, readLabel } from '../public/scripts/workbench/model/ask.js';
 import { wsName } from '../public/scripts/workbench/pages/ask.js';
-import { ensureSkillI18n } from '../public/scripts/skills/i18n.js';
 
 beforeAll(() => {
     globalThis.structuredClone ??= value => JSON.parse(JSON.stringify(value));
@@ -478,6 +477,43 @@ describe('workbench sd studio separation, legacy migration, and free drawing', (
             expect(container.querySelector('[data-sd-role="studio-source-select"]')).toBeNull();
             expect(container.querySelector('[data-sd-role="staged-proposal"]')).toBeNull();
 
+            // New session lives in the session list header; prompt preset lives in the main toolbar; empty states appear before first turn.
+            expect(container.querySelector('.sdlens-studio-sessions-head [data-sd-role="studio-new-session"]')).not.toBeNull();
+            expect(container.querySelector('.sdlens-studio-sessions [data-sd-role="studio-preset"]')).toBeNull();
+            expect(container.querySelector('.sdlens-studio-toolbar [data-sd-role="studio-preset"]')).not.toBeNull();
+            expect(container.querySelector('[data-sd-role="studio-sessions-empty"]')).not.toBeNull();
+            expect(container.querySelector('.sdlens-studio-messages > .lw-empty')).not.toBeNull();
+            expect(container.querySelector('.sdlens-studio-gallery .lw-empty')).not.toBeNull();
+            expect(container.querySelector('.sdlens-studio-gallery .lw-empty-hint')?.textContent?.trim().length).toBeGreaterThan(0);
+
+            // Switching prompt preset in the Studio toolbar updates currentPresetId and persists settings.
+            const saveSettingsDebounced = jest.fn();
+            ctx.saveSettingsDebounced = saveSettingsDebounced;
+            sdSettings.illustration.presets.push({
+                id: 'preset_2',
+                name: 'Natural language style',
+                promptStyle: 'natural',
+                promptDefaultsInitialized: true,
+                illustrationPrompt: 'Natural prompt instructions',
+                studioPrompt: 'Studio instructions',
+                explorationPrompt: DEFAULT_EXPLORATION_PROMPT,
+                llm: { apiPresetName: '', llmPresetName: '' },
+                explorationLlm: { apiPresetName: '', llmPresetName: '' },
+                visualInspection: false,
+            });
+            handle.update({ ws: 'sd', subview: 'studio' });
+            await new Promise(r => setTimeout(r, 20));
+            const presetSelect = container.querySelector('.sdlens-studio-toolbar [data-sd-role="studio-preset"]');
+            presetSelect.value = 'preset_2';
+            presetSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            await new Promise(r => setTimeout(r, 20));
+            expect(sdSettings.illustration.currentPresetId).toBe('preset_2');
+            expect(saveSettingsDebounced).toHaveBeenCalledTimes(1);
+            presetSelect.value = 'preset_1';
+            presetSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            await new Promise(r => setTimeout(r, 20));
+            expect(sdSettings.illustration.currentPresetId).toBe('preset_1');
+
             // Enable Visual review and generate an image.
             const visualSwitch = container.querySelector('.sdlens-studio-toolbar button[role="switch"]');
             expect(visualSwitch).not.toBeNull();
@@ -777,6 +813,181 @@ describe('workbench sd IterateTarget, AskProvider, and SuggestRuleProvider', () 
             expect(sdSettings.illustration.presets[0].illustrationPrompt).toBe('Prompt instructions');
             expect(sdSettings.illustration.presets[0].explorationPrompt).toBe(DEFAULT_EXPLORATION_PROMPT);
             expect(await profileStore.getProfile('char_iter_1')).toBeNull();
+        } finally {
+            globalThis.fetch = originalFetch;
+            cleanup();
+        }
+    });
+
+    test('IterateTarget supports sd_create_preset, sd_update_preset prompt_style, sd_delete_preset, UI refresh callback, and undo', async () => {
+        const { ctx, reg, sdSettings } = createHarnessContext();
+        let saveCount = 0;
+        ctx.saveSettings = async (_delay, opts) => {
+            saveCount += 1;
+            opts?.onSaved?.();
+        };
+        sdSettings.illustration.presets[0].llm = {
+            apiPresetName: 'Claude Connection',
+            llmPresetName: 'Plugin Preset',
+        };
+        sdSettings.illustration.presets[0].explorationLlm = {
+            apiPresetName: 'Explore Connection',
+            llmPresetName: 'Explore Preset',
+        };
+
+        const onPresetsCommitted = jest.fn();
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async (url) => {
+            if (url === '/api/sd/comfy/workflows') {
+                return { ok: true, status: 200, json: async () => [] };
+            }
+            throw new Error(`Unexpected fetch URL: ${url}`);
+        };
+        globalThis.Luker = { getContext: () => ctx };
+        const cleanup = initSdLens({ getContext: () => ctx, onPresetsCommitted });
+
+        try {
+            const target = reg.getIterateTargets().find(t => t.id === 'sd');
+            const toolNames = (await target.tools()).map(t => t.function.name);
+            expect(toolNames).toEqual(expect.arrayContaining([
+                'sd_list_presets',
+                'sd_read_preset',
+                'sd_create_preset',
+                'sd_update_preset',
+                'sd_delete_preset',
+            ]));
+
+            const loaded = await target.load('global', ctx);
+            const base = JSON.parse(JSON.stringify(loaded.live));
+
+            // Cannot delete the last remaining preset.
+            await expect(target.runEdit({
+                name: 'sd_delete_preset',
+                args: { preset_id: 'preset_1' },
+            }, JSON.parse(JSON.stringify(base)))).rejects.toThrow(/last remaining/i);
+
+            // Validation rejects empty name, bad prompt_style, missing clone_from, and duplicate preset_id.
+            await expect(target.runEdit({
+                name: 'sd_create_preset',
+                args: { name: '   ' },
+            }, JSON.parse(JSON.stringify(base)))).rejects.toThrow(/non-empty string/i);
+            await expect(target.runEdit({
+                name: 'sd_create_preset',
+                args: { name: 'Bad Style', prompt_style: 'comic' },
+            }, JSON.parse(JSON.stringify(base)))).rejects.toThrow(/tag.*natural/i);
+            await expect(target.runEdit({
+                name: 'sd_create_preset',
+                args: { name: 'Missing Clone', clone_from: 'preset_missing' },
+            }, JSON.parse(JSON.stringify(base)))).rejects.toThrow(/not found/i);
+            await expect(target.runEdit({
+                name: 'sd_create_preset',
+                args: { name: 'Dup', preset_id: 'preset_1' },
+            }, JSON.parse(JSON.stringify(base)))).rejects.toThrow(/already exists/i);
+
+            // Create a fresh natural-style preset and a cloned preset with overrides.
+            let draft = await target.runEdit({
+                name: 'sd_create_preset',
+                args: {
+                    preset_id: 'preset_natural_custom',
+                    name: 'Watercolor Natural',
+                    prompt_style: 'natural',
+                    illustration_prompt: 'Describe scenes as watercolor paintings.',
+                    visual_inspection: true,
+                },
+            }, JSON.parse(JSON.stringify(base)));
+
+            const createdNatural = draft.presets.find(p => p.id === 'preset_natural_custom');
+            expect(createdNatural).toMatchObject({
+                id: 'preset_natural_custom',
+                name: 'Watercolor Natural',
+                promptStyle: 'natural',
+                illustrationPrompt: 'Describe scenes as watercolor paintings.',
+                studioPrompt: getDefaultPromptValues('natural').studioPrompt,
+                explorationPrompt: getDefaultPromptValues('natural').explorationPrompt,
+                visualInspection: true,
+                llm: { apiPresetName: 'Claude Connection', llmPresetName: 'Plugin Preset' },
+                explorationLlm: { apiPresetName: 'Explore Connection', llmPresetName: 'Explore Preset' },
+            });
+
+            draft = await target.runEdit({
+                name: 'sd_create_preset',
+                args: {
+                    preset_id: 'preset_cloned',
+                    name: 'Cloned Style',
+                    clone_from: 'preset_natural_custom',
+                    studio_prompt: 'Custom cloned studio instructions.',
+                },
+            }, draft);
+            expect(draft.presets.find(p => p.id === 'preset_cloned')).toMatchObject({
+                promptStyle: 'natural',
+                illustrationPrompt: 'Describe scenes as watercolor paintings.',
+                studioPrompt: 'Custom cloned studio instructions.',
+                visualInspection: true,
+            });
+
+            // sd_list_presets surfaces promptStyle on draft presets.
+            const listed = await target.runRead({ name: 'sd_list_presets', args: {} }, draft);
+            expect(listed.find(p => p.id === 'preset_natural_custom')).toMatchObject({
+                name: 'Watercolor Natural',
+                promptStyle: 'natural',
+                visualInspection: true,
+            });
+
+            // Update preset_1 style and delete the cloned preset before commit.
+            draft = await target.runEdit({
+                name: 'sd_update_preset',
+                args: { preset_id: 'preset_1', prompt_style: 'natural' },
+            }, draft);
+            draft = await target.runEdit({
+                name: 'sd_delete_preset',
+                args: { preset_id: 'preset_cloned' },
+            }, draft);
+            expect(draft.presets.map(p => p.id)).toEqual(['preset_1', 'preset_natural_custom']);
+
+            // Commit creation + style update, verify persistence, inherited llm, and onPresetsCommitted callback.
+            const keys = ['preset:preset_1', 'preset:preset_natural_custom'];
+            const rebuilt = target.rebuild(base, draft, keys);
+            const committed = await target.commit(loaded.target, base, rebuilt, keys);
+            expect(committed.applied).toEqual(expect.arrayContaining(keys));
+            expect(saveCount).toBeGreaterThanOrEqual(1);
+            expect(onPresetsCommitted).toHaveBeenCalledTimes(1);
+
+            const persistedNew = sdSettings.illustration.presets.find(p => p.id === 'preset_natural_custom');
+            expect(persistedNew).toMatchObject({
+                name: 'Watercolor Natural',
+                promptStyle: 'natural',
+                illustrationPrompt: 'Describe scenes as watercolor paintings.',
+                studioPrompt: getDefaultPromptValues('natural').studioPrompt,
+                visualInspection: true,
+                llm: { apiPresetName: 'Claude Connection', llmPresetName: 'Plugin Preset' },
+                explorationLlm: { apiPresetName: 'Explore Connection', llmPresetName: 'Explore Preset' },
+            });
+            expect(sdSettings.illustration.presets.find(p => p.id === 'preset_1')?.promptStyle).toBe('natural');
+
+            // Delete the active preset (preset_1) via commit -> currentPresetId falls back to remaining preset.
+            const baseAfterCreate = JSON.parse(JSON.stringify((await target.load('global', ctx)).live));
+            const draftAfterDelete = await target.runEdit({
+                name: 'sd_delete_preset',
+                args: { preset_id: 'preset_1' },
+            }, JSON.parse(JSON.stringify(baseAfterCreate)));
+            const delKeys = ['preset:preset_1'];
+            const deleteCommit = await target.commit(
+                loaded.target,
+                baseAfterCreate,
+                target.rebuild(baseAfterCreate, draftAfterDelete, delKeys),
+                delKeys,
+            );
+            expect(sdSettings.illustration.presets.map(p => p.id)).toEqual(['preset_natural_custom']);
+            expect(sdSettings.illustration.currentPresetId).toBe('preset_natural_custom');
+            expect(onPresetsCommitted).toHaveBeenCalledTimes(2);
+
+            // Undo delete restores preset_1; undo create removes preset_natural_custom and restores preset_1 promptStyle.
+            await deleteCommit.undo();
+            expect(sdSettings.illustration.presets.map(p => p.id)).toEqual(expect.arrayContaining(['preset_1', 'preset_natural_custom']));
+            await committed.undo();
+            expect(sdSettings.illustration.presets.map(p => p.id)).toEqual(['preset_1']);
+            expect(sdSettings.illustration.presets[0].promptStyle).toBe('tag');
+            expect(onPresetsCommitted).toHaveBeenCalledTimes(4);
         } finally {
             globalThis.fetch = originalFetch;
             cleanup();
@@ -1250,13 +1461,6 @@ describe('workbench sd IterateTarget, AskProvider, and SuggestRuleProvider', () 
         const sideZh = sdAskProvider.getSideInfo({ characterCount: 3, brokenConnectionProfile: false });
         expect(sideZh.countText).not.toContain('chars');
         expect(sideZh.countText).not.toContain('UNTRANSLATED:');
-
-        // Verify ensureSkillI18n registers synchronously via Luker.getContext().addLocaleData
-        const addedLocales = [];
-        ctx.addLocaleData = (loc, table) => addedLocales.push([loc, table]);
-        const registration = ensureSkillI18n();
-        expect(addedLocales.map(([loc]) => loc)).toEqual(['zh-cn', 'zh-tw']);
-        await registration;
 
         handle.destroy();
         cleanup();

@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { buildPersistentToolHistoryMessages, createPersistentToolTurnMessage } from '../../../lib/iter-tool-calling.js';
+import {
+    buildAttachmentSummaryLabel,
+    collectAttachmentPathsFromRecords,
+    normalizeImageAttachments,
+} from '../../../lib/multimodal-messages.js';
+import {
+    copyChatAttachments,
+    deleteChatAttachments,
+    isAiAttachmentPath,
+    rewriteAttachmentsWithCopyMap,
+} from '../../../lib/chat-attachments-store.js';
 import { makeIllustrationId } from '../illustration/presets.js';
 
 export const STUDIO_SESSIONS_NAMESPACE = 'sd_studio_sessions';
@@ -88,19 +99,23 @@ export function normalizeStudioSession(raw, now = Date.now()) {
     };
 }
 
-export function appendStudioUserMessage(session, text, now = Date.now()) {
+export function appendStudioUserMessage(session, text, nowOrOpts = Date.now()) {
+    const opts = (nowOrOpts && typeof nowOrOpts === 'object') ? nowOrOpts : { now: nowOrOpts };
+    const now = Number.isFinite(Number(opts.now)) ? Number(opts.now) : Date.now();
     const content = String(text ?? '').trim();
+    const attachments = normalizeImageAttachments(opts.attachments);
     const message = {
         id: makeIllustrationId('msg'),
         role: 'user',
         content,
+        ...(attachments.length > 0 ? { attachments } : {}),
         at: now,
         tool_calls: [],
         tool_results: [],
     };
     session.messages.push(message);
     if (!session.title) {
-        session.title = sessionTitleFromText(content);
+        session.title = sessionTitleFromText(buildAttachmentSummaryLabel(content, attachments, '[Image]'));
     }
     session.updatedAt = now;
     return message;
@@ -109,6 +124,14 @@ export function appendStudioUserMessage(session, text, now = Date.now()) {
 function normalizeToolCalls(toolCalls, toolResults) {
     return (Array.isArray(toolCalls) ? toolCalls : []).map((call, index) => {
         const args = call?.arguments ?? call?.function?.arguments ?? {};
+        const signature = typeof call?.signature === 'string' && call.signature.length > 0
+            ? call.signature
+            : (typeof call?.raw?.signature === 'string' && call.raw.signature.length > 0
+                ? call.raw.signature
+                : (typeof call?.raw?.thoughtSignature === 'string' && call.raw.thoughtSignature.length > 0 ? call.raw.thoughtSignature : null));
+        const extraContent = call?.extra_content && typeof call.extra_content === 'object'
+            ? structuredClone(call.extra_content)
+            : (call?.raw?.extra_content && typeof call.raw.extra_content === 'object' ? structuredClone(call.raw.extra_content) : null);
         return {
             id: String(call?.id || call?.tool_call_id || toolResults?.[index]?.tool_call_id || ''),
             type: 'function',
@@ -116,6 +139,8 @@ function normalizeToolCalls(toolCalls, toolResults) {
                 name: String(call?.name || call?.function?.name || ''),
                 arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
             },
+            ...(signature ? { signature } : {}),
+            ...(extraContent ? { extra_content: extraContent } : {}),
         };
     }).filter(call => call.function.name);
 }
@@ -125,6 +150,13 @@ export function appendStudioAssistantTurn(session, {
     toolCalls = [],
     toolResults = [],
     images = [],
+    reasoning = '',
+    signature = null,
+    reasoningBlocks = null,
+    reasoningDetails = null,
+    nativeParts = null,
+    nativeContentBlocks = null,
+    responsesOutputItems = null,
     now = Date.now(),
 } = {}) {
     const normalizedResults = (Array.isArray(toolResults) ? toolResults : []).map(result => ({
@@ -136,6 +168,13 @@ export function appendStudioAssistantTurn(session, {
         assistantText: text,
         toolCalls: normalizeToolCalls(toolCalls, normalizedResults),
         toolResults: normalizedResults,
+        reasoning,
+        signature,
+        reasoningBlocks,
+        reasoningDetails,
+        nativeParts,
+        nativeContentBlocks,
+        responsesOutputItems,
         at: now,
     });
     session.messages.push(message);
@@ -166,7 +205,12 @@ export function buildStudioHistoryMessages(session) {
     for (const message of Array.isArray(session?.messages) ? session.messages : []) {
         const role = String(message?.role || '').trim().toLowerCase();
         if (role === 'user') {
-            history.push({ role: 'user', content: String(message.content ?? '') });
+            const attachments = normalizeImageAttachments(message.attachments);
+            history.push({
+                role: 'user',
+                content: String(message.content ?? ''),
+                ...(attachments.length > 0 ? { attachments } : {}),
+            });
             continue;
         }
         if (role === 'system') {
@@ -178,7 +222,17 @@ export function buildStudioHistoryMessages(session) {
         }
         const toolHistory = buildPersistentToolHistoryMessages([message]);
         if (toolHistory.length === 0) {
-            history.push({ role: 'assistant', content: String(message.content ?? '') });
+            history.push({
+                role: 'assistant',
+                content: String(message.content ?? ''),
+                ...(typeof message.reasoning === 'string' && message.reasoning.length > 0 ? { reasoning: message.reasoning } : {}),
+                ...(typeof message.signature === 'string' && message.signature.length > 0 ? { signature: message.signature } : {}),
+                ...(Array.isArray(message.reasoning_blocks) && message.reasoning_blocks.length > 0 ? { reasoning_blocks: message.reasoning_blocks } : {}),
+                ...(Array.isArray(message.reasoning_details) && message.reasoning_details.length > 0 ? { reasoning_details: message.reasoning_details } : {}),
+                ...(Array.isArray(message.native_parts) && message.native_parts.length > 0 ? { native_parts: message.native_parts } : {}),
+                ...(Array.isArray(message.native_content_blocks) && message.native_content_blocks.length > 0 ? { native_content_blocks: message.native_content_blocks } : {}),
+                ...(Array.isArray(message.responses_output_items) && message.responses_output_items.length > 0 ? { responses_output_items: message.responses_output_items } : {}),
+            });
             continue;
         }
         history.push(...toolHistory);
@@ -293,9 +347,33 @@ export function createStudioSessionStore(context) {
                 throw new Error(`Studio session "${id}" not found.`);
             }
             const count = Math.max(0, Math.min(source.messages.length, Math.floor(Number(messageCount) || 0)));
-            const keptMessages = source.messages.slice(0, count);
-            const keptMessageIds = new Set(keptMessages.map(m => m.id));
-            const keptImages = source.images.filter(img => !img.messageId || keptMessageIds.has(img.messageId));
+            const rawKeptMessages = source.messages.slice(0, count).map(m => JSON.parse(JSON.stringify(m)));
+            const keptMessageIds = new Set(rawKeptMessages.map(m => m.id));
+            const rawKeptImages = source.images
+                .filter(img => !img.messageId || keptMessageIds.has(img.messageId))
+                .map(img => JSON.parse(JSON.stringify(img)));
+
+            const sourcePaths = collectAttachmentPathsFromRecords(rawKeptMessages, { filter: isAiAttachmentPath });
+            let copyMap = new Map();
+            if (sourcePaths.length > 0 && typeof globalThis.fetch === 'function') {
+                copyMap = await copyChatAttachments(context, sourcePaths);
+            }
+
+            const keptMessages = rawKeptMessages.map(m => {
+                if (m.role !== 'user' || !Array.isArray(m.attachments) || !m.attachments.length) return m;
+                return { ...m, attachments: rewriteAttachmentsWithCopyMap(m.attachments, copyMap) };
+            });
+            const keptImages = rawKeptImages.map(img => {
+                if (copyMap.size === 0) return img;
+                const next = { ...img };
+                if (next.sourceImageId && copyMap.has(next.sourceImageId)) {
+                    next.sourceImageId = copyMap.get(next.sourceImageId);
+                }
+                if (Array.isArray(next.characterImageIds) && next.characterImageIds.length > 0) {
+                    next.characterImageIds = next.characterImageIds.map(tok => copyMap.get(tok) || tok);
+                }
+                return next;
+            });
 
             const forked = normalizeStudioSession({
                 ...source,
@@ -307,7 +385,14 @@ export function createStudioSessionStore(context) {
                 images: keptImages,
             }, now);
 
-            return await this.saveSession(forked, now);
+            try {
+                return await this.saveSession(forked, now);
+            } catch (err) {
+                if (copyMap.size > 0 && typeof globalThis.fetch === 'function') {
+                    await deleteChatAttachments(context, [...copyMap.values()]).catch(() => {});
+                }
+                throw err;
+            }
         },
 
         async deleteSession(id) {
@@ -316,6 +401,7 @@ export function createStudioSessionStore(context) {
                 return false;
             }
             let deleted = false;
+            let attachmentPaths = [];
             const res = await context.updateGlobalState(STUDIO_SESSIONS_NAMESPACE, (current) => {
                 const existing = (current?.sessions && typeof current.sessions === 'object' && !Array.isArray(current.sessions))
                     ? { ...current.sessions }
@@ -323,6 +409,7 @@ export function createStudioSessionStore(context) {
                 if (!Object.hasOwn(existing, target)) {
                     return null;
                 }
+                attachmentPaths = collectAttachmentPathsFromRecords(existing[target]?.messages, { filter: isAiAttachmentPath });
                 delete existing[target];
                 deleted = true;
                 return {
@@ -334,6 +421,11 @@ export function createStudioSessionStore(context) {
 
             if (!res?.ok) {
                 throw new Error(`Failed to delete studio session "${target}": ${res?.hint || res?.reason || 'unknown error'}`);
+            }
+            if (deleted && attachmentPaths.length > 0 && typeof globalThis.fetch === 'function') {
+                await deleteChatAttachments(context, attachmentPaths).catch(err => {
+                    console.warn('[sd/studio-store] Failed to clean up session attachments:', err);
+                });
             }
             return deleted;
         },

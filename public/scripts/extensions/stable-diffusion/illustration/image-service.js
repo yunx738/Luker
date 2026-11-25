@@ -1,3 +1,5 @@
+import { computeImageCapabilities } from '../capabilities.js';
+
 export function createImageService({ bridge, queue, getQueueConfig, context = null }) {
     return {
         configure(options) {
@@ -5,6 +7,16 @@ export function createImageService({ bridge, queue, getQueueConfig, context = nu
         },
         async getAvailableLoras() {
             return bridge.getAvailableLoras();
+        },
+        getCapabilitiesSnapshot() {
+            if (typeof bridge.getCapabilitiesSnapshot === 'function') {
+                return bridge.getCapabilitiesSnapshot();
+            }
+            const sdSettings = context?.extensionSettings?.sd;
+            if (sdSettings && typeof sdSettings === 'object') {
+                return computeImageCapabilities(sdSettings);
+            }
+            return null;
         },
         async getCapabilities() {
             if (typeof bridge.getCapabilities === 'function') {
@@ -50,7 +62,7 @@ export function createImageService({ bridge, queue, getQueueConfig, context = nu
             const bridgeOptions = hasIllustrationLease && options?.skipActivityLease === undefined
                 ? { ...options, skipActivityLease: true }
                 : options;
-            return queue.schedule(() => bridge.generateImage(prompt, bridgeOptions));
+            return queue.schedule(() => bridge.generateImage(prompt, bridgeOptions), { signal: bridgeOptions?.signal });
         },
     };
 }
