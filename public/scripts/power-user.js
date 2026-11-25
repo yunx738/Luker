@@ -13,7 +13,7 @@ import {
     event_types,
     getCurrentChatId,
     printCharactersDebounced,
-    setCharacterId,
+    selectCharacterById,
     setEditedMessageId,
     chat,
     getFirstDisplayedMessageId,
@@ -32,12 +32,11 @@ import {
     extension_prompt_roles,
     deleteMessage,
     settingsReady,
-    isGenerationInFlight,
-    setGenerationInFlightListener,
     name2,
     this_chid,
     getThumbnailUrl,
 } from '../script.js';
+import { hasActiveSource, hasKeepAliveHold, subscribeActivityGuard } from './activity-guard.js';
 import { getPipViewStatus, updatePipView } from './luker-pip-view.js';
 import { isMobile, initMovingUI, favsToHotswap, shouldSendOnEnter } from './RossAscends-mods.js';
 import {
@@ -57,7 +56,6 @@ import {
 import { initAppEndpointControls } from './app-endpoint-controls.js';
 import {
     groups,
-    resetSelectedGroup,
 } from './group-chats.js';
 import {
     instruct_presets,
@@ -93,6 +91,7 @@ import { setFrontendConsoleDebugLoggingEnabled } from './frontend-log-manager.js
 import { setAndroidDebugRecordingEnabled, isAndroidDebugTrailAvailable, getAndroidDebugRecordingActualState } from './luker-android-debug-trail.js';
 import { t, translate } from './i18n.js';
 import { getActiveThemePaletteColor, initThemePalettes, normalizeThemePalettes, syncThemePalettes } from './theme-palettes.js';
+import { createThemeManager } from './theme-manager.js';
 import { getBackgroundPath, isCustomBackgroundUrl } from './backgrounds.js';
 import { downloadCurrentSelfProfileReport, setSelfProfilerPreference, syncSelfProfilerEnabled } from './self-profiler.js';
 import { registerDebugMenuAction, setDebugMenuToggleState } from './debug-export.js';
@@ -146,20 +145,6 @@ const messageNotificationDetailModes = {
     CONTENT: 'content',
 };
 
-const beforeUnloadGuardModes = {
-    OFF: 'off',
-    SMART: 'smart',
-    ALWAYS: 'always',
-};
-
-function normalizeBeforeUnloadGuardMode(value) {
-    const normalized = String(value ?? '').trim().toLowerCase();
-    if (normalized === beforeUnloadGuardModes.OFF || normalized === beforeUnloadGuardModes.ALWAYS) {
-        return normalized;
-    }
-    return beforeUnloadGuardModes.SMART;
-}
-
 export const power_user = {
     charListGrid: false,
     counting_tokenizer: tokenizers.BEST_MATCH,
@@ -197,7 +182,6 @@ export const power_user = {
     play_sound_unfocused: true,
     message_complete_notification: false,
     message_complete_notification_detail_mode: messageNotificationDetailModes.CONTENT,
-    before_unload_guard_mode: beforeUnloadGuardModes.SMART,
     auto_save_msg_edits: false,
     confirm_message_delete: true,
 
@@ -218,9 +202,6 @@ export const power_user = {
     bot_mes_blur_tint_color: `${getComputedStyle(document.documentElement).getPropertyValue('--SmartThemeBotMesBlurTintColor').trim()}`,
     shadow_color: `${getComputedStyle(document.documentElement).getPropertyValue('--SmartThemeShadowColor').trim()}`,
     border_color: `${getComputedStyle(document.documentElement).getPropertyValue('--SmartThemeBorderColor').trim()}`,
-
-    custom_css: '',
-    palettes: null,
 
     waifuMode: false,
     movingUI: false,
@@ -421,7 +402,44 @@ Object.defineProperty(power_user, 'tokenizer', {
     },
 });
 
-let themes = [];
+async function patchThemeOnServer(name, patch) {
+    const response = await fetch('/api/themes/patch', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name, patch }),
+    });
+    if (!response.ok) {
+        throw new Error(`Failed to patch theme "${name}" (${response.status})`);
+    }
+    return await response.json();
+}
+
+const themeManager = createThemeManager({
+    patchTheme: patchThemeOnServer,
+    onCustomCssApplied: (cssText) => {
+        const next = String(cssText ?? '');
+        const $textarea = $('#customCSS');
+        if ($textarea.length && $textarea.val() !== next) {
+            $textarea.val(next);
+        }
+        themeManager.applyCustomStyleTag(next);
+        syncIosSystemBarsColor();
+    },
+    onPalettesApplied: (themeName, palettes) => {
+        syncThemePalettes(themeName, palettes);
+        syncThemeChromeColors();
+    },
+    onBuiltinWriteBlocked: (field, themeName) => {
+        console.warn(`Ignored write to "${field}" on read-only built-in theme "${themeName}". Create an editable copy first.`);
+    },
+    onStylesheetLoaded: () => {
+        syncThemeChromeColors();
+        syncIosSystemBarsColor();
+    },
+});
+
+themeManager.installPowerUserProxies(power_user);
+
 let movingUIPresets = [];
 /** @type {ContextSettings[]} */
 export let context_presets = [];
@@ -682,28 +700,17 @@ function syncMobileKeepAliveCheckbox() {
     $('#luker_mobile_keep_alive').prop('checked', checked);
 }
 
-// Web audio and HarmonyOS keep-alive are generation-scoped: while the setting
-// is enabled, a generation in flight enters the mode (web audio builds the
-// oscillator + <audio> + MediaSession; HarmonyOS marks the generation active so
-// the shell holds a continuous task once the app is in the background) and the
-// last one to finish schedules exiting it after a grace window. The grace
-// covers chained generations (orchestrator multi-node runs, agent tool loops)
-// so the mode doesn't tear down between one round and the next.
-//
-// "In flight" comes from the core's exact Generate() count (see
-// isGenerationInFlight) rather than the GENERATION_STARTED / GENERATION_ENDED
-// pair, because that pair is not balanced: recursive tool-call and
-// auto-continue-on-truncated rounds, early returns before the stop button is
-// shown, and a quiet generation overlapping a main one all leave STARTED
-// without a matching ENDED, which pinned the keep-alive on after the last
-// generation ended.
+// Web audio, HarmonyOS, and iOS keep-alive are activity-scoped: while the setting
+// is enabled, any active keepAlive lease in activity-guard enters the mode (web
+// audio builds the oscillator + <audio> + MediaSession; HarmonyOS/iOS mark the
+// generation active so the shell holds a continuous task in the background) and
+// when the last keep-alive lease releases, exiting is scheduled after a grace
+// window so chained rounds do not tear down between steps.
 const SCOPED_KEEP_ALIVE_DEACTIVATE_GRACE_MS = 10000;
 let scopedKeepAliveDeactivateTimer = null;
-// Image generations are not Generate() calls, so they are counted separately.
-let scopedKeepAliveImageGenerationCount = 0;
 
 /**
- * @returns {'audio'|'harmony'|null} the generation-scoped mode enabled on this device
+ * @returns {'audio'|'harmony'|'ios'|null} the generation-scoped mode enabled on this device
  */
 function getScopedKeepAliveMode() {
     const platform = getKeepAlivePlatform();
@@ -713,8 +720,8 @@ function getScopedKeepAliveMode() {
     return null;
 }
 
-function scopedKeepAliveShouldHold() {
-    return isGenerationInFlight() || scopedKeepAliveImageGenerationCount > 0;
+export function scopedKeepAliveShouldHold() {
+    return hasKeepAliveHold();
 }
 
 function scopedKeepAliveActivationSync() {
@@ -749,21 +756,6 @@ function scopedKeepAliveActivationSync() {
             }
         }, SCOPED_KEEP_ALIVE_DEACTIVATE_GRACE_MS);
     }
-}
-
-// Image generation is covered so keep-alive holds any image request in flight
-// even when no LLM generation is active (e.g. wand button image generation
-// while reading a long reply).
-function onScopedKeepAliveImageGenerationStarted() {
-    scopedKeepAliveImageGenerationCount += 1;
-    scopedKeepAliveActivationSync();
-    syncPipReopenBanner();
-}
-
-function onScopedKeepAliveImageGenerationEnded() {
-    scopedKeepAliveImageGenerationCount = Math.max(0, scopedKeepAliveImageGenerationCount - 1);
-    scopedKeepAliveActivationSync();
-    syncPipReopenBanner();
 }
 
 function cancelScopedKeepAliveDeactivateTimer() {
@@ -884,10 +876,15 @@ function ensurePipReopenBanner() {
     return pipReopenBanner;
 }
 
-function syncPipReopenBanner() {
-    // Quiet generations run for internal requests and never surface in the
-    // PiP window, so they do not prompt the user to restore it.
-    const visibleGeneration = getPipViewStatus() === 'generating' || scopedKeepAliveImageGenerationCount > 0;
+export function syncPipReopenBanner() {
+    // Quiet generations and ambient request-baseline calls run silently and
+    // never surface in the PiP window, while explicit non-core long tasks
+    // still prompt the user to restore it.
+    const visibleGeneration = getPipViewStatus() === 'generating'
+        || hasKeepAliveHold({
+            excludeAmbient: true,
+            excludeSources: ['core:generation', 'core:generation-quiet', 'core:group-generation'],
+        });
     const shouldShow = getKeepAlivePlatform() === 'web'
         && !!power_user.luker_mobile_keep_alive_web_pip_enabled
         && visibleGeneration
@@ -911,12 +908,12 @@ function syncPipViewCharacter() {
 
 let pipGenerationStopped = false;
 
-// The single in-flight listener owned by keep-alive: the generation-scoped
-// modes follow the exact Generate() count, the PiP window closes out its last
-// status here, and the restore button follows both.
-function onGenerationInFlightChanged() {
+// The single listener owned by keep-alive: the generation-scoped modes follow
+// activity-guard leases, the PiP window closes out its reply status when core
+// generation finishes, and the restore button tracks both.
+function onActivityGuardChanged() {
     scopedKeepAliveActivationSync();
-    if (!isGenerationInFlight() && !pipGenerationStopped && getPipViewStatus() === 'generating') {
+    if (!hasActiveSource('core:generation') && !hasActiveSource('core:group-generation') && !pipGenerationStopped && getPipViewStatus() === 'generating') {
         updatePipView({ status: 'done' });
     }
     syncPipReopenBanner();
@@ -931,7 +928,7 @@ function initPipViewFeed() {
         updatePipView({ status: 'idle', text: '' });
         syncPipReopenBanner();
     });
-    eventSource.on(event_types.GENERATION_STARTED, (type, _params, dryRun) => {
+    eventSource.on(event_types.GENERATION_AFTER_COMMANDS, (type, _params, dryRun) => {
         if (dryRun || type === 'quiet') return;
         pipGenerationStopped = false;
         syncPipViewCharacter();
@@ -963,7 +960,7 @@ function initPipViewFeed() {
     });
 }
 
-function syncMobileKeepAliveUi() {
+export function syncMobileKeepAliveUi() {
     // isMobile() gates the entire subsystem, not just UI visibility. The
     // audio-mode setting persists in settings.json across devices; if a user
     // enables it on their phone and then loads the same account on a desktop
@@ -981,9 +978,7 @@ function syncMobileKeepAliveUi() {
     if (!syncMobileKeepAliveUi._initialized) {
         initKeepAlive();
         setPipPrimingEnabled(!!power_user.luker_mobile_keep_alive_web_pip_enabled);
-        setGenerationInFlightListener(onGenerationInFlightChanged);
-        eventSource.on(event_types.IMAGE_GENERATION_STARTED, onScopedKeepAliveImageGenerationStarted);
-        eventSource.on(event_types.IMAGE_GENERATION_ENDED, onScopedKeepAliveImageGenerationEnded);
+        subscribeActivityGuard(onActivityGuardChanged);
         document.addEventListener('click', reopenPipOnGenerationTap, true);
         document.addEventListener('keydown', reopenPipOnGenerationKey, true);
         document.addEventListener('visibilitychange', () => {
@@ -2190,17 +2185,29 @@ function applyThemeColor(type) {
     }
 }
 
+function syncThemeActionControls() {
+    const builtin = themeManager.isBuiltin(power_user.theme) || themeManager.isActiveThemeBuiltin();
+    $('#ui-preset-update-button')
+        .toggleClass('disabled', builtin)
+        .attr('aria-disabled', String(builtin));
+    $('#ui-preset-delete-button')
+        .toggleClass('disabled', builtin)
+        .attr('aria-disabled', String(builtin));
+    $('#customCSS_builtin_notice').toggleClass('displayNone', !builtin);
+    $('#customCSS')
+        .prop('disabled', builtin)
+        .prop('readonly', builtin);
+    $('.editor_maximize[data-for="customCSS"]').toggleClass('displayNone', builtin);
+}
+
 function applyCustomCSS() {
-    $('#customCSS').val(power_user.custom_css);
-    var styleId = 'custom-style';
-    var style = document.getElementById(styleId);
-    if (!style) {
-        style = document.createElement('style');
-        style.setAttribute('type', 'text/css');
-        style.setAttribute('id', styleId);
-        document.head.appendChild(style);
+    const cssText = power_user.custom_css;
+    const $textarea = $('#customCSS');
+    if ($textarea.length && $textarea.val() !== cssText) {
+        $textarea.val(cssText);
     }
-    style.innerHTML = power_user.custom_css;
+    themeManager.applyCustomStyleTag(cssText);
+    syncThemeActionControls();
     syncIosSystemBarsColor();
 }
 
@@ -2271,12 +2278,15 @@ function showMediaDisplayReloadPrompt() {
     );
 }
 
-function applyTheme(name) {
-    const theme = themes.find(x => x.name == name);
+async function applyTheme(name) {
+    await themeManager.flushPendingPatch();
+    const theme = await themeManager.ensureThemeLoaded(name);
 
     if (!theme) {
         return;
     }
+
+    themeManager.setActiveTheme(theme);
 
     const themeProperties = [
         { key: 'main_text_color', selector: '#main-text-color-picker', type: 'main' },
@@ -2293,12 +2303,6 @@ function applyTheme(name) {
             key: 'blur_strength',
             action: () => {
                 applyBlurStrength();
-            },
-        },
-        {
-            key: 'custom_css',
-            action: () => {
-                applyCustomCSS();
             },
         },
         {
@@ -2484,8 +2488,10 @@ function applyTheme(name) {
         }
     }
 
-    power_user.palettes = normalizeThemePalettes(theme.palettes);
-    syncThemePalettes(theme.name, power_user.palettes);
+    await themeManager.mountBuiltinStylesheet(theme.builtin ? theme.builtin_stylesheet : '');
+    applyCustomCSS();
+    syncThemePalettes(theme.name, normalizeThemePalettes(theme.palettes));
+    syncThemeChromeColors();
 
     console.log('theme applied: ' + name);
 }
@@ -2547,6 +2553,8 @@ export function applyPowerUserSettings() {
     applyAvatarStyle();
     applyBlurStrength();
     applyShadowWidth();
+    const activeTheme = themeManager.getActiveTheme();
+    void themeManager.mountBuiltinStylesheet(activeTheme?.builtin ? activeTheme.builtin_stylesheet : '');
     applyCustomCSS();
     syncThemePalettes(power_user.theme, power_user.palettes);
     syncThemeChromeColors();
@@ -2660,10 +2668,12 @@ export async function loadPowerUserSettings(settings, data) {
             }
             delete settings.power_user.tokenizer;
         }
-        Object.assign(power_user, settings.power_user);
+        const powerUserSnapshot = { ...settings.power_user };
+        delete powerUserSnapshot.custom_css;
+        delete powerUserSnapshot.palettes;
+        Object.assign(power_user, powerUserSnapshot);
     }
     power_user.message_complete_notification_detail_mode = normalizeMessageNotificationDetailMode(power_user.message_complete_notification_detail_mode);
-    power_user.before_unload_guard_mode = normalizeBeforeUnloadGuardMode(power_user.before_unload_guard_mode);
 
     if (power_user.stscript === undefined) {
         power_user.stscript = defaultStscript;
@@ -2700,8 +2710,13 @@ export async function loadPowerUserSettings(settings, data) {
         delete power_user.stscript.autocomplete_style;
     }
 
-    if (data.themes !== undefined) {
-        themes = data.themes;
+    themeManager.hydrateFromSettingsData(data);
+    const activeTheme = power_user.theme
+        ? await themeManager.ensureThemeLoaded(power_user.theme)
+        : null;
+    themeManager.setActiveTheme(activeTheme);
+    if (activeTheme?.builtin && activeTheme.builtin_stylesheet) {
+        await themeManager.mountBuiltinStylesheet(activeTheme.builtin_stylesheet);
     }
 
     if (data.movingUIPresets !== undefined) {
@@ -2727,7 +2742,6 @@ export async function loadPowerUserSettings(settings, data) {
 
     power_user.counting_tokenizer = normalizePowerUserTokenizer(power_user.counting_tokenizer);
     power_user.encoding_tokenizer = normalizePowerUserTokenizer(power_user.encoding_tokenizer);
-    power_user.palettes = normalizeThemePalettes(power_user.palettes);
 
     // Clean up old/legacy settings
     if (power_user.import_card_tags !== undefined) {
@@ -2793,7 +2807,6 @@ export async function loadPowerUserSettings(settings, data) {
     $(`#encoding_tokenizer option[value="${power_user.encoding_tokenizer}"]`).prop('selected', true);
     $(`#send_on_enter option[value=${power_user.send_on_enter}]`).prop('selected', true);
     $('#confirm_message_delete').prop('checked', power_user.confirm_message_delete !== undefined ? !!power_user.confirm_message_delete : true);
-    $('#before_unload_guard_mode').val(power_user.before_unload_guard_mode);
     $('#spoiler_free_mode').prop('checked', power_user.spoiler_free_mode);
     $('#collapse-newlines-checkbox').prop('checked', power_user.collapse_newlines);
     $('#always-force-name2-checkbox').prop('checked', power_user.always_force_name2);
@@ -2904,13 +2917,7 @@ export async function loadPowerUserSettings(settings, data) {
     $('#media_display').val(power_user.media_display);
     $('#image_overswipe').val(power_user.image_overswipe);
 
-    for (const theme of themes) {
-        const option = document.createElement('option');
-        option.value = theme.name;
-        option.innerText = theme.name;
-        option.selected = theme.name == power_user.theme;
-        $('#themes').append(option);
-    }
+    renderThemeSelectOptions(power_user.theme);
 
     for (const movingUIPreset of movingUIPresets) {
         const option = document.createElement('option');
@@ -3505,19 +3512,68 @@ export function sortEntitiesList(entities, forceSearch, filterHelper = null) {
     });
 }
 
+function renderThemeSelectOptions(selectedName = power_user.theme) {
+    const $select = $('#themes');
+    if (!$select.length) {
+        return;
+    }
+    $select.empty();
+    for (const theme of themeManager.listThemeEntries()) {
+        const option = document.createElement('option');
+        option.value = theme.name;
+        option.innerText = theme.name;
+        option.selected = theme.name === selectedName;
+        $select.append(option);
+    }
+    if (selectedName) {
+        $select.val(selectedName);
+    }
+    syncThemeActionControls();
+}
+
+async function persistThemeDocToServer(name, theme) {
+    const response = await fetch('/api/themes/save', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(theme),
+    });
+
+    if (!response.ok) {
+        if (response.status === 403) {
+            toastr.warning(t`Built-in themes are read-only. Create an editable copy to save changes.`);
+            throw new Error('Built-in themes are read-only.');
+        }
+        toastr.error(t`Check the server connection and reload the page to prevent data loss.`, t`Theme could not be saved`);
+        console.error('Theme could not be saved', response);
+        throw new Error('Theme could not be saved');
+    }
+
+    return themeManager.registerSavedTheme(theme) ?? theme;
+}
+
 /**
  * Updates the current UI theme file.
  */
 async function updateTheme() {
+    if (themeManager.isBuiltin(power_user.theme) || themeManager.isActiveThemeBuiltin()) {
+        toastr.info(t`Built-in themes are read-only. Create an editable copy to save changes.`);
+        return;
+    }
+    await themeManager.flushPendingPatch();
     await saveTheme(power_user.theme);
-    toastr.success('Theme saved.');
+    toastr.success(t`Theme saved.`);
 }
 
 async function deleteTheme() {
     const themeName = power_user.theme;
 
     if (!themeName) {
-        toastr.info('No theme selected.');
+        toastr.info(t`No theme selected.`);
+        return;
+    }
+
+    if (themeManager.isBuiltin(themeName) || themeManager.isActiveThemeBuiltin()) {
+        toastr.info(t`Built-in themes cannot be deleted.`);
         return;
     }
 
@@ -3528,6 +3584,8 @@ async function deleteTheme() {
         return;
     }
 
+    await themeManager.flushPendingPatch();
+
     const response = await fetch('/api/themes/delete', {
         method: 'POST',
         headers: getRequestHeaders(),
@@ -3535,29 +3593,104 @@ async function deleteTheme() {
     });
 
     if (!response.ok) {
-        toastr.error('Failed to delete theme. Check the console for more information.');
+        toastr.error(t`Failed to delete theme. Check the console for more information.`);
         return;
     }
 
-    const themeIndex = themes.findIndex(x => x.name == themeName);
-
-    if (themeIndex !== -1) {
-        themes.splice(themeIndex, 1);
-        $(`#themes option[value="${themeName}"]`).remove();
-        power_user.theme = themes[0]?.name;
-        saveSettingsDebounced();
-        if (power_user.theme) {
-            applyTheme(power_user.theme);
-        }
-        toastr.success('Theme deleted.');
+    themeManager.removeDeletedTheme(themeName);
+    const remainingNames = themeManager.listThemeNames();
+    power_user.theme = remainingNames[0] || '';
+    renderThemeSelectOptions(power_user.theme);
+    saveSettingsDebounced();
+    if (power_user.theme) {
+        await applyTheme(power_user.theme);
+    } else {
+        await themeManager.mountBuiltinStylesheet('');
+        applyCustomCSS();
+        syncThemePalettes('', null);
+        syncThemeChromeColors();
     }
+    toastr.success(t`Theme deleted.`);
 }
 
 /**
- * Exports the current theme to a file.
+ * Derives a completely independent, self-contained copy of a theme (works for
+ * both built-in and external/user themes) and switches to the derived theme.
+ */
+async function deriveTheme({ sourceName = power_user.theme, promptForName = true, focusCustomCss = false, suffix = 'Copy' } = {}) {
+    await themeManager.flushPendingPatch();
+    const resolvedSourceName = typeof sourceName === 'string' ? sourceName : '';
+    const sourceTheme = resolvedSourceName ? await themeManager.ensureThemeLoaded(resolvedSourceName) : null;
+    const defaultName = themeManager.suggestDerivedThemeName(resolvedSourceName || 'Theme', suffix);
+
+    let targetName = defaultName;
+    if (promptForName) {
+        const entered = await callGenericPopup(t`Enter a theme preset name:`, POPUP_TYPE.INPUT, defaultName);
+        if (!entered) {
+            return null;
+        }
+        targetName = await getSanitizedFilename(String(entered));
+        if (!targetName) {
+            return null;
+        }
+    } else {
+        targetName = await getSanitizedFilename(defaultName);
+    }
+
+    if (themeManager.isBuiltin(targetName)) {
+        toastr.warning(t`Built-in theme names are reserved. Please choose another name.`);
+        return null;
+    }
+
+    const baseFields = getThemeObject(targetName);
+    const standaloneTheme = await themeManager.buildIndependentThemeSnapshot({
+        name: targetName,
+        baseFields,
+        sourceTheme,
+    });
+
+    await persistThemeDocToServer(targetName, standaloneTheme);
+    power_user.theme = targetName;
+    renderThemeSelectOptions(targetName);
+    await applyTheme(targetName);
+    saveSettingsDebounced();
+
+    if (focusCustomCss) {
+        const $textarea = $('#customCSS');
+        if ($textarea.length) {
+            $textarea.trigger('focus');
+        }
+    }
+
+    toastr.success(t`Created editable copy "${targetName}".`);
+    return standaloneTheme;
+}
+
+/**
+ * Exports the current theme to a standalone file.
  */
 async function exportTheme() {
-    const themeFile = await saveTheme(power_user.theme);
+    await themeManager.flushPendingPatch();
+    const currentName = power_user.theme;
+    if (!currentName) {
+        toastr.info(t`No theme selected.`);
+        return;
+    }
+
+    let themeFile;
+    if (themeManager.isBuiltin(currentName) || themeManager.isActiveThemeBuiltin()) {
+        const sourceTheme = await themeManager.ensureThemeLoaded(currentName);
+        themeFile = await themeManager.buildIndependentThemeSnapshot({
+            name: currentName,
+            baseFields: getThemeObject(currentName),
+            sourceTheme,
+        });
+    } else {
+        themeFile = await saveTheme(currentName);
+    }
+    if (!themeFile) {
+        return;
+    }
     const fileName = `${themeFile.name}.json`;
     download(JSON.stringify(themeFile, null, 4), fileName, 'application/json');
 }
@@ -3579,7 +3712,11 @@ async function importTheme(file) {
         throw new Error('Missing name');
     }
 
-    if (themes.some(t => t.name === parsed.name)) {
+    if (themeManager.isBuiltin(parsed.name)) {
+        throw new Error(t`Built-in theme names are reserved. Please choose another name.`);
+    }
+
+    if (themeManager.hasTheme(parsed.name)) {
         throw new Error('Theme with that name already exists');
     }
 
@@ -3592,68 +3729,39 @@ async function importTheme(file) {
     }
 
     const newTheme = getNewTheme(parsed);
-    themes.push(newTheme);
-    await saveTheme(parsed.name, newTheme);
-    const option = document.createElement('option');
-    option.selected = false;
-    option.value = parsed.name;
-    option.innerText = parsed.name;
-    $('#themes').append(option);
-    saveSettingsDebounced();
-    toastr.success(parsed.name, 'Theme imported');
+    await persistThemeDocToServer(parsed.name, newTheme);
+    renderThemeSelectOptions(power_user.theme);
+    toastr.success(parsed.name, t`Theme imported`);
 }
 
 /**
  * Saves the current theme to the server.
- * @param {string|undefined} name Theme name. If undefined, a popup will be shown to enter a name.
+ * @param {string|undefined} name Theme name. If undefined, derives/prompts for a new name.
  * @param {object|undefined} theme Theme object. If undefined, the current theme will be saved.
- * @returns {Promise<object>} A promise that resolves when the theme is saved.
+ * @returns {Promise<object|null>} A promise that resolves when the theme is saved.
  */
 async function saveTheme(name = undefined, theme = undefined) {
     if (typeof name !== 'string') {
-        const newName = await callGenericPopup('Enter a theme preset name:', POPUP_TYPE.INPUT, power_user.theme);
-
-        if (!newName) {
-            return;
-        }
-
-        name = await getSanitizedFilename(String(newName));
+        return await deriveTheme({ promptForName: true, suffix: 'Copy' });
     }
 
-    if (typeof theme !== 'object') {
+    if (themeManager.isBuiltin(name)) {
+        toastr.warning(t`Built-in themes are read-only. Create an editable copy to save changes.`);
+        return null;
+    }
+
+    await themeManager.flushPendingPatch();
+
+    if (typeof theme !== 'object' || theme === null) {
         theme = getThemeObject(name);
     }
 
-    const response = await fetch('/api/themes/save', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify(theme),
-    });
-
-    if (!response.ok) {
-        toastr.error('Check the server connection and reload the page to prevent data loss.', 'Theme could not be saved');
-        console.error('Theme could not be saved', response);
-        throw new Error('Theme could not be saved');
-    }
-
-    const themeIndex = themes.findIndex(x => x.name == name);
-
-    if (themeIndex == -1) {
-        themes.push(theme);
-        const option = document.createElement('option');
-        option.selected = true;
-        option.value = name;
-        option.innerText = name;
-        $('#themes').append(option);
-    } else {
-        themes[themeIndex] = theme;
-        $(`#themes option[value="${name}"]`).prop('selected', true);
-    }
-
+    const saved = await persistThemeDocToServer(name, theme);
     power_user.theme = name;
+    renderThemeSelectOptions(name);
     saveSettingsDebounced();
 
-    return theme;
+    return saved;
 }
 
 /**
@@ -3713,6 +3821,7 @@ export function getThemeObject(name) {
  */
 function getNewTheme(parsed) {
     const theme = getThemeObject(parsed.name);
+    theme.custom_css = '';
     theme.palettes = undefined;
     for (const key in parsed) {
         if (Object.hasOwn(theme, key)) {
@@ -3885,7 +3994,7 @@ function findTagIdByName(name) {
     }
 }
 
-async function doRandomChat(_, tagName) {
+export async function doRandomChat(_, tagName) {
     /**
      * Gets the ID of a random character.
      * @returns {string} The order index of the randomly selected character.
@@ -3908,17 +4017,16 @@ async function doRandomChat(_, tagName) {
         return randomIndex.toString();
     }
 
-    resetSelectedGroup();
     const characterId = getRandomCharacterId();
-    if (!characterId) {
+    if (!characterId || characters[characterId] === undefined) {
         toastr.error('No characters found');
         return;
     }
-    setCharacterId(characterId);
+    if (!await selectCharacterById(characterId)) {
+        return '';
+    }
     setActiveCharacter(characters[characterId]?.avatar);
     setActiveGroup(null);
-    await delay(1);
-    await reloadCurrentChat();
     return characters[characterId]?.name;
 }
 
@@ -4051,8 +4159,13 @@ async function setAvgBG(args) {
     const bgName = deriveBackgroundName(bgUrl);
     const themeName = nameOverride || `bgcol - ${bgName}`;
 
+    if (themeManager.isBuiltin(themeName)) {
+        toastr.warning(t`Built-in theme names are reserved. Please choose another name.`);
+        return '';
+    }
+
     // Check if a theme with the same name already exists
-    if (themes.some(t => t.name === themeName) && !force) {
+    if (themeManager.hasTheme(themeName) && !force) {
         toastr.warning('Pass "force=true" to overwrite.', `A theme named "${themeName}" already exists.`);
         return '';
     }
@@ -4078,7 +4191,7 @@ async function setAvgBG(args) {
 
     // Save as a new theme
     await saveTheme(themeName, theme);
-    applyTheme(themeName);
+    await applyTheme(themeName);
 
     toastr.success(`Theme "${themeName}" generated and applied.`);
     return '';
@@ -4092,7 +4205,7 @@ async function setThemeCallback(_, themeName) {
     }
 
     // @ts-ignore
-    const fuse = new Fuse(themes, {
+    const fuse = new Fuse(themeManager.listThemeEntries(), {
         keys: [
             { name: 'name', weight: 1 },
         ],
@@ -4108,7 +4221,7 @@ async function setThemeCallback(_, themeName) {
     }
 
     power_user.theme = theme.name;
-    applyTheme(theme.name);
+    await applyTheme(theme.name);
     $('#themes').val(theme.name);
     saveSettingsDebounced();
     return '';
@@ -4501,9 +4614,18 @@ jQuery(() => {
     });
 
     $('#customCSS').on('input', () => {
+        if (themeManager.isBuiltin(power_user.theme) || themeManager.isActiveThemeBuiltin()) {
+            return;
+        }
         power_user.custom_css = String($('#customCSS').val());
-        saveSettingsDebounced();
-        applyCustomCSS();
+    });
+
+    $('#ui_preset_derive_button').on('click', () => {
+        void deriveTheme({ promptForName: false, focusCustomCss: true, suffix: 'Custom' });
+    });
+
+    window.addEventListener('pagehide', () => {
+        void themeManager.flushPendingPatch();
     });
 
     $('#movingUImode').on('change', function () {
@@ -4663,10 +4785,10 @@ jQuery(() => {
         saveSettingsDebounced();
     });
 
-    $('#themes').on('change', function () {
+    $('#themes').on('change', async function () {
         const themeSelected = String($(this).find(':selected').val());
         power_user.theme = themeSelected;
-        applyTheme(themeSelected);
+        await applyTheme(themeSelected);
         saveSettingsDebounced();
     });
 
@@ -4678,9 +4800,9 @@ jQuery(() => {
         saveSettingsDebounced();
     });
 
-    $('#ui-preset-save-button').on('click', () => saveTheme());
-    $('#ui-preset-update-button').on('click', () => updateTheme());
-    $('#ui-preset-delete-button').on('click', () => deleteTheme());
+    $('#ui-preset-save-button').on('click', () => void deriveTheme({ promptForName: true, suffix: 'Copy' }));
+    $('#ui-preset-update-button').on('click', () => void updateTheme());
+    $('#ui-preset-delete-button').on('click', () => void deleteTheme());
     $('#movingui-preset-save-button').on('click', saveMovingUI);
 
     $('#never_resize_avatars').on('input', function () {
@@ -4887,12 +5009,6 @@ jQuery(() => {
 
     $('#confirm_message_delete').on('input', function () {
         power_user.confirm_message_delete = !!$(this).prop('checked');
-        saveSettingsDebounced();
-    });
-
-    $('#before_unload_guard_mode').on('input', function () {
-        power_user.before_unload_guard_mode = normalizeBeforeUnloadGuardMode(String($(this).val()));
-        $(this).val(power_user.before_unload_guard_mode);
         saveSettingsDebounced();
     });
 
@@ -5535,7 +5651,7 @@ jQuery(() => {
             SlashCommandArgument.fromProps({
                 description: 'theme name',
                 typeList: [ARGUMENT_TYPE.STRING],
-                enumProvider: () => themes.map(theme => new SlashCommandEnumValue(theme.name)),
+                enumProvider: () => themeManager.listThemeNames().map(name => new SlashCommandEnumValue(name)),
             }),
         ],
         helpString: `

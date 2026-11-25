@@ -8,23 +8,26 @@
 
 import { i18n, i18nFormat } from '../i18n.js';
 import { h, put, clear, formatTokens, relativeTime, copyText } from '../../lens-shared/util.js';
+import { confirmDialog } from '../../lens-shared/ui.js';
 import { icon } from '../icons.js';
 import { button, iconButton, checkRow, msgActions } from '../ui/components.js';
 import { renderMarkdown } from '../ui/markdown.js';
 import { runAsk, readsSummary, buildAskHistory } from '../model/ask.js';
 import { finishOverview } from '../model/requests.js';
-import { titleFrom } from '../model/sessions.js';
+import { titleFrom, toSessionSummary } from '../model/sessions.js';
+import { withActivityLease } from '../../activity-guard.js';
 
 const CHIP_KEYS = [
     'Why was this reply written this way',
     'Why did that error happen',
+    'Why did world book or variables not work',
     'Which extension uses the most tokens',
-    'What was in the prompt sent to the model this time',
     'Write a bug report for me with the debug info',
 ];
 
 const WS_NAME_KEYS = {
-    memory: 'Memory graph',
+    memory: 'Memory graph config',
+    memory_graph: 'Memory graph content',
     orch: 'Orchestration',
     sd: 'Image Generation',
     preset: 'Preset',
@@ -77,6 +80,7 @@ export function createAskPage(app) {
     let refreshVersion = 0;
     const activeRuns = new Map();
     let sideOpen = false;
+    let deleting = false;
     let counts = null;
 
     function validChatTarget(t) {
@@ -177,6 +181,12 @@ export function createAskPage(app) {
             }
         }
 
+        const varKeysCount = Number(snap?.variables?.count || 0);
+        const regexExtensionDisabled = Boolean(snap?.regex?.disabled);
+        const regexEnabledCount = snap?.regex && snap.regex.enabledCount !== undefined
+            ? snap.regex.enabledCount
+            : null;
+
         put(side,
             h('div', { class: 'wb-src-head' },
                 h('div', { class: 'wb-src-title', text: i18n('What Ask can see') }),
@@ -197,6 +207,13 @@ export function createAskPage(app) {
                 item(i18n('Character card'), snap?.card?.name || i18n('None selected'), 'content'),
                 item(i18n('World book'), snap?.card?.books?.length ? i18nFormat('${0} book(s)', snap.card.books.length) : '—', 'content'),
                 item(i18n('Preset'), snap?.preset?.name || '—', 'content'),
+                item(i18n('Variables'), varKeysCount > 0 ? i18nFormat('${0} keys', varKeysCount) : '—', 'content'),
+                item(
+                    i18n('Regex scripts'),
+                    regexExtensionDisabled ? i18n('Off') : (regexEnabledCount == null ? '—' : i18nFormat('${0} enabled scripts', regexEnabledCount)),
+                    'content',
+                    regexExtensionDisabled ? 'off' : 'ok',
+                ),
                 item(i18n('Connection profile'), snap?.connection || '—', 'content'),
                 h('div', { class: 'wb-src-group', text: i18n('Installed extensions') }),
                 providerItems,
@@ -232,6 +249,11 @@ export function createAskPage(app) {
             h('span', { class: 'wb-note wb-chat-tag', text: i18n('Read-only — nothing gets changed') }),
             h('span', { class: 'wb-spacer' }),
             recent.length ? historyMenu(recent) : null,
+            session?.id && store ? iconButton('trash', i18n('Delete conversation'), () => { void deleteCurrentSession(); }, {
+                className: 'wb-chat-del',
+                size: 15,
+                disabled: deleting,
+            }) : null,
             button(i18n('New conversation'), () => {
                 selectionVersion++;
                 session = null;
@@ -239,6 +261,41 @@ export function createAskPage(app) {
                 paintBody();
                 input.focus({ preventScroll: true });
             }, { iconName: 'plus', className: 'is-ghost wb-chat-new', title: i18n('New conversation') }));
+    }
+
+    async function deleteCurrentSession() {
+        const target = session;
+        if (!store || !target?.id || deleting) return;
+        const confirmed = await confirmDialog(app.layer || el, {
+            title: i18n('Delete conversation'),
+            message: i18nFormat('Delete "${0}"? This cannot be undone.', target.title || i18n('New conversation')),
+            okLabel: i18n('Delete'),
+            danger: true,
+        });
+        if (!confirmed) return;
+
+        const id = target.id;
+        const sOpts = scopeOf(target);
+        deleting = true;
+        paintHead();
+        try {
+            activeRunForSession(id)?.abort?.abort();
+            await store.remove(id, sOpts);
+            sessionScopes.delete(id);
+            recentSessions = recentSessions.filter(s => s.id !== id);
+            if (session?.id === id) {
+                selectionVersion++;
+                session = null;
+            }
+            paintHead();
+            paintBody();
+            app.toast(i18n('Conversation deleted'));
+        } catch (err) {
+            app.toast(String(err?.message || err), { error: true });
+        } finally {
+            deleting = false;
+            paintHead();
+        }
     }
 
     function historyMenu(recent) {
@@ -256,7 +313,7 @@ export function createAskPage(app) {
                 return;
             }
             const cached = recentSessions.find(s => s.id === pickedId) || null;
-            if (cached) {
+            if (cached && Array.isArray(cached.turns)) {
                 session = cached;
                 paintBody();
             }
@@ -264,7 +321,8 @@ export function createAskPage(app) {
             try {
                 const loaded = await store.get(pickedId, sessionScopes.get(pickedId) || currentScope());
                 if (version !== selectionVersion) return;
-                session = loaded || cached;
+                session = loaded || (Array.isArray(cached?.turns) ? cached : null);
+                paintHead();
                 paintBody();
             } catch (err) {
                 if (version === selectionVersion) app.toast(String(err?.message || err), { error: true });
@@ -377,10 +435,37 @@ export function createAskPage(app) {
             } },
         ]);
         const askSources = app.settings().ask?.sources || {};
+        const reqIds = Array.isArray(t.requestIds) ? [...new Set(t.requestIds.map(String).filter(Boolean))] : [];
+        const openReq = async (reqId) => {
+            if (typeof app.source.openRequestInspector === 'function') {
+                try {
+                    await app.source.openRequestInspector(reqId);
+                    return;
+                } catch { /* 回退到复制 ID */ }
+            }
+            copyText(reqId);
+            app.toast(i18n('Request ID copied'));
+        };
+        const snap = app.snapshot?.();
+        const hasOpenChat = Boolean(snap?.chat?.chatId || snap?.chat?.label);
+        const registeredTargets = app.iterateTargets?.() || [];
+        const canJumpSuggest = Boolean(
+            t.suggest
+            && wsName(t.suggest)
+            && (t.suggest !== 'memory_graph' || hasOpenChat)
+            && (!registeredTargets.length || registeredTargets.some(target => target?.id === t.suggest)),
+        );
         return h('div', { class: 'wb-msg-ai' },
             reads ? h('div', { class: 'wb-reads' }, icon('eye', { size: 12 }), h('span', { text: i18nFormat('Read ${0}', reads) })) : null,
             t.error ? h('div', { class: 'wb-msg-error', text: t.error }) : renderMarkdown(t.answer),
-            t.suggest && wsName(t.suggest) ? h('div', { class: 'wb-ans-acts' },
+            reqIds.length ? h('div', { class: 'wb-req-links' },
+                reqIds.map(id => h('button', {
+                    type: 'button',
+                    class: 'wb-req-link',
+                    title: i18nFormat('Inspect request ${0}', id),
+                    onClick: () => void openReq(id),
+                }, icon('eye', { size: 11 }), h('span', { text: id.length > 18 ? `${id.slice(0, 16)}…` : id })))) : null,
+            canJumpSuggest ? h('div', { class: 'wb-ans-acts' },
                 button(i18nFormat('Go edit ${0}', wsName(t.suggest)), () => app.go('ai', { ws: t.suggest, draft: t.fixPrompt || '', from: t.answer }), { iconName: 'spark' })) : null,
             t.sent ? h('details', { class: 'wb-sent' },
                 h('summary', null, icon('up', { size: 12 }), h('span', { text: i18nFormat('Sent to the AI (about ${0} tokens)', formatTokens(Math.round(t.sent / 1.6))) })),
@@ -445,9 +530,10 @@ export function createAskPage(app) {
                 if (updated) {
                     if (session?.id === ownerId) session = updated;
                     if (scopeKey(ownerScope) === activeScopeKey) {
+                        const summary = toSessionSummary(updated);
                         const idx = recentSessions.findIndex(r => r.id === ownerId);
-                        if (idx >= 0) recentSessions[idx] = updated;
-                        else recentSessions = [updated, ...recentSessions];
+                        if (idx >= 0) recentSessions[idx] = summary;
+                        else recentSessions = [summary, ...recentSessions];
                     }
                 }
                 return updated;
@@ -469,10 +555,15 @@ export function createAskPage(app) {
                 paintBody();
             }
 
-            const history = buildAskHistory(priorTurns, 6);
+            const history = buildAskHistory(priorTurns, 10);
             let turn;
             try {
-                const result = await runAsk({
+                const result = await withActivityLease({
+                    source: 'workbench:ask',
+                    label: i18n('Workbench AI ask'),
+                    scope: 'global',
+                    onCancel: () => controller.abort(),
+                }, () => runAsk({
                     question,
                     overview,
                     history,
@@ -485,7 +576,7 @@ export function createAskPage(app) {
                         run.steps.push(step);
                         if (session?.id === ownerId) paintBody();
                     },
-                });
+                }));
                 turn = { role: 'ai', ...result, at: Date.now() };
             } catch (err) {
                 turn = {
@@ -515,7 +606,9 @@ export function createAskPage(app) {
         }
     }
 
-    async function syncScopeChange() {
+    const isVisible = () => Boolean(el.isConnected && app.isOpen?.() !== false);
+
+    async function syncScopeChange({ fetchRecent = true } = {}) {
         const nextScope = currentScope();
         const nextKey = scopeKey(nextScope);
         if (nextKey === activeScopeKey) return;
@@ -523,9 +616,10 @@ export function createAskPage(app) {
         if (session && scopeKey(scopeOf(session)) !== nextKey) {
             selectionVersion++;
             session = null;
-            paintBody();
+            if (fetchRecent) paintBody();
         }
         recentSessions = [];
+        if (!fetchRecent) return;
         paintHead();
         await refreshRecent();
         if (activeScopeKey === nextKey) paintHead();
@@ -547,8 +641,12 @@ export function createAskPage(app) {
             requestAnimationFrame(() => input.focus({ preventScroll: true }));
         },
         onSnapshot() {
+            if (!isVisible()) {
+                void syncScopeChange({ fetchRecent: false });
+                return;
+            }
             paintSide();
-            void syncScopeChange();
+            void syncScopeChange({ fetchRecent: true });
         },
         onEscape() {
             if (sideOpen) { sideOpen = false; paintSide(); return true; }

@@ -1,25 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Settings page: 4 lifecycle-aligned sections (Extraction Cadence & Floor
+// Settings page: 5 lifecycle-aligned sections (Extraction Cadence & Floor
 // Hiding with 2x3 preset grid + live animated visualizer + Custom modal,
-// Prompt Injection & Recall, Graph Operations & Data, collapsed Technical
-// Tuning & Custom Prompts) plus value-diff dirty tracking and error surfacing.
+// Extraction Mode & Crawl, Prompt Injection & Recall, Graph Operations & Data,
+// collapsed Technical Tuning & Custom Prompts) plus value-diff dirty tracking
+// and error surfacing.
 
 import { h, clear, put } from '../../../../lens-shared/util.js';
+import { createBehaviorSummary } from '../../../../lens-shared/behavior-summary.js';
 import { CONFIG_FIELDS } from '../../config-iteration/fields.js';
+import { resolveStartSeqFromFloor } from '../../primitives.js';
 import { i18n, i18nFormat } from '../i18n.js';
-import { button, checkRow, sectionTitle, switchControl } from '../ui/components.js';
+import { button, checkRow, sectionTitle, segmented, switchControl } from '../ui/components.js';
 import { confirmText, formField, openModal, selectInput } from '../panels/modal.js';
 import {
     CADENCE_PRESETS,
     TECHNICAL_FIELDS,
-    detectVisibilityGap,
-    formatCadenceSummary,
     getDirtyAdvancedKeys,
     matchCadencePreset,
     withMissing,
     withMissingProfiles,
 } from './settings-model.js';
+import {
+    buildMgMasterNoticeModel,
+    buildMgExtractionSectionModel,
+    buildMgCustomCadenceModalModel,
+    buildMgExtractionModeModel,
+    buildMgRecallSectionModel,
+    buildMgTechnicalSectionModel,
+    buildMgManualCompressionModalModel,
+} from './behavior-summary-models.js';
+import { typeDisplayName } from '../schema/schema-model.js';
 import { createCadenceVisualizer } from './cadence-visualizer.js';
 import { importPresetExample, openPresetDerivation, PRESET_EXAMPLES } from '../../../../lens-shared/preset-examples.js';
 
@@ -30,12 +41,16 @@ const CUSTOM_MODAL_KEYS = [
     'extractBatchTurns',
     'extractContextTurns',
     'extractExcludeRecentTurns',
-    'extractMode',
-    'extractCrawlMaxRounds',
-    'extractCrawlCandidateLimit',
-    'extractCrawlMaxReads',
 ];
+const CUSTOM_MODAL_FIELD_SET = new Set(CUSTOM_MODAL_KEYS);
 const clone = (value) => (value == null ? value : JSON.parse(JSON.stringify(value)));
+
+function escapeAttr(value) {
+    const str = String(value);
+    return typeof globalThis.CSS?.escape === 'function'
+        ? globalThis.CSS.escape(str)
+        : str.replace(/["\\]/g, '\\$&');
+}
 
 function clampByField(key, rawValue, fallback) {
     const def = CONFIG_FIELDS[`settings.${key}`];
@@ -46,15 +61,6 @@ function clampByField(key, rawValue, fallback) {
     if (def && Number.isFinite(def.min)) value = Math.max(def.min, value);
     if (def && Number.isFinite(def.max)) value = Math.min(def.max, value);
     return value;
-}
-
-function formatGapWarning(gap) {
-    if (!gap?.hasGap) return '';
-    return i18nFormat(
-        'Visibility gap warning: up to ${0} unextracted turns can be hidden before extraction runs. Keep at least ${1} recent messages visible (or set 0 to disable hiding).',
-        gap.maxUnextracted,
-        gap.minRecommendedVisible,
-    );
 }
 
 /**
@@ -74,12 +80,66 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
     let debugQuery = '';
     let lastError = '';
     let stickyBarEl = null;
-    let cadenceSummaryEl = null;
-    let gapWarningEl = null;
 
     const cadenceVisualizer = createCadenceVisualizer({}, { autoPlay: true });
     const statusEl = h('div', { class: 'ml-settings-status', role: 'status' });
     const errorEl = h('div', { class: 'ml-settings-error', role: 'alert', hidden: true });
+
+    const masterSummary = createBehaviorSummary({
+        id: 'mg-master-notice',
+        ariaLabel: i18n('Memory Graph status summary'),
+        build: () => (view ? buildMgMasterNoticeModel({ enabled: view.values.enabled }) : null) || { tone: 'dormant', rows: [] },
+    });
+    const extractionSummary = createBehaviorSummary({
+        id: 'mg-extraction',
+        ariaLabel: i18n('Extraction cadence and floor hiding summary'),
+        build: () => view && advanced
+            ? buildMgExtractionSectionModel({ values: view.values, advanced, options: view.options })
+            : { tone: 'dormant', rows: [] },
+        resolveField: (fieldKey, scopeEl) => {
+            if (!scopeEl) return [];
+            if (CUSTOM_MODAL_FIELD_SET.has(fieldKey)) {
+                const activeCard = scopeEl.querySelector('.ml-preset-card.is-active');
+                return activeCard ? [activeCard] : [];
+            }
+            return scopeEl.querySelectorAll(`[data-field-key="${escapeAttr(fieldKey)}"]`);
+        },
+        onTokenActivate: (fields) => {
+            const modalField = fields.find(k => CUSTOM_MODAL_FIELD_SET.has(k));
+            if (!modalField) return false;
+            openCustomCadenceModal({ focusField: modalField });
+            return true;
+        },
+    });
+    const extractionModeSummary = createBehaviorSummary({
+        id: 'mg-extraction-mode',
+        ariaLabel: i18n('Extraction mode summary'),
+        build: () => advanced ? buildMgExtractionModeModel({ advanced }) : { tone: 'dormant', rows: [] },
+    });
+    const recallSummary = createBehaviorSummary({
+        id: 'mg-recall',
+        ariaLabel: i18n('Prompt injection and recall summary'),
+        build: () => view && advanced
+            ? buildMgRecallSectionModel({ values: view.values, advanced, options: view.options })
+            : { tone: 'dormant', rows: [] },
+    });
+    const technicalSummary = createBehaviorSummary({
+        id: 'mg-technical',
+        ariaLabel: i18n('Technical tuning summary'),
+        build: () => view && advanced
+            ? buildMgTechnicalSectionModel({ values: view.values, advanced })
+            : { tone: 'dormant', rows: [] },
+    });
+
+    function syncAllSummaries() {
+        if (!view || !advanced) return;
+        masterSummary.el.hidden = Boolean(view.values.enabled);
+        masterSummary.update();
+        extractionSummary.update();
+        extractionModeSummary.update();
+        recallSummary.update();
+        technicalSummary.update();
+    }
 
     const dirtyKeys = () => getDirtyAdvancedKeys(advanced, savedAdvanced);
     const dirtyCount = () => dirtyKeys().length;
@@ -155,6 +215,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
     function setValue(key, value) {
         view.values[key] = source.settings.set(key, value);
         if (REPAINT_KEYS.has(key)) paint();
+        else syncAllSummaries();
     }
 
     const fieldWrap = (key, control) => {
@@ -163,7 +224,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         return node;
     };
 
-    const toggle = (key, label) => fieldWrap(key, switchControl(label, view.values[key], (value) => { setValue(key, value); paint(); }));
+    const toggle = (key, label) => fieldWrap(key, switchControl(label, view.values[key], (value) => { setValue(key, value); if (!REPAINT_KEYS.has(key)) paint(); }));
     const pick = (key, label, options) => fieldWrap(key, formField(label, selectInput(options, view.values[key], (value) => setValue(key, value))));
     const setValue2 = (key, value) => (setValue(key, value), view.values[key]);
     const number = (key, label, min, max) => fieldWrap(key, formField(label, h('input', {
@@ -176,6 +237,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
     function onAdvancedFieldMutated() {
         syncStickyBar();
         notifyDirtyIfChanged();
+        syncAllSummaries();
     }
 
     const advNumber = (key, label, min, max) => fieldWrap(key, formField(label, h('input', {
@@ -220,18 +282,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
     const group = (...children) => h('section', { class: 'ml-aiset-group' }, children);
     const fields = (...children) => h('div', { class: 'ml-aiset-fields' }, children);
 
-    function syncCadenceFeedback() {
-        if (cadenceSummaryEl) {
-            cadenceSummaryEl.textContent = formatCadenceSummary(advanced);
-        }
-        if (gapWarningEl) {
-            const gap = detectVisibilityGap(advanced);
-            const text = formatGapWarning(gap);
-            gapWarningEl.textContent = text;
-            gapWarningEl.hidden = !text;
-        }
-        cadenceVisualizer.setParams(advanced);
-    }
+    let activeModalCleanup = null;
 
     function applyCadencePreset(preset) {
         Object.assign(advanced, preset.values);
@@ -240,17 +291,12 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         notifyDirtyIfChanged();
     }
 
-    function openCustomCadenceModal() {
+    function openCustomCadenceModal({ focusField = '' } = {}) {
+        activeModalCleanup?.();
         const draft = {};
         for (const key of CUSTOM_MODAL_KEYS) {
             draft[key] = advanced[key];
         }
-
-        const modalViz = createCadenceVisualizer(draft, { autoPlay: true });
-        const modalSummaryEl = h('p', { class: 'ml-settings-cadence-summary', text: formatCadenceSummary(draft) });
-        const initialGapText = formatGapWarning(detectVisibilityGap(draft));
-        const modalGapEl = h('div', { class: 'ml-settings-gap-warning', role: 'alert', hidden: !initialGapText, text: initialGapText });
-        const crawlWrap = h('div', { class: 'ml-aiset-fields' });
 
         function resolvedDraftPreview() {
             return {
@@ -262,12 +308,32 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
             };
         }
 
+        const modalViz = createCadenceVisualizer(draft, { autoPlay: true });
+        const modalSummary = createBehaviorSummary({
+            id: 'mg-custom-cadence-modal',
+            ariaLabel: i18n('Custom cadence and floor hiding summary'),
+            build: () => buildMgCustomCadenceModalModel({
+                draft: resolvedDraftPreview(),
+                autoExtractionEnabled: view?.values?.autoExtractionEnabled,
+            }),
+        });
+
+        let modalPulseTimer = 0;
+        let modalCleaned = false;
+        function cleanupModal() {
+            if (modalCleaned) return;
+            modalCleaned = true;
+            clearTimeout(modalPulseTimer);
+            modalPulseTimer = 0;
+            modalSummary.destroy();
+            modalViz.destroy();
+            if (activeModalCleanup === cleanupModal) activeModalCleanup = null;
+        }
+        activeModalCleanup = cleanupModal;
+
         function syncModalPreview() {
             const preview = resolvedDraftPreview();
-            modalSummaryEl.textContent = formatCadenceSummary(preview);
-            const gapText = formatGapWarning(detectVisibilityGap(preview));
-            modalGapEl.textContent = gapText;
-            modalGapEl.hidden = !gapText;
+            modalSummary.update();
             modalViz.setParams(preview);
         }
 
@@ -284,29 +350,8 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
             },
         })));
 
-        function paintCrawlFields() {
-            clear(crawlWrap);
-            const isCrawl = String(draft.extractMode || 'oneshot') === 'crawl';
-            crawlWrap.hidden = !isCrawl;
-            if (!isCrawl) return;
-            put(crawlWrap,
-                modalNumber('extractCrawlMaxRounds', i18n('Crawl max rounds'), CONFIG_FIELDS['settings.extractCrawlMaxRounds'].min, CONFIG_FIELDS['settings.extractCrawlMaxRounds'].max),
-                modalNumber('extractCrawlCandidateLimit', i18n('Crawl candidate limit'), CONFIG_FIELDS['settings.extractCrawlCandidateLimit'].min, CONFIG_FIELDS['settings.extractCrawlCandidateLimit'].max),
-                modalNumber('extractCrawlMaxReads', i18n('Crawl read budget'), CONFIG_FIELDS['settings.extractCrawlMaxReads'].min, CONFIG_FIELDS['settings.extractCrawlMaxReads'].max),
-            );
-        }
-
-        const modeField = fieldWrap('extractMode', formField(i18n('Extraction graph mode'), selectInput([
-            { value: 'oneshot', label: i18n('One-shot (full graph input)') },
-            { value: 'crawl', label: i18n('Crawl (LLM-explored local slice)') },
-        ], String(draft.extractMode || 'oneshot'), (value) => {
-            draft.extractMode = value;
-            paintCrawlFields();
-        })));
-
-        paintCrawlFields();
-
         const content = h('div', { class: 'ml-aiset ml-custom-cadence-modal' },
+            modalSummary.el,
             fields(
                 modalNumber('llmVisibleRecentMessages', i18n('Hide old floors — keep latest N messages visible (0 = off)'), CONFIG_FIELDS['settings.llmVisibleRecentMessages'].min, CONFIG_FIELDS['settings.llmVisibleRecentMessages'].max),
                 modalNumber('updateEvery', i18n('Update every N assistant turns'), CONFIG_FIELDS['settings.updateEvery'].min, undefined),
@@ -314,12 +359,10 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
                 modalNumber('extractContextTurns', i18n('Extract context assistant turns'), CONFIG_FIELDS['settings.extractContextTurns'].min, CONFIG_FIELDS['settings.extractContextTurns'].max),
                 modalNumber('extractExcludeRecentTurns', i18n('Exclude latest N assistant turns from graph extraction'), CONFIG_FIELDS['settings.extractExcludeRecentTurns'].min, undefined),
             ),
-            fields(modeField),
-            crawlWrap,
             modalViz.el,
-            modalSummaryEl,
-            modalGapEl,
         );
+        modalSummary.bindScope(content);
+        modalSummary.update();
 
         const closeModal = openModal(app, {
             title: i18n('Custom Cadence & Floor Hiding'),
@@ -332,11 +375,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
                 advanced.extractBatchTurns = clampByField('extractBatchTurns', draft.extractBatchTurns, advanced.extractBatchTurns);
                 advanced.extractContextTurns = clampByField('extractContextTurns', draft.extractContextTurns, advanced.extractContextTurns);
                 advanced.extractExcludeRecentTurns = clampByField('extractExcludeRecentTurns', draft.extractExcludeRecentTurns, advanced.extractExcludeRecentTurns);
-                advanced.extractMode = String(draft.extractMode || 'oneshot') === 'crawl' ? 'crawl' : 'oneshot';
-                advanced.extractCrawlMaxRounds = clampByField('extractCrawlMaxRounds', draft.extractCrawlMaxRounds, advanced.extractCrawlMaxRounds);
-                advanced.extractCrawlCandidateLimit = clampByField('extractCrawlCandidateLimit', draft.extractCrawlCandidateLimit, advanced.extractCrawlCandidateLimit);
-                advanced.extractCrawlMaxReads = clampByField('extractCrawlMaxReads', draft.extractCrawlMaxReads, advanced.extractCrawlMaxReads);
-                modalViz.destroy();
+                cleanupModal();
                 cadenceVisualizer.setParams(advanced);
                 paint();
                 notifyDirtyIfChanged();
@@ -344,11 +383,33 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
             },
         });
 
-        // Clean up the modal visualizer's interval whenever the modal closes via Cancel/Escape/backdrop.
+        if (focusField) {
+            requestAnimationFrame(() => {
+                const key = String(focusField);
+                const wrap = [...content.querySelectorAll('[data-field-key]')].find(n => n.dataset.fieldKey === key);
+                const input = wrap?.querySelector('input, select, textarea');
+                if (input) {
+                    input.focus?.({ preventScroll: true });
+                    input.select?.();
+                }
+                if (wrap) {
+                    wrap.classList.remove('luker-bsum-field-pulse');
+                    void wrap.offsetWidth;
+                    wrap.classList.add('luker-bsum-field-pulse');
+                    clearTimeout(modalPulseTimer);
+                    modalPulseTimer = setTimeout(() => {
+                        modalPulseTimer = 0;
+                        wrap.classList.remove('luker-bsum-field-pulse');
+                    }, 1200);
+                }
+            });
+        }
+
+        // Clean up the modal visualizer's interval and summary listeners whenever the modal closes via Cancel/Escape/backdrop.
         const observer = typeof MutationObserver === 'function'
             ? new MutationObserver(() => {
                 if (!modalViz.el.isConnected) {
-                    modalViz.destroy();
+                    cleanupModal();
                     observer.disconnect();
                 }
             })
@@ -370,7 +431,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
             : i18n('Manual numbers');
         const customLine2 = isCustomActive
             ? (customVisible <= 0 ? i18n('Keep full history') : i18nFormat('Hide past ${0} msgs', customVisible))
-            : i18n('Context & mode');
+            : i18n('Context & exclusions');
 
         const presetCards = CADENCE_PRESETS.map(preset => h('button', {
             type: 'button',
@@ -394,13 +455,11 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         h('span', { class: 'ml-preset-card-line', text: customLine1 }),
         h('span', { class: 'ml-preset-card-line is-sub', text: customLine2 }));
 
-        cadenceSummaryEl = h('p', { class: 'ml-settings-cadence-summary', text: formatCadenceSummary(advanced) });
-        const gapText = formatGapWarning(detectVisibilityGap(advanced));
-        gapWarningEl = h('div', { class: 'ml-settings-gap-warning', role: 'alert', hidden: !gapText, text: gapText });
         cadenceVisualizer.setParams(advanced);
 
         return h('section', { class: 'ml-aiset-group ml-settings-section', dataset: { settingsSection: 'extraction' } },
             sectionTitle(i18n('Extraction Cadence & Floor Hiding')),
+            extractionSummary.el,
             toggle('autoExtractionEnabled', i18n('Auto extraction')),
             toggle('autoCompressionEnabled', i18n('Auto compression')),
             fields(
@@ -412,12 +471,33 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
                 h('div', { class: 'ml-preset-grid', role: 'group', 'aria-label': i18n('Cadence & floor-hiding presets') },
                     ...presetCards,
                     customCard)),
-            cadenceVisualizer.el,
-            cadenceSummaryEl,
-            gapWarningEl);
+            cadenceVisualizer.el);
     }
 
-    // ---- Section 2: Prompt Injection & Recall ----------------------------
+    // ---- Section 2: Extraction Mode & Crawl ------------------------------
+    function extractionModeSection() {
+        const isCrawl = String(advanced.extractMode || 'oneshot') === 'crawl';
+        const modeField = fieldWrap('extractMode', formField(i18n('Extraction graph mode'), selectInput([
+            { value: 'oneshot', label: i18n('One-shot (full graph input)') },
+            { value: 'crawl', label: i18n('Crawl (LLM-explored local slice)') },
+        ], isCrawl ? 'crawl' : 'oneshot', (value) => {
+            advanced.extractMode = value === 'crawl' ? 'crawl' : 'oneshot';
+            paint();
+            notifyDirtyIfChanged();
+        })));
+
+        return h('section', { class: 'ml-aiset-group ml-settings-section', dataset: { settingsSection: 'extraction-mode' } },
+            sectionTitle(i18n('Extraction Mode & Crawl')),
+            extractionModeSummary.el,
+            fields(modeField),
+            isCrawl ? fields(
+                advNumber('extractCrawlMaxRounds', i18n('Crawl max rounds'), CONFIG_FIELDS['settings.extractCrawlMaxRounds'].min, CONFIG_FIELDS['settings.extractCrawlMaxRounds'].max),
+                advNumber('extractCrawlCandidateLimit', i18n('Crawl candidate limit (0 = unlimited)'), CONFIG_FIELDS['settings.extractCrawlCandidateLimit'].min, CONFIG_FIELDS['settings.extractCrawlCandidateLimit'].max),
+                advNumber('extractCrawlMaxReads', i18n('Crawl read budget'), CONFIG_FIELDS['settings.extractCrawlMaxReads'].min, CONFIG_FIELDS['settings.extractCrawlMaxReads'].max),
+            ) : null);
+    }
+
+    // ---- Section 3: Prompt Injection & Recall ----------------------------
     function recallSection() {
         const { values, options } = view;
         const rag = values.recallMethod === 'rag';
@@ -425,10 +505,10 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         const p = options.positions;
         return h('section', { class: 'ml-aiset-group ml-settings-section', dataset: { settingsSection: 'recall' } },
             sectionTitle(i18n('Prompt Injection & Recall')),
+            recallSummary.el,
             toggle('recallEnabled', i18n('Enable recall injection')),
             h('div', { class: 'ml-settings-subblock' },
                 h('div', { class: 'ml-aiset-label', text: i18n('Persistent Injection') }),
-                h('p', { class: 'ml-settings-note', text: i18n('Types marked Always Visible and events are persistently injected without waiting for recall. Setting a recency horizon moves older entries back to the recall candidate pool.') }),
                 fields(
                     advNumber('persistentInjectionMaxSeqDistance', i18n('Persistent injection recency horizon (assistant turns, 0 = no limit)'), 0))),
             h('div', { class: 'ml-settings-subblock' },
@@ -479,7 +559,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
                     button(i18n('View Last Injection'), () => app.showInjection(), { className: 'ml-btn-ghost' }))));
     }
 
-    // ---- Section 3: Graph Operations & Data ------------------------------
+    // ---- Section 4: Graph Operations & Data ------------------------------
     async function run(task) {
         if (busy) return;
         clearError();
@@ -503,26 +583,128 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
 
     const action = (label, task, options = {}) => button(label, task, { disabled: busy, className: 'ml-btn-ghost', ...options });
 
-    function askRebuildRecent() {
-        const latest = source.ops.latestSeq();
+    function askRebuildRange() {
+        const range = source.ops.rebuildRange();
+        const latest = Number(range?.latestSeq || 0);
         if (latest <= 0) {
             surfaceError(new Error(i18n('No assistant turns available to rebuild.')));
             return;
         }
-        // cap-ok: initial default input value clamped to available chat turns; max is latest
-        const input = h('input', { class: 'ml-schema-input', type: 'number', min: 1, max: latest, step: 1, value: String(Math.min(20, latest)) });
+        const minFloor = Number.isInteger(range.minFloor) ? range.minFloor : 0;
+        const maxFloor = Number.isInteger(range.maxFloor) ? range.maxFloor : 0;
+        const assistantFloors = Array.isArray(range.assistantFloors) ? range.assistantFloors : [];
+
+        let mode = 'recent';
+        let recentValue = String(Math.min(20, latest)); // cap-ok: initial default input value clamped to available chat turns; max is latest
+        let floorValue = String(maxFloor);
+
+        const modeOptions = [
+            { value: 'recent', label: i18n('Rebuild Recent') },
+            { value: 'from_floor', label: i18n('From Floor') },
+        ];
+        const modeSlot = h('div');
+        const labelEl = h('span', { class: 'lw-field-label' });
+        const input = h('input', { class: 'ml-schema-input', type: 'number', step: 1 });
+        const field = h('label', { class: 'lw-field' }, labelEl, input);
+        const previewEl = h('div', { class: 'ml-settings-note' });
+
+        function parseNonNegInt(raw) {
+            const trimmed = String(raw ?? '').trim();
+            return /^\d+$/.test(trimmed) ? Number(trimmed) : null;
+        }
+
+        function updatePreview() {
+            const parsed = parseNonNegInt(input.value);
+            if (parsed === null) {
+                previewEl.textContent = '';
+                previewEl.hidden = true;
+                return;
+            }
+            let fromFloor = null;
+            let toFloor = maxFloor;
+            let turnCount = 0;
+            if (mode === 'recent') {
+                if (parsed < 1 || parsed > latest) {
+                    previewEl.textContent = '';
+                    previewEl.hidden = true;
+                    return;
+                }
+                const startSeq = latest - parsed + 1;
+                fromFloor = assistantFloors[startSeq - 1];
+                toFloor = assistantFloors[latest - 1];
+                turnCount = parsed;
+            } else {
+                const startSeq = resolveStartSeqFromFloor(assistantFloors, parsed);
+                if (startSeq === null) {
+                    previewEl.textContent = '';
+                    previewEl.hidden = true;
+                    return;
+                }
+                fromFloor = parsed;
+                toFloor = assistantFloors[latest - 1];
+                turnCount = latest - startSeq + 1;
+            }
+            if (!Number.isInteger(fromFloor) || !Number.isInteger(toFloor)) {
+                previewEl.textContent = '';
+                previewEl.hidden = true;
+                return;
+            }
+            previewEl.textContent = fromFloor === toFloor
+                ? i18nFormat('Will rebuild floor ${0} (${1} assistant turn(s)).', fromFloor, turnCount)
+                : i18nFormat('Will rebuild floors ${0}-${1} (${2} assistant turn(s)).', fromFloor, toFloor, turnCount);
+            previewEl.hidden = false;
+        }
+
+        function syncModeUi() {
+            put(clear(modeSlot), segmented(modeOptions, mode, (nextMode) => {
+                if (mode === 'recent') recentValue = input.value;
+                else floorValue = input.value;
+                mode = nextMode;
+                syncModeUi();
+                input.focus();
+            }, { ariaLabel: i18n('Rebuild mode') }));
+
+            if (mode === 'recent') {
+                labelEl.textContent = i18nFormat('Rebuild recent assistant turns: enter N (1-${0}).', latest);
+                input.min = '1';
+                input.max = String(latest);
+                input.value = recentValue;
+            } else {
+                labelEl.textContent = i18nFormat('Rebuild from floor N (${0}-${1}).', minFloor, maxFloor);
+                input.min = String(minFloor);
+                input.max = String(maxFloor);
+                input.value = floorValue;
+            }
+            updatePreview();
+        }
+
+        input.addEventListener('input', () => {
+            if (mode === 'recent') recentValue = input.value;
+            else floorValue = input.value;
+            updatePreview();
+        });
+        syncModeUi();
+
         openModal(app, {
-            title: i18n('Rebuild Recent'),
-            content: formField(i18nFormat('Rebuild recent assistant turns: enter N (1-${0}).', latest), input),
-            okLabel: i18n('Rebuild Recent'),
+            title: i18n('Rebuild Range'),
+            content: h('div', { class: 'ml-aiset' }, modeSlot, field, previewEl),
+            okLabel: i18n('Start Rebuild'),
             wide: false,
             onOk() {
-                const turns = Number(input.value);
-                if (!Number.isInteger(turns) || turns < 1 || turns > latest) {
-                    app.notify(i18nFormat('Please enter a valid integer between 1 and ${0}.', latest));
+                const value = parseNonNegInt(input.value);
+                if (mode === 'recent') {
+                    if (value === null || value < 1 || value > latest) {
+                        app.notify(i18nFormat('Please enter a valid integer between 1 and ${0}.', latest));
+                        return false;
+                    }
+                    void run(() => source.ops.rebuildRecent(value));
+                    return true;
+                }
+                if (value === null || resolveStartSeqFromFloor(assistantFloors, value) === null) {
+                    app.notify(i18nFormat('Please enter a valid integer between ${0} and ${1}.', minFloor, maxFloor));
                     return false;
                 }
-                void run(() => source.ops.rebuildRecent(turns));
+                void run(() => source.ops.rebuildFromFloor(value));
                 return true;
             },
         });
@@ -534,36 +716,151 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
             surfaceError(new Error(i18n('No compressible types in current schema.')));
             return;
         }
-        const scope = selectInput([{ value: 'all', label: i18n('All nodes') }, { value: 'older', label: i18n('Older nodes only (exclude recent N assistant turns)') }], 'older');
-        const excludeRecent = h('input', { class: 'ml-schema-input', type: 'number', min: 0, step: 1, value: '2' });
+        activeModalCleanup?.();
+        const displayTypes = types.map(item => ({
+            ...item,
+            displayLabel: typeDisplayName(item),
+        }));
+        const selected = new Set(displayTypes.map(item => item.id));
+        const draft = {
+            scope: 'older',
+            excludeRecent: 2,
+            mode: 'schema',
+            roundLimitMode: 'unlimited',
+            maxRoundsPerType: 3,
+            selectedTypeIds: [...selected],
+        };
+
+        const modalSummary = createBehaviorSummary({
+            id: 'mg-manual-compress-modal',
+            ariaLabel: i18n('Manual compression summary'),
+            build: () => buildMgManualCompressionModalModel({ draft, types: displayTypes }),
+        });
+
+        let cleanedUp = false;
+        function cleanupModal() {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            modalSummary.destroy();
+            if (activeModalCleanup === cleanupModal) activeModalCleanup = null;
+        }
+        activeModalCleanup = cleanupModal;
+
+        let excludeField = null;
+        let roundsField = null;
+        function syncModalState() {
+            if (excludeField) excludeField.hidden = draft.scope !== 'older';
+            if (roundsField) roundsField.hidden = draft.roundLimitMode !== 'limited';
+            modalSummary.update();
+        }
+
+        const scope = selectInput([
+            { value: 'older', label: i18n('Older nodes only (exclude recent N assistant turns)') },
+            { value: 'all', label: i18n('All nodes') },
+        ], draft.scope, (value) => {
+            draft.scope = value;
+            syncModalState();
+        });
+        const excludeRecent = h('input', {
+            class: 'ml-schema-input',
+            type: 'number',
+            min: 0,
+            step: 1,
+            value: String(draft.excludeRecent),
+            onInput: (event) => {
+                draft.excludeRecent = event.target.value === '' ? '' : Number(event.target.value);
+                syncModalState();
+            },
+        });
         const mode = selectInput([
             { value: 'schema', label: i18n('Use schema thresholds') },
             { value: 'force', label: i18n('Force compress (ignore threshold)') },
             { value: 'flat', label: i18n('Force compress across depths (ignore hierarchy)') },
-        ], 'schema');
-        const rounds = h('input', { class: 'ml-schema-input', type: 'number', min: 1, step: 1, value: '3' });
-        const selected = new Set(types.map(item => item.id));
+        ], draft.mode, (value) => {
+            draft.mode = value;
+            syncModalState();
+        });
+        const roundLimitMode = selectInput([
+            { value: 'unlimited', label: i18n('Compress until done') },
+            { value: 'limited', label: i18n('Stop after N merges per type') },
+        ], draft.roundLimitMode, (value) => {
+            draft.roundLimitMode = value;
+            syncModalState();
+        });
+        const rounds = h('input', {
+            class: 'ml-schema-input',
+            type: 'number',
+            min: 1,
+            step: 1,
+            value: String(draft.maxRoundsPerType),
+            onInput: (event) => {
+                draft.maxRoundsPerType = event.target.value === '' ? '' : Number(event.target.value);
+                syncModalState();
+            },
+        });
+
+        const scopeField = fieldWrap('scope', formField(i18n('Compression scope'), scope));
+        excludeField = fieldWrap('excludeRecent', formField(i18n('Exclude recent assistant turns'), excludeRecent));
+        const modeField = fieldWrap('mode', formField(i18n('Compression mode'), mode));
+        const roundLimitField = fieldWrap('roundLimitMode', formField(i18n('Stop rule'), roundLimitMode));
+        roundsField = fieldWrap('maxRoundsPerType', formField(i18n('Max merges per type'), rounds));
+        const typesField = h('div', { class: 'ml-aiset-field', dataset: { fieldKey: 'selectedTypeIds' } },
+            h('span', { class: 'ml-aiset-label', text: i18n('Types to compress') }),
+            displayTypes.map(item => checkRow({
+                checked: true,
+                label: item.displayLabel,
+                onChange: (value) => {
+                    if (value) selected.add(item.id);
+                    else selected.delete(item.id);
+                    draft.selectedTypeIds = displayTypes.filter(t => selected.has(t.id)).map(t => t.id);
+                    syncModalState();
+                },
+            })));
+
+        const content = h('div', { class: 'ml-aiset ml-manual-compress-modal' },
+            modalSummary.el,
+            scopeField,
+            excludeField,
+            modeField,
+            roundLimitField,
+            roundsField,
+            typesField);
+        modalSummary.bindScope(content);
+        syncModalState();
+
         openModal(app, {
             title: i18n('Manual Compression'),
-            content: h('div', { class: 'ml-aiset' },
-                formField(i18n('Compression scope'), scope),
-                formField(i18n('Exclude recent assistant turns'), excludeRecent),
-                formField(i18n('Compression mode'), mode),
-                formField(i18n('Max rounds per type'), rounds),
-                h('div', { class: 'ml-aiset-field' }, h('span', { class: 'ml-aiset-label', text: i18n('Types to compress') }),
-                    types.map(item => checkRow({ checked: true, label: item.label, onChange: (value) => { if (value) selected.add(item.id); else selected.delete(item.id); } })))),
+            content,
             okLabel: i18n('Apply Manual Compression'),
             onOk() {
+                if (draft.selectedTypeIds.length === 0) {
+                    app.notify(i18n('Select at least one type to compress.'));
+                    return false;
+                }
+                const maxRoundsPerType = draft.roundLimitMode === 'limited'
+                    ? Math.max(1, Math.floor(Number(draft.maxRoundsPerType) || 1))
+                    : null;
+                cleanupModal();
                 void run(() => source.ops.compress({
-                    scope: scope.value,
-                    mode: mode.value,
-                    excludeRecent: Math.max(0, Math.floor(Number(excludeRecent.value) || 0)),
-                    maxRoundsPerType: Math.max(1, Math.floor(Number(rounds.value) || 1)),
-                    selectedTypeIds: [...selected],
+                    scope: draft.scope,
+                    mode: draft.mode,
+                    excludeRecent: Math.max(0, Math.floor(Number(draft.excludeRecent) || 0)),
+                    maxRoundsPerType,
+                    selectedTypeIds: draft.selectedTypeIds.slice(),
                 }));
                 return true;
             },
         });
+
+        const observer = typeof MutationObserver === 'function'
+            ? new MutationObserver(() => {
+                if (!content.isConnected) {
+                    cleanupModal();
+                    observer.disconnect();
+                }
+            })
+            : null;
+        observer?.observe(app.root, { childList: true });
     }
 
     function askRawEdit() {
@@ -608,13 +905,15 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
     function operationsSection() {
         const ops = source.ops;
         const actions = (...children) => h('div', { class: 'ml-settings-actions' }, children);
+        const rebuildRangeBtn = action(i18n('Rebuild Range'), askRebuildRange);
+        rebuildRangeBtn.dataset.rebuildRange = 'true';
         return h('section', { class: 'ml-aiset-group ml-settings-section', dataset: { settingsSection: 'operations' } },
             sectionTitle(i18n('Graph Operations & Data')),
             h('div', { class: 'ml-settings-stats', text: statsLine() }),
             actions(
                 action(i18n('Fill Graph'), () => run(ops.fill)),
                 action(i18n('Rebuild Graph'), () => confirmText(app, { title: i18n('Rebuild Graph'), lines: [i18n('Rebuild the whole graph from this chat?')], okLabel: i18n('Rebuild Graph'), danger: true, onOk: () => { void run(ops.rebuild); } })),
-                action(i18n('Rebuild Recent'), askRebuildRecent),
+                rebuildRangeBtn,
                 action(i18n('Manual Compress'), askCompress),
                 action(i18n('Fill Missing'), () => run(() => ops.vectors('incremental'))),
                 action(i18n('Full Rebuild'), () => run(() => ops.vectors('full')))),
@@ -630,11 +929,11 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
                 action(i18n('Edit graph JSON'), askRawEdit),
                 action(i18n('Reset Chat'), () => confirmText(app, { title: i18n('Reset Chat'), lines: [i18n('Reset current chat memory graph? This cannot be undone.')], okLabel: i18n('Reset'), danger: true, onOk: () => { void run(ops.reset); } }), { className: 'ml-btn-danger' })),
             actions(
-                button(i18n('AI Configure Memory Graph'), () => openStudio(ops.openConfigStudio), { iconName: 'sparkle', disabled: busy }),
-                button(i18n('AI Edit Graph'), () => openStudio(ops.openGraphStudio), { iconName: 'sparkle', disabled: busy })));
+                button(i18n('AI Edit Memory Graph Config'), () => openStudio(ops.openConfigStudio), { iconName: 'sparkle', disabled: busy }),
+                button(i18n('AI Edit Memory Graph Content'), () => openStudio(ops.openGraphStudio), { iconName: 'sparkle', disabled: busy })));
     }
 
-    // ---- Section 4: Technical Tuning & Custom Prompts (collapsed) --------
+    // ---- Section 5: Technical Tuning & Custom Prompts (collapsed) --------
     function technicalControl(field) {
         const label = i18n(field.label);
         if (field.kind === 'bool') {
@@ -683,6 +982,7 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         },
         h('summary', { class: 'ml-settings-summary' }, h('span', { text: i18n('Technical Tuning & Custom Prompts') })),
         h('div', { class: 'ml-settings-details-body' },
+            technicalSummary.el,
             fields(
                 pick('requestApiPresetName', i18n('Iteration AI API preset (Connection profile)'), connectionOptions('requestApiPresetName')),
                 presetField('requestLlmPresetName', i18n('Iteration AI prompt preset (params + prompt)'))),
@@ -767,24 +1067,43 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         statusEl.textContent = source.ops.status();
         syncErrorBanner();
         clear(el);
+        const masterHidden = Boolean(view.values.enabled);
+        masterSummary.el.hidden = masterHidden;
+        const enabledGroup = group(
+            toggle('enabled', i18n('Enabled')),
+            masterHidden ? null : masterSummary.el,
+            statusEl,
+            errorEl,
+            busy ? button(i18n('Stop'), () => source.ops.stop(), { iconName: 'x', className: 'ml-btn-danger' }) : null,
+            h('p', { class: 'ml-settings-note', text: i18n('The AI Workbench uses to edit these settings is selected in Workbench → Settings.') }),
+        );
+        const sec1 = extractionSection();
+        const sec2 = extractionModeSection();
+        const sec3 = recallSection();
+        const sec4 = operationsSection();
+        const sec5 = technicalSection();
         put(el, h('div', { class: 'ml-settings-inner' },
-            group(
-                toggle('enabled', i18n('Enabled')),
-                statusEl,
-                errorEl,
-                busy ? button(i18n('Stop'), () => source.ops.stop(), { iconName: 'x', className: 'ml-btn-danger' }) : null,
-                h('p', { class: 'ml-settings-note', text: i18n('The AI Workbench uses to edit these settings is selected in Workbench → Settings.') })),
-            extractionSection(),
-            recallSection(),
-            operationsSection(),
-            technicalSection(),
+            enabledGroup,
+            sec1,
+            sec2,
+            sec3,
+            sec4,
+            sec5,
             scopeSaveBar()));
+        masterSummary.bindScope(masterHidden ? null : enabledGroup);
+        masterSummary.update();
+        extractionSummary.bindScope(sec1);
+        extractionSummary.update();
+        extractionModeSummary.bindScope(sec2);
+        extractionModeSummary.update();
+        recallSummary.bindScope(sec3);
+        recallSummary.update();
+        technicalSummary.bindScope(sec5);
+        technicalSummary.update();
         el.scrollTop = scroll;
     }
 
     const editingHere = () => el.contains(document.activeElement) && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
-
-    void syncCadenceFeedback;
 
     return {
         id: 'settings',
@@ -795,6 +1114,12 @@ export function createSettingsView(app, source, { onDirtyChange = null } = {}) {
         invalidate() { needsReload = true; },
         dirtyCount,
         destroy() {
+            activeModalCleanup?.();
+            masterSummary.destroy();
+            extractionSummary.destroy();
+            extractionModeSummary.destroy();
+            recallSummary.destroy();
+            technicalSummary.destroy();
             cadenceVisualizer.destroy();
             unsubscribeStatus();
             unsubscribeSettings();

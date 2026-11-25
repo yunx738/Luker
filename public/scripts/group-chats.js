@@ -104,7 +104,12 @@ import {
     invalidateChatWriteSnapshot,
     isChatTransitionInProgress,
     maybeApplyCharacterBoundPreset,
+    stopGeneration,
+    confirmChatSwitchGuard,
+    getChatTransitionEpoch,
+    bumpChatTransitionEpoch,
 } from '../script.js';
+import { withActivityLease } from './activity-guard.js';
 import { settleChatChanged } from './floor-state.js';
 import { printTagList, createTagMapFromList, applyTagsOnCharacterSelect, tag_map, applyTagsOnGroupSelect, printTagFilters, tag_filter_type } from './tags.js';
 import { FILTER_TYPES, FilterHelper } from './filters.js';
@@ -230,12 +235,19 @@ export async function loadGroupChat(chatId) {
             body: JSON.stringify({ id: chatId }),
         });
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+            const errorPayload = typeof response.json === 'function'
+                ? await response.json().catch(() => null)
+                : null;
+            const error = new Error(`HTTP ${response.status}`);
+            if (errorPayload?.corrupted) {
+                error.corrupted = true;
+            }
+            throw error;
         }
         const data = await response.json().catch(() => {
             throw new Error('Invalid JSON response');
         });
-        if (!Array.isArray(data)) {
+        if (!Array.isArray(data) || (data.length > 0 && (!data[0] || typeof data[0] !== 'object' || Array.isArray(data[0])))) {
             throw new Error('Expected a chat message array');
         }
         return data;
@@ -316,7 +328,10 @@ export async function getGroupChat(groupId, reload = false) {
         return;
     }
     if (!ownsChat()) return;
-    const metadata = data?.[0]?.chat_metadata ?? {};
+    const rawMetadata = data?.[0]?.chat_metadata;
+    const metadata = (rawMetadata && typeof rawMetadata === 'object' && !Array.isArray(rawMetadata))
+        ? rawMetadata
+        : {};
     const freshChat = !metadata.tainted && !data.length;
     const target = { is_group: true, id: chat_id };
 
@@ -333,6 +348,7 @@ export async function getGroupChat(groupId, reload = false) {
         metadata.integrity = uuidv4();
     }
     updateChatMetadata(metadata, true);
+    consumePendingForceOverwrite(target);
     if (freshChat) {
         invalidateChatWriteSnapshot(target);
     } else {
@@ -714,6 +730,7 @@ async function saveGroupChatInternal(groupId, shouldSaveGroup, force = false, re
             console.debug('[ChatWrite] Group save dropped: no active group chat target.');
             return false;
         }
+        consumePendingForceOverwrite(context?.target ?? { is_group: true, id: group.chat_id });
         console.error('[ChatWrite] Group save refused: chat not fully loaded (integrity missing).');
         toastr.error(
             t`Refusing to save: chat is not fully loaded. Reload the page to prevent data loss.`,
@@ -727,11 +744,17 @@ async function saveGroupChatInternal(groupId, shouldSaveGroup, force = false, re
     const resolvedGroupId = String(saveContext?.groupId || groupId || '').trim();
     const group = groups.find(x => String(x?.id || '') === resolvedGroupId);
     if (!group) {
+        if (saveContext?.target) {
+            consumePendingForceOverwrite(saveContext.target);
+        }
         console.warn('Group not found', resolvedGroupId);
         return false;
     }
     const chatId = saveContext?.target?.id ?? group.chat_id;
     if (!chatId) {
+        if (saveContext?.target) {
+            consumePendingForceOverwrite(saveContext.target);
+        }
         console.warn('Group chat id is empty', resolvedGroupId);
         return false;
     }
@@ -845,21 +868,53 @@ async function saveGroupChatInternal(groupId, shouldSaveGroup, force = false, re
     }
 
     if (!response.ok) {
+        const conflictSnapshot = { attempted: false, snapshot: null, error: null, corrupted: false };
         const conflictResolution = !effectiveForce
             ? await resolveChatWriteConflictForTarget(response, target, metadataSnapshot, retryAttempt, {
                 endpoint: requestSummary?.endpoint ?? 'group save',
                 opSummary: requestSummary?.opSummary ?? null,
                 sentIntegrity: metadataSnapshot?.integrity,
+                onServerSnapshot: (result) => {
+                    conflictSnapshot.attempted = true;
+                    conflictSnapshot.snapshot = result?.snapshot ?? null;
+                    conflictSnapshot.error = result?.error ?? null;
+                    conflictSnapshot.corrupted = Boolean(result?.corrupted);
+                },
             })
             : 'none';
         if (conflictResolution !== 'none') {
             if (conflictResolution === 'integrity' || conflictResolution === 'snapshot') {
-                const loaded = await loadGroupChat(chatId);
-                const loadedMetadata = loaded[0]?.chat_metadata ?? {};
-                const loadedMessages = Object.hasOwn(loaded[0] ?? {}, 'chat_metadata') ? loaded.slice(1) : loaded;
-                seedChatMetadataSnapshot(target, loadedMetadata);
-                seedChatMessageSnapshot(target, loadedMessages);
-                applyIntegrityFromWritePayloadToTarget(loadedMetadata, target, metadataSnapshot);
+                // Reuse the single /api/chats/group/get result fetched during conflict
+                // diagnostics; rethrow read failures to abort the retry rather than
+                // overwriting concurrent server edits.
+                let serverSnapshot = null;
+                if (conflictSnapshot.attempted) {
+                    if (conflictSnapshot.error) {
+                        throw conflictSnapshot.error;
+                    }
+                    serverSnapshot = conflictSnapshot.snapshot;
+                } else if (conflictResolution === 'integrity') {
+                    const loaded = await loadGroupChat(chatId);
+                    if (loaded.length === 0) {
+                        serverSnapshot = { metadata: {}, messages: [], existsOnServer: false };
+                    } else {
+                        const rawMeta = loaded[0]?.chat_metadata;
+                        const loadedMetadata = (rawMeta && typeof rawMeta === 'object' && !Array.isArray(rawMeta))
+                            ? rawMeta
+                            : {};
+                        const loadedMessages = Object.hasOwn(loaded[0] ?? {}, 'chat_metadata') ? loaded.slice(1) : loaded;
+                        serverSnapshot = { metadata: loadedMetadata, messages: loadedMessages, existsOnServer: true };
+                    }
+                }
+                if (serverSnapshot) {
+                    if (serverSnapshot.existsOnServer === false) {
+                        invalidateChatWriteSnapshot(target);
+                    } else {
+                        seedChatMetadataSnapshot(target, serverSnapshot.metadata);
+                        seedChatMessageSnapshot(target, serverSnapshot.messages);
+                        applyIntegrityFromWritePayloadToTarget(serverSnapshot.metadata, target, metadataSnapshot);
+                    }
+                }
             }
             return await saveGroupChatInternal(resolvedGroupId, shouldSaveGroup, force, retryAttempt + 1, {
                 ...(saveContext ?? {}),
@@ -876,6 +931,7 @@ async function saveGroupChatInternal(groupId, shouldSaveGroup, force = false, re
             // but force=true skipped the resolver. Invalidate explicitly here
             // so the next save re-syncs from BE truth.
             invalidateChatWriteSnapshot(target);
+            consumePendingForceOverwrite(target);
             toastr.error(t`Check the server connection and reload the page to prevent data loss.`, t`Group Chat could not be saved`);
             console.error('Group chat could not be saved', response);
             return false;
@@ -883,6 +939,7 @@ async function saveGroupChatInternal(groupId, shouldSaveGroup, force = false, re
         // 409 + resolver returned 'none' (retryAttempt > 0): the resolver's
         // early-return doesn't invalidate, but the optimistic commit is stale.
         invalidateChatWriteSnapshot(target);
+        consumePendingForceOverwrite(target);
         toastr.error(t`Group chat changed on server. Reloaded once and save still failed.`, t`Group Chat could not be saved`);
         return false;
     }
@@ -909,6 +966,7 @@ async function saveGroupChat(groupId, shouldSaveGroup, force = false, retryAttem
             return await saveGroupChatInternal(groupId, shouldSaveGroup, force, retryAttempt, saveContext);
         } catch (error) {
             invalidateChatWriteSnapshot(saveContext.target);
+            consumePendingForceOverwrite(saveContext.target);
             const chatId = saveContext.target.id;
             toastr.error(t`Group chat ${chatId} could not be saved. Check the server connection and retry saving.`, t`Group Chat could not be saved`, { escapeHtml: true });
             console.error(`Group chat ${chatId} could not be saved`, error);
@@ -1220,12 +1278,6 @@ function getGroupChatNames(groupId) {
  * @returns {Promise<string|void>} Generated text or nothing if no generation occurred
  */
 async function generateGroupWrapper(byAutoMode, type = null, params = {}) {
-    function throwIfAborted() {
-        if (params.signal instanceof AbortSignal && params.signal.aborted) {
-            throw new Error('AbortSignal was fired. Group generation stopped');
-        }
-    }
-
     if (online_status === 'no_connection') {
         is_group_generating = false;
         setSendButtonState(false);
@@ -1251,121 +1303,180 @@ async function generateGroupWrapper(byAutoMode, type = null, params = {}) {
         return Promise.resolve();
     }
 
-    try {
-        await unshallowGroupMembers(selected_group);
+    const groupAbortController = new AbortController();
+    const externalSignal = (params?.signal && typeof params.signal === 'object' && 'aborted' in params.signal)
+        ? params.signal
+        : null;
+    const onExternalAbort = () => groupAbortController.abort();
+    const groupEpoch = getChatTransitionEpoch();
+    const isStaleEpoch = () => getChatTransitionEpoch() !== groupEpoch;
 
-        throwIfAborted();
-        hideSwipeButtons();
-        is_group_generating = true;
-        setCharacterName('');
-        setCharacterId(undefined);
-        const userInput = String($('#send_textarea').val());
+    const onStop = () => {
+        eventSource.removeListener(event_types.GENERATION_STOPPED, onStop);
+        groupAbortController.abort();
+    };
 
-        // id of this specific batch for regeneration purposes
-        group_generation_id = Date.now();
-        const lastMessage = chat[chat.length - 1];
-        let activationText = '';
-        let isUserInput = false;
-
-        if (userInput?.length && !byAutoMode) {
-            isUserInput = true;
-            activationText = userInput;
-        } else {
-            if (lastMessage && !lastMessage.is_system) {
-                activationText = lastMessage.mes;
-            }
+    function throwIfAborted() {
+        if (groupAbortController.signal.aborted || externalSignal?.aborted || isStaleEpoch()) {
+            throw new Error('AbortSignal was fired. Group generation stopped');
         }
-
-        const activationStrategy = Number(group.activation_strategy ?? group_activation_strategy.NATURAL);
-        const enabledMembers = group.members.filter(x => !group.disabled_members.includes(x));
-        let activatedMembers = [];
-
-        if (params && typeof params.force_chid == 'number') {
-            activatedMembers = [params.force_chid];
-        } else if (type === 'quiet') {
-            activatedMembers = activateSwipe(group.members, { allowSystem: true }).slice(0, 1);
-
-            if (activatedMembers.length === 0) {
-                activatedMembers = activateListOrder(group.members.slice(0, 1));
-            }
-        } else if (type === 'swipe' || type === 'continue') {
-            activatedMembers = activateSwipe(group.members, { allowSystem: false });
-
-            if (activatedMembers.length === 0) {
-                toastr.warning(t`Deleted group member swiped. To get a reply, add them back to the group.`);
-                throw new Error('Deleted group member swiped');
-            }
-        } else if (type === 'impersonate') {
-            activatedMembers = activateImpersonate(group.members);
-        } else if (activationStrategy === group_activation_strategy.NATURAL) {
-            activatedMembers = activateNaturalOrder(enabledMembers, activationText, lastMessage, group.allow_self_responses, isUserInput);
-        } else if (activationStrategy === group_activation_strategy.LIST) {
-            activatedMembers = activateListOrder(enabledMembers);
-        } else if (activationStrategy === group_activation_strategy.POOLED) {
-            activatedMembers = activatePooledOrder(enabledMembers, lastMessage, isUserInput);
-        } else if (activationStrategy === group_activation_strategy.MANUAL && !isUserInput) {
-            activatedMembers = shuffle(enabledMembers).slice(0, 1).map(x => characters.findIndex(y => y.avatar === x)).filter(x => x !== -1);
-        }
-
-        if (activatedMembers.length === 0) {
-            //toastr.warning('All group members are disabled. Enable at least one to get a reply.');
-
-            // Send user message as is
-            const bias = getBiasStrings(userInput, type);
-            await sendMessageAsUser(userInput, bias.messageBias);
-            await saveChatConditional();
-            $('#send_textarea').val('')[0].dispatchEvent(new Event('input', { bubbles: true }));
-        }
-        groupChatQueueOrder = new Map();
-
-        if (power_user.show_group_chat_queue) {
-            for (let i = 0; i < activatedMembers.length; ++i) {
-                groupChatQueueOrder.set(characters[activatedMembers[i]].avatar, i + 1);
-            }
-        }
-        await eventSource.emit(event_types.GROUP_WRAPPER_STARTED, { selected_group, type });
-        // now the real generation begins: cycle through every activated character
-        for (const chId of activatedMembers) {
-            throwIfAborted();
-            deactivateSendButtons();
-            setCharacterId(chId);
-            setCharacterName(getCharacterName(characters[chId]));
-            if (power_user.show_group_chat_queue) {
-                printGroupMembers();
-            }
-            await eventSource.emit(event_types.GROUP_MEMBER_DRAFTED, chId);
-
-            // Wait for generation to finish
-            const generateType = ['swipe', 'impersonate', 'quiet', 'continue'].includes(type) ? type : 'normal';
-            textResult = await Generate(generateType, { automatic_trigger: byAutoMode, ...(params || {}) });
-            let messageChunk = textResult?.messageChunk;
-
-            if (messageChunk) {
-                while (shouldAutoContinue(messageChunk, type === 'impersonate')) {
-                    textResult = await Generate('continue', { automatic_trigger: byAutoMode, ...(params || {}) });
-                    messageChunk = textResult?.messageChunk;
-                }
-            }
-            if (power_user.show_group_chat_queue) {
-                groupChatQueueOrder.delete(characters[chId].avatar);
-                groupChatQueueOrder.forEach((value, key, map) => map.set(key, value - 1));
-            }
-        }
-    } finally {
-        is_group_generating = false;
-        setSendButtonState(false);
-        setCharacterId(undefined);
-        if (power_user.show_group_chat_queue) {
-            groupChatQueueOrder = new Map();
-            printGroupMembers();
-        }
-        setCharacterName('');
-        activateSendButtons();
-        showSwipeButtons();
-        await eventSource.emit(event_types.GROUP_WRAPPER_FINISHED, { selected_group, type });
     }
 
-    return Promise.resolve(textResult);
+    return await withActivityLease({
+        source: 'core:group-generation',
+        label: t`Group chat generation`,
+        scope: 'chat',
+        guardUnload: true,
+        guardChatSwitch: true,
+        keepAlive: true,
+        onCancel: () => {
+            const wasAborted = groupAbortController.signal.aborted;
+            groupAbortController.abort();
+            if (!wasAborted) {
+                stopGeneration();
+            }
+        },
+    }, async () => {
+        if (externalSignal) {
+            if (externalSignal.aborted) {
+                groupAbortController.abort();
+            } else if (typeof externalSignal.addEventListener === 'function') {
+                externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+            }
+        }
+        eventSource.on(event_types.GENERATION_STOPPED, onStop);
+
+        try {
+            await unshallowGroupMembers(selected_group);
+            if (isStaleEpoch()) {
+                return textResult;
+            }
+
+            throwIfAborted();
+            hideSwipeButtons();
+            is_group_generating = true;
+            setCharacterName('');
+            setCharacterId(undefined);
+            const userInput = String($('#send_textarea').val());
+
+            // id of this specific batch for regeneration purposes
+            group_generation_id = Date.now();
+            const lastMessage = chat[chat.length - 1];
+            let activationText = '';
+            let isUserInput = false;
+
+            if (userInput?.length && !byAutoMode) {
+                isUserInput = true;
+                activationText = userInput;
+            } else {
+                if (lastMessage && !lastMessage.is_system) {
+                    activationText = lastMessage.mes;
+                }
+            }
+
+            const activationStrategy = Number(group.activation_strategy ?? group_activation_strategy.NATURAL);
+            const enabledMembers = group.members.filter(x => !group.disabled_members.includes(x));
+            let activatedMembers = [];
+
+            if (params && typeof params.force_chid == 'number') {
+                activatedMembers = [params.force_chid];
+            } else if (type === 'quiet') {
+                activatedMembers = activateSwipe(group.members, { allowSystem: true }).slice(0, 1);
+
+                if (activatedMembers.length === 0) {
+                    activatedMembers = activateListOrder(group.members.slice(0, 1));
+                }
+            } else if (type === 'swipe' || type === 'continue') {
+                activatedMembers = activateSwipe(group.members, { allowSystem: false });
+
+                if (activatedMembers.length === 0) {
+                    toastr.warning(t`Deleted group member swiped. To get a reply, add them back to the group.`);
+                    throw new Error('Deleted group member swiped');
+                }
+            } else if (type === 'impersonate') {
+                activatedMembers = activateImpersonate(group.members);
+            } else if (activationStrategy === group_activation_strategy.NATURAL) {
+                activatedMembers = activateNaturalOrder(enabledMembers, activationText, lastMessage, group.allow_self_responses, isUserInput);
+            } else if (activationStrategy === group_activation_strategy.LIST) {
+                activatedMembers = activateListOrder(enabledMembers);
+            } else if (activationStrategy === group_activation_strategy.POOLED) {
+                activatedMembers = activatePooledOrder(enabledMembers, lastMessage, isUserInput);
+            } else if (activationStrategy === group_activation_strategy.MANUAL && !isUserInput) {
+                activatedMembers = shuffle(enabledMembers).slice(0, 1).map(x => characters.findIndex(y => y.avatar === x)).filter(x => x !== -1);
+            }
+
+            if (activatedMembers.length === 0) {
+                //toastr.warning('All group members are disabled. Enable at least one to get a reply.');
+
+                // Send user message as is
+                const bias = getBiasStrings(userInput, type);
+                await sendMessageAsUser(userInput, bias.messageBias);
+                throwIfAborted();
+                await saveChatConditional();
+                throwIfAborted();
+                $('#send_textarea').val('')[0].dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            groupChatQueueOrder = new Map();
+
+            if (power_user.show_group_chat_queue) {
+                for (let i = 0; i < activatedMembers.length; ++i) {
+                    groupChatQueueOrder.set(characters[activatedMembers[i]].avatar, i + 1);
+                }
+            }
+            await eventSource.emit(event_types.GROUP_WRAPPER_STARTED, { selected_group, type });
+            throwIfAborted();
+            // now the real generation begins: cycle through every activated character
+            for (const chId of activatedMembers) {
+                throwIfAborted();
+                deactivateSendButtons();
+                setCharacterId(chId);
+                setCharacterName(getCharacterName(characters[chId]));
+                if (power_user.show_group_chat_queue) {
+                    printGroupMembers();
+                }
+                await eventSource.emit(event_types.GROUP_MEMBER_DRAFTED, chId);
+                throwIfAborted();
+
+                // Wait for generation to finish
+                const generateType = ['swipe', 'impersonate', 'quiet', 'continue'].includes(type) ? type : 'normal';
+                textResult = await Generate(generateType, { automatic_trigger: byAutoMode, ...(params || {}), signal: groupAbortController.signal });
+                throwIfAborted();
+                let messageChunk = textResult?.messageChunk;
+
+                if (messageChunk) {
+                    while (shouldAutoContinue(messageChunk, type === 'impersonate')) {
+                        throwIfAborted();
+                        textResult = await Generate('continue', { automatic_trigger: byAutoMode, ...(params || {}), signal: groupAbortController.signal });
+                        throwIfAborted();
+                        messageChunk = textResult?.messageChunk;
+                    }
+                }
+                if (power_user.show_group_chat_queue) {
+                    groupChatQueueOrder.delete(characters[chId].avatar);
+                    groupChatQueueOrder.forEach((value, key, map) => map.set(key, value - 1));
+                }
+            }
+            return textResult;
+        } finally {
+            eventSource.removeListener(event_types.GENERATION_STOPPED, onStop);
+            if (externalSignal && typeof externalSignal.removeEventListener === 'function') {
+                externalSignal.removeEventListener('abort', onExternalAbort);
+            }
+            is_group_generating = false;
+            if (!isStaleEpoch()) {
+                setSendButtonState(false);
+                setCharacterId(undefined);
+                if (power_user.show_group_chat_queue) {
+                    groupChatQueueOrder = new Map();
+                    printGroupMembers();
+                }
+                setCharacterName('');
+                activateSendButtons();
+                showSwipeButtons();
+                await eventSource.emit(event_types.GROUP_WRAPPER_FINISHED, { selected_group, type });
+            }
+        }
+    });
 }
 
 /**
@@ -1614,6 +1725,9 @@ async function deleteGroup(id) {
     }
 
     if (response.ok) {
+        if (selected_group === id) {
+            bumpChatTransitionEpoch();
+        }
         await clearChat();
         selected_group = null;
         delete tag_map[id];
@@ -2016,16 +2130,22 @@ async function onDeleteGroupClick() {
         toastr.warning(t`Currently no group selected.`);
         return;
     }
-    if (is_group_generating) {
-        toastr.warning(t`Not so fast! Wait for the characters to stop typing before deleting the group.`);
+
+    const confirm = await Popup.show.confirm(t`Delete the group?`, '<p>' + t`This will also delete all your chats with that group. If you want to delete a single conversation, select a "View past chats" option in the lower left menu.` + '</p>');
+    if (!confirm) {
         return;
     }
 
-    const confirm = await Popup.show.confirm(t`Delete the group?`, '<p>' + t`This will also delete all your chats with that group. If you want to delete a single conversation, select a "View past chats" option in the lower left menu.` + '</p>');
-    if (confirm) {
-        deleteGroup(openGroupId);
+    if (selected_group === openGroupId) {
+        if (!await confirmChatSwitchGuard()) {
+            return;
+        }
     }
+
+    deleteGroup(openGroupId);
 }
+
+export { onDeleteGroupClick as _onDeleteGroupClickForTest };
 
 async function onFavoriteGroupClick() {
     updateFavButtonState(!fav_grp_checked);
@@ -2291,38 +2411,45 @@ function updateFavButtonState(state) {
 /**
  * Opens a group chat by its ID and updates the UI accordingly.
  * @param {string} groupId ID of the group to open
- * @returns {Promise<boolean>} Whether the group was opened
+ * @param {object} [options] Options for the switch.
+ * @param {boolean} [options.skipSwitchGuard=false] Skip modal confirmation while still cancelling/fencing active work.
+ * @returns {Promise<boolean>} Whether the group was opened (false if cancelled or not found)
  */
-export async function openGroupById(groupId) {
-    if (shouldBlockChatSwitchWhileSaving()) {
-        toastr.info(t`Please wait until the chat is saved before switching characters.`, t`Your chat is still saving...`);
-        return false;
-    }
-
+export async function openGroupById(groupId, { skipSwitchGuard = false } = {}) {
     if (!groups.find(x => x.id === groupId)) {
         console.log('Group not found', groupId);
         return false;
     }
 
-    if (!is_send_press && !is_group_generating) {
-        select_group_chats(groupId, false);
+    if (shouldBlockChatSwitchWhileSaving()) {
+        toastr.info(t`Please wait until the chat is saved before switching characters.`, t`Your chat is still saving...`);
+        return false;
+    }
 
-        if (selected_group !== groupId) {
-            groupChatQueueOrder = new Map();
-            setCharacterId(undefined);
-            setCharacterName('');
-            resetSelectedGroup();
-            await clearChat({ clearData: true });
-            cancelTtsPlay();
-            selected_group = groupId;
-            setEditedMessageId(undefined);
-            updateChatMetadata({}, true);
-            await getGroupChat(groupId);
-            return true;
+    if (selected_group !== groupId) {
+        if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+            return false;
         }
     }
 
-    return false;
+    select_group_chats(groupId, false);
+
+    if (selected_group !== groupId) {
+        bumpChatTransitionEpoch();
+        groupChatQueueOrder = new Map();
+        setCharacterId(undefined);
+        setCharacterName('');
+        resetSelectedGroup();
+        await clearChat({ clearData: true });
+        cancelTtsPlay();
+        selected_group = groupId;
+        setEditedMessageId(undefined);
+        updateChatMetadata({}, true);
+        await getGroupChat(groupId);
+        return true;
+    }
+
+    return true;
 }
 
 /**
@@ -2429,6 +2556,7 @@ export async function createNewGroupChat(groupId) {
     const ownsChat = captureGroupChatEntryOwnership(groupId);
     if (!ownsChat) return;
 
+    bumpChatTransitionEpoch();
     await clearChat({ clearData: true, isCurrent: ownsChat });
     if (!ownsChat()) return;
     const group = groups.find(x => x.id === groupId);
@@ -2478,28 +2606,37 @@ export async function getGroupPastChats(groupId) {
  * Opens a specific group chat for the specified group by its ID.
  * @param {string} groupId Group ID
  * @param {string} chatId Chat ID
- * @returns {Promise<void>}
+ * @param {object} [options] Options for the switch
+ * @param {boolean} [options.skipSwitchGuard=false] Skip modal confirmation while cancelling/fencing active work
+ * @returns {Promise<boolean>} True if opened, false if cancelled or invalid
  */
-export async function openGroupChat(groupId, chatId) {
+export async function openGroupChat(groupId, chatId, { skipSwitchGuard = false } = {}) {
     const group = groups.find(x => x.id === groupId);
 
     if (!group || !group.chats.includes(chatId)) {
-        return;
+        return false;
     }
     const ownsChat = captureGroupChatEntryOwnership(groupId);
-    if (!ownsChat) return;
-    if (!await waitForChatSwitchAvailability() || !ownsChat()) return;
+    if (!ownsChat) return false;
+    if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard }) || !ownsChat()) {
+        return false;
+    }
+    if (!await waitForChatSwitchAvailability() || !ownsChat()) {
+        return false;
+    }
 
+    bumpChatTransitionEpoch();
     await clearChat({ clearData: true, isCurrent: ownsChat });
-    if (!ownsChat()) return;
+    if (!ownsChat()) return false;
     const currentGroup = groups.find(x => x.id === groupId);
     currentGroup.chat_id = chatId;
     currentGroup.date_last_chat = Date.now();
     updateChatMetadata({}, true);
 
     await editGroup(groupId, true, false);
-    if (!ownsChat(chatId)) return;
+    if (!ownsChat(chatId)) return false;
     await getGroupChat(groupId);
+    return true;
 }
 
 /**
@@ -2540,11 +2677,19 @@ async function restoreGroupChatSnapshot(chatId, chatFile) {
     return response.ok;
 }
 
-async function deleteGroupChatInternal(groupId, chatId, { jumpToNewChat = true, mediaPrompt = true } = {}) {
+async function deleteGroupChatInternal(groupId, chatId, { jumpToNewChat = true, mediaPrompt = true, skipSwitchGuard = false } = {}) {
     const group = groups.find(x => x.id === groupId);
 
     if (!group || !group.chats.includes(chatId)) {
         return false;
+    }
+
+    const previousGroupChatId = String(group.chat_id || '');
+    const deletedCurrentChat = previousGroupChatId === chatId;
+    if (deletedCurrentChat && selected_group === groupId && jumpToNewChat) {
+        if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+            return false;
+        }
     }
 
     let mediaPathsToDelete = null;
@@ -2576,8 +2721,6 @@ async function deleteGroupChatInternal(groupId, chatId, { jumpToNewChat = true, 
 
     const rawChatSnapshot = structuredClone(await loadGroupChat(chatId));
     const previousChats = Array.isArray(group.chats) ? [...group.chats] : [];
-    const previousGroupChatId = String(group.chat_id || '');
-    const deletedCurrentChat = previousGroupChatId === chatId;
 
     const response = await fetch('/api/chats/group/delete', {
         method: 'POST',
@@ -2610,7 +2753,7 @@ async function deleteGroupChatInternal(groupId, chatId, { jumpToNewChat = true, 
             updateChatMetadata({}, true);
 
             if (group.chats.length) {
-                await openGroupChat(groupId, fallbackChatId);
+                await openGroupChat(groupId, fallbackChatId, { skipSwitchGuard: true });
             } else {
                 await createNewGroupChat(groupId);
             }
@@ -2660,7 +2803,7 @@ async function deleteGroupChatInternal(groupId, chatId, { jumpToNewChat = true, 
                 await editGroup(groupId, true, true);
 
                 if (shouldReopenDeletedChat) {
-                    await openGroupChat(groupId, chatId);
+                    await openGroupChat(groupId, chatId, { skipSwitchGuard: true });
                 } else if ($('#select_chat_popup').is(':visible')) {
                     await displayPastChats([chatId]);
                 }
@@ -2698,9 +2841,10 @@ export async function deleteGroupChatByName(groupId, chatName, options = {}) {
  * @param {object} [options={}] Options for the deletion.
  * @param {boolean} [options.jumpToNewChat=true] Whether to jump to a new chat after deletion (existing one, or create a new one if none exists)
  * @param {boolean} [options.mediaPrompt=true] Whether to offer associated media for deletion.
+ * @param {boolean} [options.skipSwitchGuard=false] Skip modal confirmation while cancelling/fencing active work.
  */
-export async function deleteGroupChat(groupId, chatId, { jumpToNewChat = true, mediaPrompt = true } = {}) {
-    return await deleteGroupChatInternal(groupId, chatId, { jumpToNewChat, mediaPrompt });
+export async function deleteGroupChat(groupId, chatId, { jumpToNewChat = true, mediaPrompt = true, skipSwitchGuard = false } = {}) {
+    return await deleteGroupChatInternal(groupId, chatId, { jumpToNewChat, mediaPrompt, skipSwitchGuard });
 }
 
 /**

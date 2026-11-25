@@ -12,6 +12,7 @@
 
 import { i18n, i18nFormat, listSeparator } from '../i18n.js';
 import { h, put, clear, relativeTime, copyText } from '../../lens-shared/util.js';
+import { confirmDialog } from '../../lens-shared/ui.js';
 import { icon } from '../icons.js';
 import { button, iconButton, checkRow, segmented, dot, msgActions } from '../ui/components.js';
 import { renderMarkdown } from '../ui/markdown.js';
@@ -26,9 +27,10 @@ import {
     decisionNote,
     trimMessages,
 } from '../model/iterate.js';
-import { groupSessions, titleFrom } from '../model/sessions.js';
-import { importLegacySessionsOnce } from '../model/legacy-import.js';
+import { groupSessions, titleFrom, computePendingCount, toSessionSummary } from '../model/sessions.js';
+import { importLegacySessionsOnce, hasLegacyGlobalSettingsSessions } from '../model/legacy-import.js';
 import { isReplayableIterationMessage } from '../../iteration-library/iter-message-filter.js';
+import { withActivityLease } from '../../activity-guard.js';
 
 const DEFAULT_CHIPS = {
     memory: () => [
@@ -65,8 +67,11 @@ const DEFAULT_CHIPS = {
 
 const DEFAULT_SCOPE_NOTE = {
     memory: {
-        global: () => i18n('Edit the memory structure shared by all characters'),
-        character: () => i18n('Edit only this character\'s own memory structure (created on save if there is none)'),
+        global: () => i18n('Edit the memory structure and settings shared by all characters'),
+        character: () => i18n('Edit only this character\'s own memory structure and settings (created on save if there is none)'),
+    },
+    memory_graph: {
+        chat: () => i18n('Edit the memory nodes and relationships stored in this chat'),
     },
     orch: {
         global: () => i18n('Edit the orchestration profile shared by all characters'),
@@ -122,8 +127,11 @@ export function createIteratePage(app) {
     let snapshotVersion = 0;
     let workLoadVersion = 0;
     let activeScopeKey = '';
+    let loadedSessionsScopeKey = '';
     const activeRuns = new Map();
     const applying = new Set();
+    const deleting = new Set();
+    let clearing = false;
     const importedScopeTargets = new Set();
 
     // Saved copies per target+scope key: { base, target, title }
@@ -283,9 +291,10 @@ export function createIteratePage(app) {
     const currentBusy = () => Boolean(currentRun() || (!session && pendingNewSelection === selectionVersion));
 
     // ----- sessions -------------------------------------------------------
+    const isVisible = () => Boolean(el.isConnected && app.isOpen?.() !== false);
+
     function pendingOf(s) {
-        const last = [...(s?.turns || [])].reverse().find(t => t.role === 'ai' && t.changes?.length);
-        return last && last.state === 'pending' ? last.changes.length : 0;
+        return computePendingCount(s);
     }
 
     function currentScopeKey(w = ws, s = scope) {
@@ -299,39 +308,73 @@ export function createIteratePage(app) {
         const sOpts = scopeOptsFor();
         if (!store || !t || !sOpts) {
             recentSessions = [];
+            loadedSessionsScopeKey = '';
             paintSessions();
             return;
         }
 
         const importKey = currentScopeKey(t.id, scope);
-        if (!importedScopeTargets.has(importKey)) {
-            importedScopeTargets.add(importKey);
-            const ctx = getCtx();
-            if (ctx) {
-                try {
-                    await importLegacySessionsOnce({
-                        ctx,
-                        targetId: t.id,
-                        scope,
-                        scopeOpts: sOpts,
-                        scopeName: scopeDisplayName(scope),
-                    });
-                } catch (err) {
-                    console.warn('[workbench/iterate] legacy import failed:', err);
-                }
-            }
-        }
+        const ctx = getCtx();
 
         try {
-            const list = await store.list('iterate', sOpts);
-            if (ver !== refreshVersion) return;
+            let list;
+            if (typeof store.listWithMeta === 'function') {
+                let meta = await store.listWithMeta('iterate', sOpts);
+                if (ver !== refreshVersion) return;
+                const needsImport = !importedScopeTargets.has(importKey)
+                    && ctx
+                    && (!meta.legacyImported?.[t.id] || (scope === 'global' && hasLegacyGlobalSettingsSessions(ctx, t.id)));
+                importedScopeTargets.add(importKey);
+                if (needsImport) {
+                    try {
+                        const imp = await importLegacySessionsOnce({
+                            ctx,
+                            targetId: t.id,
+                            scope,
+                            scopeOpts: sOpts,
+                            scopeName: scopeDisplayName(scope),
+                            prefetchedState: meta.state,
+                        });
+                        if (ver !== refreshVersion) return;
+                        if (imp?.imported?.length) {
+                            meta = await store.listWithMeta('iterate', sOpts);
+                            if (ver !== refreshVersion) return;
+                        }
+                    } catch (err) {
+                        console.warn('[workbench/iterate] legacy import failed:', err);
+                    }
+                }
+                list = meta.sessions;
+            } else {
+                if (!importedScopeTargets.has(importKey)) {
+                    importedScopeTargets.add(importKey);
+                    if (ctx) {
+                        try {
+                            await importLegacySessionsOnce({
+                                ctx,
+                                targetId: t.id,
+                                scope,
+                                scopeOpts: sOpts,
+                                scopeName: scopeDisplayName(scope),
+                            });
+                        } catch (err) {
+                            console.warn('[workbench/iterate] legacy import failed:', err);
+                        }
+                    }
+                }
+                list = await store.list('iterate', sOpts);
+                if (ver !== refreshVersion) return;
+            }
+
             for (const s of list) sessionScopes.set(s.id, clone(sOpts));
             recentSessions = list;
+            loadedSessionsScopeKey = importKey;
             paintSessions();
             app.refreshBadges?.();
         } catch (err) {
             if (ver === refreshVersion) {
                 recentSessions = [];
+                loadedSessionsScopeKey = '';
                 paintSessions();
                 app.toast(String(err?.message || err), { error: true });
             }
@@ -342,29 +385,142 @@ export function createIteratePage(app) {
         clear(sess);
         sess.classList.toggle('is-open', sessOpen);
         const list = recentSessions.filter(s => !ws || s.ws === ws);
+        const canClear = Boolean(store && list.length && !clearing && !list.some(s => applying.has(s.id)));
         put(sess,
             h('div', { class: 'wb-sess-head' },
                 button(i18n('New conversation'), () => newChat(), { iconName: 'plus' }),
+                store && list.length ? iconButton('trash', i18n('Clear conversations'), () => { void clearVisibleSessions(list); }, {
+                    className: 'wb-sess-clear',
+                    size: 15,
+                    disabled: !canClear,
+                }) : null,
                 sessOpen ? iconButton('x', i18n('Off'), () => { sessOpen = false; paintSessions(); }) : null),
             h('div', { class: 'wb-sess-list' },
                 list.length ? groupSessions(list).map(g => [
                     h('div', { class: 'wb-src-group', text: g.label }),
                     g.items.map(s => {
                         const p = pendingOf(s);
-                        return h('button', {
+                        return h('div', {
+                            class: 'wb-sess-row',
+                            dataset: { sessionId: s.id },
+                        },
+                        h('button', {
                             type: 'button',
                             class: 'wb-sess-item',
                             'aria-current': String(s.id === session?.id),
                             onClick: () => openSession(s.id),
                         },
-                        dot(s.ws || 'other'),
+                        dot(targetById(s.ws)?.tone || (s.ws === 'memory_graph' ? 'memory' : s.ws) || 'other'),
                         h('span', { class: 'wb-sess-main' },
                             h('span', { class: 'wb-sess-t', text: s.title }),
                             h('span', { class: 'wb-sess-m' },
                                 `${targetName(s.ws)} · ${s.scopeName || scopeDisplayName(s.scope)} · ${relativeTime(s.updatedAt)}`,
-                                p ? h('span', { class: 'wb-sess-p', text: i18nFormat(' · ${0} to confirm', p) }) : null)));
+                                p ? h('span', { class: 'wb-sess-p', text: i18nFormat(' · ${0} to confirm', p) }) : null))),
+                        store ? iconButton('trash', i18n('Delete conversation'), (event) => {
+                            event.stopPropagation();
+                            void deleteSession(s);
+                        }, {
+                            className: 'wb-sess-del',
+                            size: 14,
+                            disabled: deleting.has(s.id) || applying.has(s.id) || clearing,
+                        }) : null);
                     }),
                 ]) : h('p', { class: 'wb-note wb-sess-empty', text: i18n('No chats yet.') })));
+    }
+
+    async function deleteSession(targetSession) {
+        const id = targetSession?.id;
+        if (!store || !id || deleting.has(id) || applying.has(id) || clearing) return;
+        const confirmed = await confirmDialog(app.layer || el, {
+            title: i18n('Delete conversation'),
+            message: i18nFormat('Delete "${0}"? This cannot be undone.', targetSession.title || i18n('New conversation')),
+            okLabel: i18n('Delete'),
+            danger: true,
+        });
+        if (!confirmed) return;
+
+        deleting.add(id);
+        paintSessions();
+        try {
+            activeRunForSession(id)?.abort?.abort();
+            const isCurrent = session?.id === id;
+            if (isCurrent) {
+                void firePendingCancelHook();
+            }
+            const sOpts = sessionScopes.get(id) || scopeOptsFor(targetSession.scope) || { scope: 'global' };
+            await store.remove(id, sOpts);
+            drafts.delete(id);
+            sessionScopes.delete(id);
+            recentSessions = recentSessions.filter(x => x.id !== id);
+            if (isCurrent) {
+                selectionVersion++;
+                session = null;
+                paintAll();
+            } else {
+                paintSessions();
+            }
+            app.refreshBadges?.();
+            app.toast(i18n('Conversation deleted'));
+        } catch (err) {
+            app.toast(String(err?.message || err), { error: true });
+        } finally {
+            deleting.delete(id);
+            paintSessions();
+        }
+    }
+
+    async function clearVisibleSessions(visibleList) {
+        if (!store || clearing || !Array.isArray(visibleList) || !visibleList.length) return;
+        if (visibleList.some(s => applying.has(s.id) || deleting.has(s.id))) return;
+        const confirmed = await confirmDialog(app.layer || el, {
+            title: i18n('Clear conversations'),
+            message: i18nFormat('Delete all ${0} conversations under "${1}" (${2})? This cannot be undone.', visibleList.length, targetName(), scopeDisplayName()),
+            okLabel: i18n('Clear all'),
+            danger: true,
+        });
+        if (!confirmed) return;
+
+        clearing = true;
+        paintSessions();
+        try {
+            const ids = visibleList.map(s => s.id).filter(Boolean);
+            const idSet = new Set(ids);
+            for (const id of ids) {
+                activeRunForSession(id)?.abort?.abort();
+            }
+            const clearedCurrent = Boolean(session?.id && idSet.has(session.id));
+            if (clearedCurrent) {
+                void firePendingCancelHook();
+            }
+            const sOpts = scopeOptsFor() || { scope: 'global' };
+            if (typeof store.removeMany === 'function') {
+                await store.removeMany(ids, sOpts);
+            } else {
+                for (const id of ids) {
+                    await store.remove(id, sessionScopes.get(id) || sOpts);
+                }
+            }
+            for (const id of ids) {
+                drafts.delete(id);
+                sessionScopes.delete(id);
+            }
+            recentSessions = recentSessions.filter(x => !idSet.has(x.id));
+            if (clearedCurrent) {
+                selectionVersion++;
+                session = null;
+                paintAll();
+            } else {
+                paintSessions();
+            }
+            app.refreshBadges?.();
+            app.toast(i18nFormat('Deleted ${0} conversations', ids.length));
+        } catch (err) {
+            app.toast(String(err?.message || err), { error: true });
+            if (isVisible()) void refreshSessions();
+        } finally {
+            clearing = false;
+            paintSessions();
+        }
     }
 
     function newChat() {
@@ -380,7 +536,7 @@ export function createIteratePage(app) {
         void firePendingCancelHook();
         const version = ++selectionVersion;
         const sOpts = sessionScopes.get(id) || scopeOptsFor() || { scope: 'global' };
-        let loaded = recentSessions.find(x => x.id === id) || null;
+        let loaded = store ? null : (recentSessions.find(x => x.id === id) || null);
         if (store) {
             try {
                 const fetched = await store.get(id, sOpts);
@@ -1015,9 +1171,10 @@ export function createIteratePage(app) {
                 if (updated) {
                     if (session?.id === ownerId) session = updated;
                     if (stillViewingRunScope()) {
+                        const summary = toSessionSummary(updated);
                         const idx = recentSessions.findIndex(r => r.id === ownerId);
-                        if (idx >= 0) recentSessions[idx] = updated;
-                        else recentSessions = [updated, ...recentSessions];
+                        if (idx >= 0) recentSessions[idx] = summary;
+                        else recentSessions = [summary, ...recentSessions];
                     }
                 }
                 return updated;
@@ -1065,7 +1222,7 @@ export function createIteratePage(app) {
                 paintOpts();
             }
 
-            const turn = await runTurn({
+            const { turn, messages: nextMessages } = await runTurn({
                 run,
                 runTargetObj,
                 runWs,
@@ -1074,11 +1231,13 @@ export function createIteratePage(app) {
                 draft,
                 userContent,
                 controller,
-                saveTo,
             });
-            const latest = (await store.get(ownerId, runScopeOpts)) || current;
+            const latest = await store.get(ownerId, runScopeOpts);
             if (!latest) return;
-            const updatedSession = await saveTo({ turns: [...latest.turns, turn] });
+            const updatedSession = await saveTo({
+                turns: [...latest.turns, turn],
+                ...(nextMessages ? { messages: nextMessages } : {}),
+            });
             if (turn.changes?.length && app.settings().reviewChanges === false && updatedSession) {
                 await apply(ownerId, updatedSession.turns.length - 1, turn.changes.map(c => c.key));
             }
@@ -1087,7 +1246,11 @@ export function createIteratePage(app) {
         } finally {
             if (pendingNewSelection === selection) pendingNewSelection = -1;
             if (runId) activeRuns.delete(runId);
-            await refreshSessions();
+            if (isVisible()) {
+                await refreshSessions();
+            } else {
+                loadedSessionsScopeKey = '';
+            }
             const viewingOwner = ownerId ? session?.id === ownerId : stillViewingStart();
             if (viewingOwner) {
                 paintHead();
@@ -1102,79 +1265,91 @@ export function createIteratePage(app) {
     }
 
     /** One model turn. Never throws: failures become the turn's error text. */
-    async function runTurn({ run, runTargetObj, runWs, runScope, current, draft, userContent, controller, saveTo }) {
+    async function runTurn({ run, runTargetObj, runWs, runScope, current, draft, userContent, controller }) {
         try {
-            const ctx = getCtx();
-            const wrapper = wrapperPrompt({
-                wsName: targetLabel(runTargetObj),
-                scopeText: draft.title,
-                builtin: app.settings().builtinPrompt !== false,
-            });
-            const system = typeof runTargetObj.systemPrompt === 'function'
-                ? await runTargetObj.systemPrompt(runScope, draft.ai, { wrapper, ctx, target: draft.target })
-                : [wrapper, await runTargetObj.prompt(draft.ai, runScope, ctx, { wrapper, target: draft.target })].filter(Boolean).join('\n\n');
-            const history = replayMessagesForApi(current.messages);
-            const messages = trimMessages([{ role: 'system', content: system }, ...history, { role: 'user', content: userContent }]);
-            const tools = await runTargetObj.tools(draft.ai, runScope, ctx, { target: draft.target });
-            const result = await runIterateTurn({
-                messages,
-                live: draft.ai,
-                tools,
-                bus: draft.bus,
-                proposalKinds: runTargetObj.proposalKinds || null,
-                targetRef: draft.target,
-                isRead: (n) => runTargetObj.isRead(n),
-                runRead: (call, live, helpers) => runTargetObj.runRead(call, live, helpers),
-                runEdit: (call, live, helpers) => runTargetObj.runEdit(call, live, helpers),
-                request: (msgs, t) => app.source.aiRequest(runWs, { messages: msgs, tools: t, signal: controller.signal }),
-                onRound: (info) => {
-                    run.liveStep = i18nFormat('Read ${0} times, edited ${1} times…', info.reads, info.edits);
-                    if (session?.id === run.sessionId) paintBody();
-                },
-                signal: controller.signal,
-            });
-            draft.ai = result.live;
-            draft.bus = result.bus;
-            draft.proposalIds = result.proposalIds || [];
-            const changes = buildTurnChanges({
-                base: draft.base,
-                ai: draft.ai,
-                units: runTargetObj.units,
-                bus: draft.bus,
-                proposalIds: draft.proposalIds,
-                kindAdapters: runTargetObj.proposalKinds,
-                targetRef: draft.target,
-            });
-            draft.changes = changes;
-            if (!changes.length) drafts.delete(run.sessionId);
+            return await withActivityLease({
+                source: 'workbench:iterate',
+                label: i18n('Workbench AI iteration'),
+                scope: runScope === 'chat' ? 'chat' : 'global',
+                onCancel: () => controller.abort(),
+            }, async () => {
+                const ctx = getCtx();
+                const wrapper = wrapperPrompt({
+                    wsName: targetLabel(runTargetObj),
+                    scopeText: draft.title,
+                    builtin: app.settings().builtinPrompt !== false,
+                });
+                const system = typeof runTargetObj.systemPrompt === 'function'
+                    ? await runTargetObj.systemPrompt(runScope, draft.ai, { wrapper, ctx, target: draft.target })
+                    : [wrapper, await runTargetObj.prompt(draft.ai, runScope, ctx, { wrapper, target: draft.target })].filter(Boolean).join('\n\n');
+                const history = replayMessagesForApi(current.messages);
+                const messages = trimMessages([{ role: 'system', content: system }, ...history, { role: 'user', content: userContent }]);
+                const tools = await runTargetObj.tools(draft.ai, runScope, ctx, { target: draft.target });
+                const result = await runIterateTurn({
+                    messages,
+                    live: draft.ai,
+                    tools,
+                    bus: draft.bus,
+                    proposalKinds: runTargetObj.proposalKinds || null,
+                    targetRef: draft.target,
+                    isRead: (n) => runTargetObj.isRead(n),
+                    runRead: (call, live, helpers) => runTargetObj.runRead(call, live, helpers),
+                    runEdit: (call, live, helpers) => runTargetObj.runEdit(call, live, helpers),
+                    request: (msgs, t) => app.source.aiRequest(runWs, { messages: msgs, tools: t, signal: controller.signal }),
+                    onRound: (info) => {
+                        run.liveStep = i18nFormat('Read ${0} times, edited ${1} times…', info.reads, info.edits);
+                        if (session?.id === run.sessionId) paintBody();
+                    },
+                    signal: controller.signal,
+                });
+                draft.ai = result.live;
+                draft.bus = result.bus;
+                draft.proposalIds = result.proposalIds || [];
+                const changes = buildTurnChanges({
+                    base: draft.base,
+                    ai: draft.ai,
+                    units: runTargetObj.units,
+                    bus: draft.bus,
+                    proposalIds: draft.proposalIds,
+                    kindAdapters: runTargetObj.proposalKinds,
+                    targetRef: draft.target,
+                });
+                draft.changes = changes;
+                if (!changes.length) drafts.delete(run.sessionId);
 
-            const all = result.messages.filter(m => m.role !== 'system');
-            const msgKeep = history.length;
-            await saveTo({ messages: all });
+                const all = result.messages.filter(m => m.role !== 'system');
+                const msgKeep = history.length;
 
-            return {
-                role: 'ai',
-                text: result.text || (changes.length ? '' : i18n('(The AI made no changes)')),
-                ...(result.reasoning ? { reasoning: result.reasoning } : {}),
-                ...(result.toolCalls?.length ? { toolCalls: result.toolCalls } : {}),
-                reads: result.reads.length,
-                edits: result.edits.length,
-                failed: result.failed.length,
-                changes,
-                proposalIds: draft.proposalIds,
-                state: changes.length ? 'pending' : '',
-                target: draft.title,
-                msgKeep,
-                at: Date.now(),
-            };
+                return {
+                    messages: all,
+                    turn: {
+                        role: 'ai',
+                        text: result.text || (changes.length ? '' : i18n('(The AI made no changes)')),
+                        ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+                        ...(result.toolCalls?.length ? { toolCalls: result.toolCalls } : {}),
+                        reads: result.reads.length,
+                        edits: result.edits.length,
+                        failed: result.failed.length,
+                        changes,
+                        proposalIds: draft.proposalIds,
+                        state: changes.length ? 'pending' : '',
+                        target: draft.title,
+                        msgKeep,
+                        at: Date.now(),
+                    },
+                };
+            });
         } catch (err) {
             drafts.delete(run.sessionId);
             return {
-                role: 'ai',
-                text: '',
-                error: controller.signal.aborted ? i18n('Stopped.') : i18nFormat('Not changed: ${0}', err?.message || err),
-                msgKeep: (current.messages || []).length,
-                at: Date.now(),
+                messages: null,
+                turn: {
+                    role: 'ai',
+                    text: '',
+                    error: controller.signal.aborted ? i18n('Stopped.') : i18nFormat('Not changed: ${0}', err?.message || err),
+                    msgKeep: (current.messages || []).length,
+                    at: Date.now(),
+                },
             };
         }
     }
@@ -1440,20 +1615,33 @@ export function createIteratePage(app) {
         },
         onSnapshot() {
             evictStaleWork();
-            const ver = ++snapshotVersion;
-            refreshScopes().then(() => {
-                if (ver !== snapshotVersion) return;
-                fixScope();
+            if (!isVisible()) {
                 const nextKey = currentScopeKey();
-                const scopeChanged = nextKey !== activeScopeKey;
-                if (scopeChanged) {
-                    activeScopeKey = nextKey;
+                if (activeScopeKey && nextKey !== activeScopeKey) {
+                    activeScopeKey = '';
+                    loadedSessionsScopeKey = '';
                     selectionVersion++;
                     session = null;
                     recentSessions = [];
                     loadError = '';
                 }
-                if (el.isConnected && !currentBusy()) {
+                return;
+            }
+            const ver = ++snapshotVersion;
+            refreshScopes().then(() => {
+                if (ver !== snapshotVersion || !isVisible()) return;
+                fixScope();
+                const nextKey = currentScopeKey();
+                const scopeChanged = nextKey !== activeScopeKey;
+                if (scopeChanged) {
+                    activeScopeKey = nextKey;
+                    loadedSessionsScopeKey = '';
+                    selectionVersion++;
+                    session = null;
+                    recentSessions = [];
+                    loadError = '';
+                }
+                if (!currentBusy()) {
                     if (scopeChanged) paintAll();
                     else {
                         paintHead();
@@ -1461,19 +1649,24 @@ export function createIteratePage(app) {
                         paintPreview();
                     }
                 }
-                void refreshSessions();
+                if (scopeChanged || loadedSessionsScopeKey !== nextKey) {
+                    void refreshSessions();
+                }
             });
         },
         onRegistryUpdate() {
+            if (!isVisible()) {
+                loadedSessionsScopeKey = '';
+                return;
+            }
             const ver = ++snapshotVersion;
             refreshScopes().then(() => {
-                if (ver !== snapshotVersion) return;
+                if (ver !== snapshotVersion || !isVisible()) return;
                 fixScope();
                 activeScopeKey = currentScopeKey();
-                if (el.isConnected) {
-                    paintAll();
-                    void refreshSessions();
-                }
+                loadedSessionsScopeKey = '';
+                paintAll();
+                void refreshSessions();
             });
         },
         pendingCount: () => recentSessions.reduce((n, s) => n + (pendingOf(s) ? 1 : 0), 0),
@@ -1491,6 +1684,7 @@ export function createIteratePage(app) {
             paintPreview();
         },
         onCollapse() {
+            loadedSessionsScopeKey = '';
             return firePendingCancelHook();
         },
         destroy() {

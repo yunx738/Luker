@@ -269,7 +269,19 @@ import {
     formatInstructModeStoryString,
     getInstructStoppingSequences,
 } from './scripts/instruct-mode.js';
-import { initLocales, t } from './scripts/i18n.js';
+import { getCurrentLocale, initLocales, t, translate } from './scripts/i18n.js';
+import { setToastTranslator } from './scripts/luker-toast.js';
+import {
+    buildChatSwitchBlockingReasons,
+    cancelChatSwitchActivities,
+    createChatSwitchConfirmRunner,
+    getChatSwitchBlockingLabels,
+    hasActiveSource,
+    hasChatSwitchGuard,
+    hasUnloadGuard,
+    resolveRequestActivityLeaseOptions,
+    withActivityLease,
+} from './scripts/activity-guard.js';
 import { getFriendlyTokenizerName, getTokenCount, getTokenCountAsync, initTokenizers, saveTokenCacheDebounced, flushTokenCacheSave } from './scripts/tokenizers.js';
 import { consumeLastUsage } from './scripts/last-usage.js';
 import {
@@ -334,7 +346,8 @@ import { fetchRecentChatsSnapshot, initWelcomeScreen, openPermanentAssistantChat
 import { initDataMaid } from './scripts/data-maid.js';
 import { clearItemizedPrompts, deleteItemizedPromptForMessage, deleteItemizedPrompts, findItemizedPromptSet, flushItemizedPromptsSave, initItemizedPrompts, itemizedParams, itemizedPrompts, loadItemizedPrompts, promptItemize, replaceItemizedPromptText, saveItemizedPrompts, saveItemizedPromptsDebounced, swapItemizedPrompts } from './scripts/itemized-prompts.js';
 import { getSystemMessageByType, initSystemMessages, SAFETY_CHAT, sendSystemMessage, system_message_types, system_messages } from './scripts/system-messages.js';
-import { initAnnouncements } from './scripts/announcements.js';
+import { initAnnouncements, whenCriticalAnnouncementsDone } from './scripts/announcements.js';
+import { initWhatsNew } from './scripts/whats-new.js';
 import { event_types, eventSource } from './scripts/events.js';
 import {
     settleChatChanged,
@@ -439,6 +452,7 @@ function waitForPageLoad() {
 }
 
 // Configure toast library:
+setToastTranslator(translate);
 toastr.options = {
     positionClass: 'toast-top-center',
     closeButton: false,
@@ -458,34 +472,6 @@ toastr.options = {
         fixToastrForDialogs();
     },
 };
-
-// Run once during startup
-toastr.subscribe(function (args) {
-    if (args.state !== 'visible') {
-        return;
-    }
-
-    const $container = toastr.getContainer(args.options, false);
-    if (!$container || !$container.length) {
-        return;
-    }
-
-    // toastr has already inserted the element at this point
-    const $toast = args.options.newestOnTop
-        ? $container.children().first()
-        : $container.children().last();
-
-    // Meaning of "clickable":
-    // Interactable unless tapToDismiss was explicitly false
-    const isInteractable = args.options.tapToDismiss !== false;
-    $toast.toggleClass('interactable', isInteractable);
-    if (isInteractable) {
-        $toast.attr('title', t`Tap to close`);
-    } else {
-        $toast.removeAttr('title');
-        $toast.addClass('toast-non-interactable');
-    }
-});
 
 export const characterGroupOverlay = new BulkEditOverlay();
 
@@ -1410,8 +1396,8 @@ if (typeof window !== 'undefined') {
             }
 
             // In a chat? Closing it returns to the welcome screen. closeCurrentChat()
-            // toasts instead of closing while generation is in flight; we still consume
-            // the press so the exit-confirm toast does not stack on top.
+            // prompts for confirmation when tasks or edits are active; consume the press
+            // so the exit-confirm toast does not stack on top.
             if (this_chid !== undefined || selected_group) {
                 void closeCurrentChat();
                 return 'consumed';
@@ -2355,6 +2341,14 @@ async function firstLoadInit() {
         () => initTextGenModelSelects(),
         () => initSystemMessages(),
         () => initAnnouncements(),
+        () => {
+            void initWhatsNew({
+                getRequestHeaders,
+                getLocale: getCurrentLocale,
+                translate,
+                waitForAnnouncements: whenCriticalAnnouncementsDone,
+            });
+        },
         () => initExtensions(),
         () => bootstrapExtensions(),
         () => initExtensionSlashCommands(),
@@ -2510,49 +2504,54 @@ export function resultCheckStatus() {
 }
 
 /**
- * Switches the currently selected character to the one with the given ID. (character index, not the character key!)
- *
- * If the character ID doesn't exist, if the chat is being saved, or if a group is being generated, this function does nothing.
- * If the character is different from the currently selected one, it will clear the chat and reset any selected character or group.
- * @param {number} id The ID of the character to switch to.
+ * Switches the currently selected character to the one with the given ID (character index, not the character key).
+ * @param {number|string} id The ID of the character to switch to.
  * @param {object} [options] Options for the switch.
  * @param {boolean} [options.switchMenu=true] Whether to switch the right menu to the character edit menu if the character is already selected.
- * @returns {Promise<void>} A promise that resolves when the character is switched.
+ * @param {boolean} [options.skipSwitchGuard=false] Whether to skip the interactive confirmation dialog while still cancelling/fencing active chat-scoped work.
+ * @returns {Promise<boolean>} False if cancelled or unable to switch, true otherwise.
  */
-export async function selectCharacterById(id, { switchMenu = true } = {}) {
+export async function selectCharacterById(id, { switchMenu = true, skipSwitchGuard = false } = {}) {
     if (characters[id] === undefined) {
-        return;
+        return false;
     }
 
     if (shouldBlockChatSwitchWhileSaving()) {
         toastr.info(t`Please wait until the chat is saved before switching characters.`, t`Your chat is still saving...`);
-        return;
+        return false;
     }
 
-    if (selected_group && is_group_generating) {
-        return;
+    const inTempChat = !selected_group && this_chid === undefined && name2 === neutralCharacterName;
+    const isLeavingActiveChat = Boolean(selected_group)
+        || (this_chid !== undefined && String(this_chid) !== String(id))
+        || inTempChat;
+
+    if (isLeavingActiveChat) {
+        if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+            return false;
+        }
     }
 
     if (selected_group || String(this_chid) !== String(id)) {
         //if clicked on a different character from what was currently selected
-        if (!is_send_press) {
-            setCharacterId(undefined);
-            setCharacterName('');
-            resetSelectedGroup();
-            await clearChat({ clearData: true });
-            cancelTtsPlay();
-            this_edit_mes_id = undefined;
-            selected_button = 'character_edit';
-            setCharacterId(id);
-            beginChatTransition();
-            chat_metadata = {};
-            await getChat();
-        }
+        setCharacterId(undefined);
+        setCharacterName('');
+        resetSelectedGroup();
+        await clearChat({ clearData: true });
+        cancelTtsPlay();
+        this_edit_mes_id = undefined;
+        selected_button = 'character_edit';
+        setCharacterId(id);
+        beginChatTransition();
+        chat_metadata = {};
+        await getChat();
+        return true;
     } else {
         //if clicked on character that was already selected
         switchMenu && (selected_button = 'character_edit');
         await unshallowCharacter(this_chid);
         select_selected_character(this_chid, { switchMenu });
+        return true;
     }
 }
 
@@ -3320,7 +3319,7 @@ async function restoreDeletedCharacterUndoSnapshots(snapshots) {
     if (currentCharacterSnapshot && !selected_group && this_chid === undefined) {
         const restoredCharacterId = characters.findIndex(entry => entry.avatar === currentCharacterSnapshot.avatarUrl);
         if (restoredCharacterId >= 0) {
-            await selectCharacterById(restoredCharacterId);
+            await selectCharacterById(restoredCharacterId, { skipSwitchGuard: true });
         }
     }
 
@@ -3337,7 +3336,7 @@ async function refreshVisibleDeletedChatViews(fileName = '') {
     }
 }
 
-async function deleteCharacterChatInternal(characterId, fileName, { mediaPrompt = true } = {}) {
+async function deleteCharacterChatInternal(characterId, fileName, { mediaPrompt = true, skipSwitchGuard = false } = {}) {
     await unshallowCharacter(characterId);
 
     /** @type {Character} */
@@ -3345,6 +3344,14 @@ async function deleteCharacterChatInternal(characterId, fileName, { mediaPrompt 
     if (!character) {
         console.warn(`Character with ID ${characterId} not found.`);
         return false;
+    }
+
+    const previousSelectedChat = String(character.chat || '');
+    const deletedCurrentChat = previousSelectedChat.replace(/\.jsonl$/i, '') === String(fileName).replace(/\.jsonl$/i, '');
+    if (deletedCurrentChat && !selected_group && Number(characterId) === Number(this_chid)) {
+        if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+            return false;
+        }
     }
 
     // Offer the associated media preview before the chat goes away; the
@@ -3377,8 +3384,6 @@ async function deleteCharacterChatInternal(characterId, fileName, { mediaPrompt 
     }
 
     const rawChatSnapshot = await getRawCharacterChatSnapshot(characterId, fileName);
-    const previousSelectedChat = String(character.chat || '');
-    const deletedCurrentChat = previousSelectedChat.replace(/\.jsonl$/i, '') === String(fileName).replace(/\.jsonl$/i, '');
 
     const response = await fetch('/api/chats/delete', {
         method: 'POST',
@@ -3436,7 +3441,7 @@ async function deleteCharacterChatInternal(characterId, fileName, { mediaPrompt 
                     await updateRemoteChatName(characterId, fileName);
                 } else if (String(character.chat || '') === replacementChatName) {
                     await updateRemoteChatName(characterId, fileName);
-                    await openCharacterChat(fileName);
+                    await openCharacterChat(fileName, { skipSwitchGuard: true });
                 }
             }
 
@@ -3450,13 +3455,13 @@ async function deleteCharacterChatInternal(characterId, fileName, { mediaPrompt 
     return true;
 }
 
-async function delChat(chatfile) {
+async function delChat(chatfile, options = {}) {
     const fileName = String(chatfile || '').replace(/\.jsonl$/i, '');
     if (!fileName) {
         return false;
     }
 
-    return await deleteCharacterChatInternal(String(this_chid), fileName);
+    return await deleteCharacterChatInternal(String(this_chid), fileName, options);
 }
 
 /**
@@ -3673,6 +3678,10 @@ export async function clearChat({ clearData = false, isCurrent = undefined } = {
     if (isCurrent) {
         await saveItemizedPrompts(getCurrentChatId());
         if (!isCurrent()) return;
+    }
+
+    if (clearData) {
+        bumpChatTransitionEpoch();
     }
 
     stopLukerGenerationRecovery();
@@ -6749,6 +6758,12 @@ class StreamingProcessor {
         this.reasoningBlocks = null;
         /** @type {object[]?} */
         this.reasoningDetails = null;
+        /** @type {number} */
+        this.chatEpoch = getChatTransitionEpoch();
+    }
+
+    isStaleEpoch() {
+        return this.chatEpoch !== getChatTransitionEpoch();
     }
 
     /**
@@ -6785,6 +6800,9 @@ class StreamingProcessor {
     }
 
     async onStartStreaming(text) {
+        if (this.isStaleEpoch()) {
+            return -1;
+        }
         const continueOnReasoning = !!(this.type === 'continue' && this.promptReasoning.prefixReasoning);
         if (continueOnReasoning) {
             this.reasoningHandler.initContinue(this.promptReasoning);
@@ -6797,8 +6815,14 @@ class StreamingProcessor {
             this.sendTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
             await saveReply({ type: this.type, getMessage: text, fromStreaming: true });
+            if (this.isStaleEpoch()) {
+                return -1;
+            }
             messageId = chat.length - 1;
             await this.#checkDomElements(messageId, continueOnReasoning);
+            if (this.isStaleEpoch()) {
+                return -1;
+            }
             this.markUIGenStarted();
         }
         hideSwipeButtons({ hideCounters: true });
@@ -6807,6 +6831,9 @@ class StreamingProcessor {
     }
 
     async onProgressStreaming(messageId, text, isFinal) {
+        if (this.isStaleEpoch()) {
+            return;
+        }
         const isImpersonate = this.type == 'impersonate';
         const isContinue = this.type == 'continue';
 
@@ -6839,11 +6866,20 @@ class StreamingProcessor {
         }
 
         if (isImpersonate) {
+            if (this.isStaleEpoch()) {
+                return;
+            }
             this.sendTextarea.value = processedText;
             this.sendTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
+            if (!chat[messageId]) {
+                return;
+            }
             const mesChanged = chat[messageId].mes !== processedText;
             await this.#checkDomElements(messageId);
+            if (this.isStaleEpoch() || !chat[messageId]) {
+                return;
+            }
             this.#updateMessageBlockVisibility();
             const currentTime = new Date();
             chat[messageId].mes = processedText;
@@ -6856,11 +6892,17 @@ class StreamingProcessor {
 
             // Update reasoning
             await this.reasoningHandler.process(messageId, mesChanged, this.promptReasoning);
+            if (this.isStaleEpoch() || !chat[messageId]) {
+                return;
+            }
             processedText = chat[messageId].mes;
 
             // Token count update.
             const tokenCountText = this.reasoningHandler.reasoning + processedText;
             const currentTokenCount = isFinal && power_user.message_token_count_enabled ? await resolveAssistantTokenCount(tokenCountText) : 0;
+            if (this.isStaleEpoch() || !chat[messageId]) {
+                return;
+            }
             if (currentTokenCount) {
                 chat[messageId].extra.token_count = currentTokenCount;
                 if (this.messageTokenCounterDom instanceof HTMLElement) {
@@ -6904,7 +6946,7 @@ class StreamingProcessor {
             this.setFirstSwipe(messageId);
         }
 
-        if (!scrollLock) {
+        if (!scrollLock && !this.isStaleEpoch()) {
             scrollChatToBottom({ waitForFrame: true });
         }
     }
@@ -6919,7 +6961,13 @@ class StreamingProcessor {
      * @param {boolean} options.unlockUI - Whether to unlock the generation UI.
      */
     async finalizeIntermediaryMessage(messageId, text, { unlockUI = true, deferEmit = false, suppressEmit = false }) {
+        if (this.isStaleEpoch()) {
+            return;
+        }
         await this.onProgressStreaming(messageId, text, true);
+        if (this.isStaleEpoch()) {
+            return;
+        }
         const messageElement = chatElement.find(`.mes[mesid="${messageId}"]`);
         const message = chat[messageId];
         // Stamp before swipe_info clones extra. A non-stop reason (`tool_calls`,
@@ -6938,8 +6986,11 @@ class StreamingProcessor {
         addCopyToCodeBlocks(messageElement);
 
         await this.reasoningHandler.finish(messageId);
+        if (this.isStaleEpoch()) {
+            return;
+        }
 
-        if (Array.isArray(this.swipes) && this.swipes.length > 0) {
+        if (message && Array.isArray(this.swipes) && this.swipes.length > 0) {
             const swipeInfoExtra = structuredClone(message.extra ?? {});
             delete swipeInfoExtra.token_count;
             delete swipeInfoExtra.reasoning;
@@ -6956,26 +7007,31 @@ class StreamingProcessor {
             message.swipe_info.push(...swipeInfoArray);
         }
 
-        syncMesToSwipe(messageId);
-        saveLogprobsForActiveMessage(this.messageLogprobs.filter(Boolean), this.continueMessage);
+        if (message) {
+            syncMesToSwipe(messageId);
+            saveLogprobsForActiveMessage(this.messageLogprobs.filter(Boolean), this.continueMessage);
+        }
 
-        if (Array.isArray(this.images) && this.images.length > 0) {
+        if (message && Array.isArray(this.images) && this.images.length > 0) {
             await processImageAttachment(message, { imageUrls: this.images });
+            if (this.isStaleEpoch()) {
+                return;
+            }
             appendMediaToMessage(message, $(this.messageDom));
         }
 
         // Store reasoning signature for models that support multi-turn context
-        if (this.reasoningSignature) {
+        if (message && this.reasoningSignature) {
             message.extra = message.extra || {};
             message.extra.reasoning_signature = this.reasoningSignature;
         }
 
-        if (Array.isArray(this.reasoningBlocks) && this.reasoningBlocks.length > 0) {
+        if (message && Array.isArray(this.reasoningBlocks) && this.reasoningBlocks.length > 0) {
             message.extra = message.extra || {};
             message.extra.reasoning_blocks = this.reasoningBlocks;
         }
 
-        if (Array.isArray(this.reasoningDetails) && this.reasoningDetails.length > 0) {
+        if (message && Array.isArray(this.reasoningDetails) && this.reasoningDetails.length > 0) {
             message.extra = message.extra || {};
             message.extra.reasoning_details = this.reasoningDetails;
         }
@@ -6998,16 +7054,24 @@ class StreamingProcessor {
             // from extensions (they only see the merged final message).
             if (!deferEmit && !suppressEmit) {
                 await eventSource.emit(event_types.MESSAGE_RECEIVED, this.messageId, this.type);
+                if (this.isStaleEpoch()) {
+                    return;
+                }
                 await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, this.messageId, this.type);
             }
         } else if (!suppressEmit) {
             await eventSource.emit(event_types.IMPERSONATE_READY, text);
         }
 
-        updateSwipeCounter(messageId, { message, messageElement });
+        if (!this.isStaleEpoch()) {
+            updateSwipeCounter(messageId, { message, messageElement });
+        }
     }
 
     async onFinishStreaming(messageId, text, { suppress = false } = {}) {
+        if (this.isStaleEpoch()) {
+            return;
+        }
         // suppress=true is the auto-continue-on-truncated intermediate-round
         // contract: the just-finished round's text is already accumulated in
         // chat[i].mes via onProgressStreaming, but we must NOT emit
@@ -7025,6 +7089,9 @@ class StreamingProcessor {
         // double-write that BE then dedups (producing a snapshot phantom).
         // See commit 6c99b32d0 (HAR analysis) for the race details.
         await this.finalizeIntermediaryMessage(messageId, text, { unlockUI: true, deferEmit: true });
+        if (this.isStaleEpoch()) {
+            return;
+        }
 
         const isAborted = this.abortController.signal.aborted;
         if (!isAborted && power_user.auto_swipe && generatedTextFiltered(text)) {
@@ -7055,25 +7122,37 @@ class StreamingProcessor {
             // Backend persisted the reply after ACK timeout; avoid writing it again on the client.
         } else if (canUseIncrementalAppend) {
             const appended = await appendChatMessages([chat[this.messageId]]);
-            if (!appended) {
+            if (!appended && !this.isStaleEpoch()) {
                 await saveChatConditional();
             }
         } else {
             await saveChatConditional();
         }
+        if (this.isStaleEpoch()) {
+            return;
+        }
 
         if (this.type !== 'impersonate') {
             await eventSource.emit(event_types.MESSAGE_RECEIVED, this.messageId, this.type);
+            if (this.isStaleEpoch()) {
+                return;
+            }
             await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, this.messageId, this.type);
         }
 
-        playMessageSound();
-        notifyMessageComplete(text, String(chat[this.messageId]?.name || ''));
+        if (!this.isStaleEpoch()) {
+            playMessageSound();
+            notifyMessageComplete(text, String(chat[this.messageId]?.name || ''));
+        }
     }
 
     onErrorStreaming() {
         this.abortController.abort();
         this.isStopped = true;
+
+        if (this.isStaleEpoch()) {
+            return;
+        }
 
         this.markUIGenStopped();
 
@@ -7111,9 +7190,18 @@ class StreamingProcessor {
     }
 
     async generate() {
+        if (this.isStaleEpoch()) {
+            return this.result;
+        }
         if (this.messageId == -1) {
             this.messageId = await this.onStartStreaming(this.firstMessageText);
+            if (this.isStaleEpoch()) {
+                return this.result;
+            }
             await delay(1); // delay for message to be rendered
+            if (this.isStaleEpoch()) {
+                return this.result;
+            }
             scrollLock = false;
         }
 
@@ -7132,7 +7220,7 @@ class StreamingProcessor {
                 if (!this.timeToFirstToken) {
                     this.timeToFirstToken = now - this.createdAt.getTime();
                 }
-                if (this.isStopped || this.abortController.signal.aborted) {
+                if (this.isStopped || this.abortController.signal.aborted || this.isStaleEpoch()) {
                     return this.result;
                 }
 
@@ -7161,7 +7249,13 @@ class StreamingProcessor {
                 if (state?.finishReason) {
                     this.finishReason = String(state.finishReason);
                 }
+                if (this.isStaleEpoch()) {
+                    return this.result;
+                }
                 await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED, text);
+                if (this.isStaleEpoch()) {
+                    return this.result;
+                }
                 await sw.tick(async () => await this.onProgressStreaming(this.messageId, this.continueMessage + text));
             }
             const seconds = (timestamps[timestamps.length - 1] - timestamps[0]) / 1000;
@@ -7261,16 +7355,17 @@ export function createRawPrompt(prompt, api, instructOverride, quietToLoud, syst
  * @prop {string} [llmPresetName] Optional OpenAI chat-completion preset name for this request only.
  * @prop {string} [apiPresetName] Optional connection profile name; resolved internally to the corresponding connection settings override for this request only.
  * @prop {object} [apiSettingsOverride] Optional OpenAI connection settings override object for this request only.
+ * @prop {boolean|object} [activity] Optional activity guard lease overrides or `false` to opt out.
  * @param {GenerateRawParams} params Parameters for generating a message
  * @returns {Promise<string>} Generated message
  */
-export async function generateRaw({ prompt = '', api = null, instructOverride = false, quietToLoud = false, systemPrompt = '', responseLength = null, trimNames = true, prefill = '', jsonSchema = null, llmPresetName = '', apiPresetName = '', apiSettingsOverride = null } = {}) {
+export async function generateRaw({ prompt = '', api = null, instructOverride = false, quietToLoud = false, systemPrompt = '', responseLength = null, trimNames = true, prefill = '', jsonSchema = null, llmPresetName = '', apiPresetName = '', apiSettingsOverride = null, activity = true } = {}) {
     if (arguments.length > 0 && typeof arguments[0] !== 'object') {
         console.trace('generateRaw called with positional arguments. Please use an object instead.');
-        [prompt, api, instructOverride, quietToLoud, systemPrompt, responseLength, trimNames, prefill, jsonSchema, llmPresetName, apiPresetName, apiSettingsOverride] = arguments;
+        [prompt, api, instructOverride, quietToLoud, systemPrompt, responseLength, trimNames, prefill, jsonSchema, llmPresetName, apiPresetName, apiSettingsOverride, activity] = arguments;
     }
 
-    const data = await generateRawData({ prompt, api, instructOverride, quietToLoud, systemPrompt, responseLength, prefill, jsonSchema, llmPresetName, apiPresetName, apiSettingsOverride });
+    const data = await generateRawData({ prompt, api, instructOverride, quietToLoud, systemPrompt, responseLength, prefill, jsonSchema, llmPresetName, apiPresetName, apiSettingsOverride, activity });
 
     // JSON string (matching the provided schema) will already be extracted.
     if (jsonSchema) {
@@ -7301,125 +7396,131 @@ export async function generateRaw({ prompt = '', api = null, instructOverride = 
  * @param {GenerateRawParams} params Parameters for generating a message
  * @returns {Promise<object | string>} Raw API response data, or a JSON string extracted from the response when `jsonSchema` is provided.
  */
-export async function generateRawData({ prompt = '', api = null, instructOverride = false, quietToLoud = false, systemPrompt = '', responseLength = null, prefill = '', jsonSchema = null, llmPresetName = '', apiPresetName = '', apiSettingsOverride = null } = {}) {
-    if (!api) {
-        api = main_api;
-    }
-
-    const abortController = new AbortController();
-    const responseLengthCustomized = typeof responseLength === 'number' && responseLength > 0;
-    let eventHook = () => { };
-
-    // construct final prompt from the input. Can either be a string or an array of chat-style messages.
-    prompt = createRawPrompt(prompt, api, instructOverride, quietToLoud, systemPrompt, prefill);
-
-    // Allow extensions to stop generation before it happens
-    const eventAbortController = new AbortController();
-    const abortHook = () => {
-        abortController.abort(new Error('Cancelled by stop event'));
-        eventAbortController.abort(new Error('Cancelled by extension'));
-    };
-    eventSource.on(event_types.GENERATION_STOPPED, abortHook);
-
-    try {
-        if (responseLengthCustomized) {
-            TempResponseLength.save(api, responseLength);
-        }
-        /** @type {object|any[]} */
-        let generateData = {};
-
-        // Allow extensions to modify the prompt before generation
-        // 1. for text completion
-        if (typeof prompt === 'string') {
-            const eventData = { prompt: prompt, dryRun: false };
-            await eventSource.emit(event_types.GENERATE_AFTER_COMBINE_PROMPTS, eventData);
-            prompt = eventData.prompt;
-        }
-        // 2. for chat completion
-        if (Array.isArray(prompt)) {
-            const eventData = { chat: prompt, dryRun: false };
-            await eventSource.emit(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
-            prompt = eventData.chat;
+export async function generateRawData({ prompt = '', api = null, instructOverride = false, quietToLoud = false, systemPrompt = '', responseLength = null, prefill = '', jsonSchema = null, llmPresetName = '', apiPresetName = '', apiSettingsOverride = null, activity = true } = {}) {
+    const leaseOptions = resolveRequestActivityLeaseOptions(activity, 'core:generate-raw', {
+        defaultLabel: translate('Background AI request'),
+    });
+    const run = async () => {
+        if (!api) {
+            api = main_api;
         }
 
-        // Check if the generation was aborted during the event
-        eventAbortController.signal.throwIfAborted();
+        const abortController = new AbortController();
+        const responseLengthCustomized = typeof responseLength === 'number' && responseLength > 0;
+        let eventHook = () => { };
 
-        switch (api) {
-            case 'kobold':
-            case 'koboldhorde':
-                if (kai_settings.preset_settings === 'gui') {
-                    generateData = { prompt: prompt, gui_settings: true, max_length: amount_gen, max_context_length: max_context, api_server: kai_settings.api_server };
-                } else {
-                    const isHorde = api === 'koboldhorde';
-                    const koboldSettings = koboldai_settings[koboldai_setting_names[kai_settings.preset_settings]];
-                    generateData = getKoboldGenerationData(prompt.toString(), koboldSettings, amount_gen, max_context, isHorde, 'quiet');
+        // construct final prompt from the input. Can either be a string or an array of chat-style messages.
+        prompt = createRawPrompt(prompt, api, instructOverride, quietToLoud, systemPrompt, prefill);
+
+        // Allow extensions to stop generation before it happens
+        const eventAbortController = new AbortController();
+        const abortHook = () => {
+            abortController.abort(new Error('Cancelled by stop event'));
+            eventAbortController.abort(new Error('Cancelled by extension'));
+        };
+        eventSource.on(event_types.GENERATION_STOPPED, abortHook);
+
+        try {
+            if (responseLengthCustomized) {
+                TempResponseLength.save(api, responseLength);
+            }
+            /** @type {object|any[]} */
+            let generateData = {};
+
+            // Allow extensions to modify the prompt before generation
+            // 1. for text completion
+            if (typeof prompt === 'string') {
+                const eventData = { prompt: prompt, dryRun: false };
+                await eventSource.emit(event_types.GENERATE_AFTER_COMBINE_PROMPTS, eventData);
+                prompt = eventData.prompt;
+            }
+            // 2. for chat completion
+            if (Array.isArray(prompt)) {
+                const eventData = { chat: prompt, dryRun: false };
+                await eventSource.emit(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
+                prompt = eventData.chat;
+            }
+
+            // Check if the generation was aborted during the event
+            eventAbortController.signal.throwIfAborted();
+
+            switch (api) {
+                case 'kobold':
+                case 'koboldhorde':
+                    if (kai_settings.preset_settings === 'gui') {
+                        generateData = { prompt: prompt, gui_settings: true, max_length: amount_gen, max_context_length: max_context, api_server: kai_settings.api_server };
+                    } else {
+                        const isHorde = api === 'koboldhorde';
+                        const koboldSettings = koboldai_settings[koboldai_setting_names[kai_settings.preset_settings]];
+                        generateData = getKoboldGenerationData(prompt.toString(), koboldSettings, amount_gen, max_context, isHorde, 'quiet');
+                    }
+                    TempResponseLength.restore(api);
+                    break;
+                case 'novel': {
+                    const novelSettings = novelai_settings[novelai_setting_names[nai_settings.preset_settings_novel]];
+                    generateData = getNovelGenerationData(prompt, novelSettings, amount_gen, false, false, null, 'quiet');
+                    TempResponseLength.restore(api);
+                    break;
                 }
-                TempResponseLength.restore(api);
-                break;
-            case 'novel': {
-                const novelSettings = novelai_settings[novelai_setting_names[nai_settings.preset_settings_novel]];
-                generateData = getNovelGenerationData(prompt, novelSettings, amount_gen, false, false, null, 'quiet');
-                TempResponseLength.restore(api);
-                break;
-            }
-            case 'textgenerationwebui':
-                generateData = await getTextGenGenerationData(prompt, amount_gen, false, false, null, 'quiet');
-                TempResponseLength.restore(api);
-                break;
-            case 'openai': {
-                generateData = prompt;  // generateData is just the chat message object
-                eventHook = TempResponseLength.setupEventHook(api);
-            } break;
-        }
-
-        let data = {};
-
-        if (api === 'koboldhorde') {
-            data = await generateHorde(prompt.toString(), generateData, abortController.signal, false);
-        } else if (api === 'openai') {
-            data = await sendOpenAIRequest('quiet', generateData, abortController.signal, {
-                jsonSchema,
-                llmPresetName: String(llmPresetName || '').trim(),
-                apiPresetName: String(apiPresetName || '').trim(),
-                apiSettingsOverride: apiSettingsOverride && typeof apiSettingsOverride === 'object' ? apiSettingsOverride : null,
-            });
-        } else {
-            const generateUrl = getGenerateUrl(api);
-            const response = await fetch(generateUrl, {
-                method: 'POST',
-                headers: getRequestHeaders(),
-                cache: 'no-cache',
-                body: JSON.stringify(generateData),
-                signal: abortController.signal,
-            });
-
-            if (!response.ok) {
-                throw await response.json();
+                case 'textgenerationwebui':
+                    generateData = await getTextGenGenerationData(prompt, amount_gen, false, false, null, 'quiet');
+                    TempResponseLength.restore(api);
+                    break;
+                case 'openai': {
+                    generateData = prompt;  // generateData is just the chat message object
+                    eventHook = TempResponseLength.setupEventHook(api);
+                } break;
             }
 
-            data = await response.json();
-        }
+            let data = {};
 
-        // should only happen for text completions
-        // other frontend paths do not return data if calling the backend fails,
-        // they throw things instead
-        if (data.error) {
-            throw new Error(data.response);
-        }
+            if (api === 'koboldhorde') {
+                data = await generateHorde(prompt.toString(), generateData, abortController.signal, false);
+            } else if (api === 'openai') {
+                data = await sendOpenAIRequest('quiet', generateData, abortController.signal, {
+                    jsonSchema,
+                    llmPresetName: String(llmPresetName || '').trim(),
+                    apiPresetName: String(apiPresetName || '').trim(),
+                    apiSettingsOverride: apiSettingsOverride && typeof apiSettingsOverride === 'object' ? apiSettingsOverride : null,
+                });
+            } else {
+                const generateUrl = getGenerateUrl(api);
+                const response = await fetch(generateUrl, {
+                    method: 'POST',
+                    headers: getRequestHeaders(),
+                    cache: 'no-cache',
+                    body: JSON.stringify(generateData),
+                    signal: abortController.signal,
+                });
 
-        if (jsonSchema) {
-            return extractJsonFromData(data, { mainApi: api, returnInvalidJson: jsonSchema.returnInvalid });
-        }
+                if (!response.ok) {
+                    throw await response.json();
+                }
 
-        return data;
-    } finally {
-        eventSource.removeListener(event_types.GENERATION_STOPPED, abortHook);
-        if (responseLengthCustomized && TempResponseLength.isCustomized()) {
-            TempResponseLength.restore(api);
-            TempResponseLength.removeEventHook(api, eventHook);
+                data = await response.json();
+            }
+
+            // should only happen for text completions
+            // other frontend paths do not return data if calling the backend fails,
+            // they throw things instead
+            if (data.error) {
+                throw new Error(data.response);
+            }
+
+            if (jsonSchema) {
+                return extractJsonFromData(data, { mainApi: api, returnInvalidJson: jsonSchema.returnInvalid });
+            }
+
+            return data;
+        } finally {
+            eventSource.removeListener(event_types.GENERATION_STOPPED, abortHook);
+            if (responseLengthCustomized && TempResponseLength.isCustomized()) {
+                TempResponseLength.restore(api);
+                TempResponseLength.removeEventHook(api, eventHook);
+            }
         }
-    }
+    };
+    return leaseOptions ? await withActivityLease(leaseOptions, run) : await run();
 }
 
 class TempResponseLength {
@@ -7730,44 +7831,6 @@ function applyFinalizedAuthorsNoteInjections(anBefore = [], anAfter = []) {
     );
 }
 
-// Number of Generate() invocations currently in flight. Consumers that need to
-// know whether a generation is running (the mobile background keep-alive) read
-// this instead of the GENERATION_STARTED / GENERATION_ENDED pair, which is not
-// balanced: recursive tool-call and auto-continue-on-truncated rounds emit
-// STARTED without a matching ENDED, early returns emit STARTED before the stop
-// button that ENDED is gated on ever appears, and a quiet generation
-// overlapping a main one swallows the main generation's ENDED. Counting at the
-// Generate() boundary is exact for every entry and exit path.
-let generationInFlightCount = 0;
-let generationInFlightListener = null;
-
-/**
- * Whether a Generate() call is currently in flight.
- * @returns {boolean}
- */
-export function isGenerationInFlight() {
-    return generationInFlightCount > 0;
-}
-
-/**
- * Register a callback invoked whenever the in-flight generation count changes.
- * Only one callback is retained.
- * @param {(inFlight: boolean) => void} callback
- */
-export function setGenerationInFlightListener(callback) {
-    generationInFlightListener = typeof callback === 'function' ? callback : null;
-}
-
-function notifyGenerationInFlightChanged() {
-    if (typeof generationInFlightListener === 'function') {
-        try {
-            generationInFlightListener(generationInFlightCount > 0);
-        } catch (_) {
-            // A listener throwing must not break generation.
-        }
-    }
-}
-
 /**
  * MARK:Generate()
  * Runs a generation using the current chat context.
@@ -7777,23 +7840,12 @@ function notifyGenerationInFlightChanged() {
  * @returns {Promise<any>} Returns a promise that resolves when the text is done generating.
  */
 export async function Generate(type, options = {}, dryRun = false) {
-    // A dry run only assembles the prompt (token counting, previews); it neither
-    // calls the model nor persists, so it must not hold the keep-alive.
-    if (dryRun) {
-        return await generateInternal(type, options, dryRun);
-    }
-    generationInFlightCount += 1;
-    notifyGenerationInFlightChanged();
-    try {
-        return await generateInternal(type, options, dryRun);
-    } finally {
-        generationInFlightCount = Math.max(0, generationInFlightCount - 1);
-        notifyGenerationInFlightChanged();
-    }
+    return await generateInternal(type, options, dryRun);
 }
 
 async function generateInternal(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema = null, depth = 0 } = {}, dryRun = false) {
     console.log('Generate entered');
+    const genEpoch = getChatTransitionEpoch();
     setGenerationProgress(0);
     if (!dryRun && type !== 'quiet') {
         generation_started = new Date();
@@ -7833,31 +7885,83 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
             return false;
         }
 
-        setExtensionPrompt(inject_ids.QUIET_PROMPT, '', extension_prompt_types.IN_PROMPT, 0, true);
+        if (getChatTransitionEpoch() === genEpoch) {
+            setExtensionPrompt(inject_ids.QUIET_PROMPT, '', extension_prompt_types.IN_PROMPT, 0, true);
 
-        if (!dryRun && type !== 'quiet') {
-            unblockGeneration(type);
+            if (!dryRun && type !== 'quiet') {
+                unblockGeneration(type);
+            }
         }
 
         return true;
     };
-
-    // OpenAI doesn't need instruct mode. Use OAI main prompt instead.
-    const isInstruct = power_user.instruct.enabled && main_api !== 'openai';
-    const isImpersonate = type == 'impersonate';
 
     if (!(dryRun || depth || type == 'regenerate' || type == 'swipe' || type == 'quiet')) {
         const interruptedByCommand = await processCommands(String($('#send_textarea').val()));
 
         if (interruptedByCommand) {
             //$("#send_textarea").val('')[0].dispatchEvent(new Event('input', { bubbles:true }));
-            unblockGeneration(type);
+            if (getChatTransitionEpoch() === genEpoch) {
+                unblockGeneration(type);
+            }
             return Promise.resolve();
         }
     }
 
+    const generationPayload = {
+        type,
+        automatic_trigger,
+        force_name2,
+        quiet_prompt,
+        quietToLoud,
+        skipWIAN,
+        force_chid,
+        signal,
+        quietImage,
+        quietName,
+        jsonSchema,
+        depth,
+        dryRun,
+        genEpoch,
+        generationEventParams,
+        generationAbortController,
+        exitAbortedGenerationIfNeeded,
+    };
+
+    if (dryRun) {
+        return await generateInternalAfterCommands(generationPayload);
+    }
+
+    return await withActivityLease({
+        source: type === 'quiet' ? 'core:generation-quiet' : 'core:generation',
+        label: type === 'quiet' ? t`Background generation` : t`Message generation`,
+        scope: 'chat',
+        guardUnload: true,
+        guardChatSwitch: true,
+        keepAlive: true,
+        onCancel: () => {
+            if (!generationAbortController.signal.aborted) {
+                stopGeneration();
+            }
+        },
+    }, () => generateInternalAfterCommands(generationPayload));
+}
+
+async function generateInternalAfterCommands({ type, automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema, depth, dryRun, genEpoch, generationEventParams, generationAbortController, exitAbortedGenerationIfNeeded }) {
+    const isStaleEpoch = () => !dryRun && getChatTransitionEpoch() !== genEpoch;
+    if (isStaleEpoch()) {
+        return Promise.resolve();
+    }
+
+    // OpenAI doesn't need instruct mode. Use OAI main prompt instead.
+    const isInstruct = power_user.instruct.enabled && main_api !== 'openai';
+    const isImpersonate = type == 'impersonate';
+
     // Occurs only if the generation is not aborted due to slash commands execution
     await eventSource.emit(event_types.GENERATION_AFTER_COMMANDS, type, generationEventParams, dryRun);
+    if (isStaleEpoch()) {
+        return Promise.resolve();
+    }
 
     // Compatibility bridge for scripts that rewrite #send_textarea during GENERATION_AFTER_COMMANDS.
     // v1.4.0 snapshots textarea early to protect IME input; if a listener intentionally rewrites the
@@ -7890,6 +7994,9 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
     if (!dryRun) {
         // Ping server to make sure it is still alive
         const pingResult = await pingServer();
+        if (isStaleEpoch()) {
+            return Promise.resolve();
+        }
 
         if (!pingResult) {
             unblockGeneration(type);
@@ -7909,7 +8016,7 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
     if (selected_group && !is_group_generating) {
         if (!dryRun) {
             // Returns the promise that generateGroupWrapper returns; resolves when generation is done
-            return generateGroupWrapper(false, type, { quiet_prompt, force_chid, signal: generationAbortController.signal, quietImage, jsonSchema });
+            return await generateGroupWrapper(false, type, { quiet_prompt, force_chid, signal: generationAbortController.signal, quietImage, jsonSchema });
         }
 
         const characterIndexMap = new Map(characters.map((char, index) => [char.avatar, index]));
@@ -8237,6 +8344,9 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
     if (!dryRun) {
         console.debug('Running extension interceptors');
         const aborted = await runGenerationInterceptors(coreChat, this_max_context, type);
+        if (isStaleEpoch()) {
+            return Promise.resolve();
+        }
 
         if (aborted) {
             console.debug('Generation aborted by extension interceptors');
@@ -9172,7 +9282,7 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     messageExamples: oaiMessageExamples,
                 }, dryRun);
             } catch (error) {
-                if (!dryRun) {
+                if (!dryRun && !isStaleEpoch()) {
                     if (type !== 'quiet') {
                         notifyMessageFailure(String(error?.message || error || ''), String(name2 || ''));
                     }
@@ -9197,7 +9307,7 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
 
     await eventSource.emit(event_types.GENERATE_AFTER_DATA, generate_data, dryRun);
 
-    if (dryRun) {
+    if (dryRun || isStaleEpoch()) {
         return Promise.resolve();
     }
 
@@ -9207,6 +9317,9 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
      * @throws {Error|object} Error with message text, or Error with response JSON (OAI/Horde), or the actual response JSON (novel|textgenerationwebui|kobold)
      */
     async function finishGenerating() {
+        if (isStaleEpoch()) {
+            return;
+        }
         if (power_user.console_log_prompts) {
             console.log(generate_data.prompt);
         }
@@ -9217,11 +9330,15 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
 
         //set array object for prompt token itemization of this message
         let currentArrayEntry = Number(thisPromptBits.length - 1);
+        const allAnchors = await getAllExtensionPrompts();
+        if (isStaleEpoch()) {
+            return;
+        }
         let additionalPromptStuff = {
             ...thisPromptBits[currentArrayEntry],
             rawPrompt: generate_data.prompt || generate_data.input,
             mesId: getNextMessageId(type),
-            allAnchors: await getAllExtensionPrompts(),
+            allAnchors,
             chatInjects: injectedIndices?.map(index => arrMes[arrMes.length - index - 1])?.join('') || '',
             authorsNoteString: (extension_prompts['2_floating_prompt']?.value || ''),
             smartContextString: (extension_prompts.chromadb?.value || ''),
@@ -9279,25 +9396,36 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                 abortSignal: generationAbortController.signal,
             };
             await eventSource.emit(event_types.GENERATE_TAKEOVER_DISPATCH, dispatchEvent);
+            if (isStaleEpoch()) {
+                try { dispatchEvent.takeoverHandle?.setOnUpdate?.(null); } catch { /* idempotent */ }
+                return Object.defineProperties(new String(''), {
+                    'fromTakeover': { value: true },
+                });
+            }
 
             if (dispatchEvent.takeoverHandle) {
                 // Takeover plugins replace the sendOpenAIRequest step, which
                 // is where CHAT_COMPLETION_SETTINGS_READY normally fires for
-                // chat-completion prompt processors (e.g. ST-Prompt-Template's
-                // EJS template engine). On this path the plugin consumes the
-                // messages and ST core never reaches sendOpenAIRequest, so
-                // those hooks would otherwise silently no-op. Emit the event
-                // here as the takeover-path equivalent so the assembled
-                // messages still get a chance to be processed before the
-                // plugin reads them. The hook's expected shape is
-                // `{ messages: [...] }` (the chat-completion request body
-                // shape), so wrap generate_data — which carries the array
-                // under the legacy `prompt` field name on this path
-                // (`generate_data = { prompt: prompt }` at line 8186) — and
-                // write any replacement back so the plugin sees it.
+                // chat-completion prompt processors (e.g. template engines).
+                // On this path the plugin consumes the messages and core never
+                // reaches sendOpenAIRequest, so those hooks would otherwise
+                // silently no-op. Emit the event here as the takeover-path
+                // equivalent so the assembled messages still get a chance to
+                // be processed before the plugin reads them. The hook's
+                // expected shape is `{ messages: [...] }` (the chat-completion
+                // request body shape), so wrap generate_data — which carries
+                // the array under the legacy `prompt` field name on this path
+                // (`generate_data = { prompt: prompt }`) — and write any
+                // replacement back so the plugin sees it.
                 if (main_api === 'openai' && Array.isArray(generate_data?.prompt)) {
                     const hookData = { messages: generate_data.prompt };
                     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, hookData);
+                    if (isStaleEpoch()) {
+                        try { dispatchEvent.takeoverHandle?.setOnUpdate?.(null); } catch { /* idempotent */ }
+                        return Object.defineProperties(new String(''), {
+                            'fromTakeover': { value: true },
+                        });
+                    }
                     generate_data.prompt = hookData.messages;
                 }
 
@@ -9322,6 +9450,12 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
 
                 // ── 1. Acquire/push placeholder per type ──
                 const placeholderId = await acquireTakeoverPlaceholder(type);
+                if (abortController !== myAbortController || isStaleEpoch()) {
+                    try { handle.setOnUpdate?.(null); } catch { /* idempotent */ }
+                    return Object.defineProperties(new String(''), {
+                        'fromTakeover': { value: true },
+                    });
+                }
                 const originalText = String(chat[placeholderId]?.mes ?? '');
                 const originalReasoning = String(chat[placeholderId]?.extra?.reasoning ?? '');
                 // Seed the slot's gen_started with the takeover claim time so
@@ -9337,6 +9471,7 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
 
                 // ── 2. Wire onUpdate → live redraw + chat mutation ──
                 handle.setOnUpdate?.((text, reasoning) => {
+                    if (abortController !== myAbortController || isStaleEpoch()) return;
                     if (!chat[placeholderId]) return;
                     chat[placeholderId].mes = String(text ?? '');
                     if (!chat[placeholderId].extra) chat[placeholderId].extra = {};
@@ -9355,24 +9490,25 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                 // something the kernel papers over with a timeout.
                 const outcome = await handle.complete;
                 try { handle.setOnUpdate?.(null); } catch { /* idempotent */ }
-                showSwipeButtons();
 
-                // Liveness boundary: a fresh Generate() may have replaced
-                // our abortController while we awaited handle.complete —
-                // the typical "stop then send a new message" sequence. The
-                // plugin's late settle is stale for every outcome, not
-                // just `discarded`: a late `committed` would mutate a slot
-                // the user already cancelled, emit MESSAGE_RECEIVED + run
-                // saveChatConditional / triggerAutoContinue against state
-                // the new turn now owns; a late `aborted` would clobber
-                // the slot the new turn pushed. setOnUpdate is already
-                // detached above so the plugin can't keep writing either.
-                // Drop everything and let the new turn proceed unaware.
-                if (abortController !== myAbortController) {
+                // Liveness boundary: a fresh Generate() or chat switch may have
+                // replaced our abortController or bumped the chat epoch while
+                // we awaited handle.complete — the typical "stop then send a
+                // new message" or "switch chats mid-generation" sequence. The
+                // plugin's late settle is stale for every outcome, not just
+                // `discarded`: a late `committed` would mutate a slot the user
+                // already cancelled or left behind, emit MESSAGE_RECEIVED + run
+                // saveChatConditional / triggerAutoContinue against state the
+                // new turn or new chat now owns; a late `aborted` would clobber
+                // the slot the new turn pushed. setOnUpdate is already detached
+                // above so the plugin can't keep writing either. Drop everything
+                // and let the new turn/chat proceed unaware.
+                if (abortController !== myAbortController || isStaleEpoch()) {
                     return Object.defineProperties(new String(''), {
                         'fromTakeover': { value: true },
                     });
                 }
+                showSwipeButtons();
 
                 // ── 4. Route by outcome ──
                 if (outcome.status === 'committed') {
@@ -9400,6 +9536,11 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                         if (power_user.message_token_count_enabled) {
                             const tokenCountText = (finalReasoning || '') + cleanedText;
                             slot.extra.token_count = await resolveAssistantTokenCount(tokenCountText);
+                            if (abortController !== myAbortController || isStaleEpoch()) {
+                                return Object.defineProperties(new String(''), {
+                                    'fromTakeover': { value: true },
+                                });
+                            }
                         }
                         // Sync mes into the active swipe slot (saveReply
                         // initialised `swipes`/`swipe_info` at placeholder
@@ -9443,9 +9584,16 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                         // Server already has it; nothing to do.
                     } else if (canUseIncrementalAppend) {
                         const appended = await appendChatMessages([chat[placeholderId]]);
-                        if (!appended) await saveChatConditional();
+                        if (!appended && abortController === myAbortController && !isStaleEpoch()) {
+                            await saveChatConditional();
+                        }
                     } else {
                         await saveChatConditional();
+                    }
+                    if (abortController !== myAbortController || isStaleEpoch()) {
+                        return Object.defineProperties(new String(''), {
+                            'fromTakeover': { value: true },
+                        });
                     }
 
                     // Unblock the UI (and fire GENERATION_ENDED via
@@ -9461,6 +9609,11 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     unblockGeneration(type);
 
                     await eventSource.emit(event_types.MESSAGE_RECEIVED, placeholderId, type);
+                    if (abortController !== myAbortController || isStaleEpoch()) {
+                        return Object.defineProperties(new String(''), {
+                            'fromTakeover': { value: true },
+                        });
+                    }
                     await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, placeholderId, type);
 
                     // Note: `statMesProcess` was already called inside the
@@ -9474,7 +9627,9 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     // placeholder push), stats were already updated by
                     // the prior bookkeeping that created the slot.
 
-                    triggerAutoContinue?.(cleanedText, false);
+                    if (abortController === myAbortController && !isStaleEpoch()) {
+                        triggerAutoContinue?.(cleanedText, false);
+                    }
                     // Wrap with `fromTakeover` so onSuccess short-circuits
                     // (otherwise it would re-run saveReply on the returned
                     // text and duplicate the entry).
@@ -9487,26 +9642,22 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     // Plugin signalled mid-turn abort (typically user
                     // clicked stop and the plugin chose to preserve
                     // whatever partial output had streamed so far).
-                    // Mirrors ST core streaming's `isStreamFinished`
-                    // gate at line ~8420 below: a stopped stream
-                    // publishes its partial in the chat slot but
-                    // skips `onFinishStreaming` (no MESSAGE_RECEIVED
-                    // / persistence / autoContinue). Same trade-off:
-                    // the aborted partial lives locally until the
-                    // user's next action (regenerate / swipe / send
-                    // / reload). Skipping persistence is deliberate —
-                    // saving the aborted partial to the server would
-                    // crystallise state the user just clicked stop to
-                    // prevent.
+                    // Mirrors core streaming's `isStreamFinished` gate
+                    // below: a stopped stream publishes its partial in the
+                    // chat slot but skips `onFinishStreaming` (no
+                    // MESSAGE_RECEIVED / persistence / autoContinue). Same
+                    // trade-off: the aborted partial lives locally until the
+                    // user's next action (regenerate / swipe / send / reload).
+                    // Skipping persistence is deliberate — saving the aborted
+                    // partial to the server would crystallise state the user
+                    // just clicked stop to prevent.
                     //
-                    // The sync writes below mirror the committed
-                    // branch in structure but skip the metadata that
-                    // only matters for persisted messages: no
-                    // token-count `await` (transient content,
-                    // metadata not worth the yield point that opens
-                    // a stop+regenerate race window) and no
-                    // swipe_info clone (the partial is not a finished
-                    // swipe).
+                    // The sync writes below mirror the committed branch in
+                    // structure but skip the metadata that only matters for
+                    // persisted messages: no token-count `await` (transient
+                    // content, metadata not worth the yield point that opens
+                    // a stop+regenerate race window) and no swipe_info clone
+                    // (the partial is not a finished swipe).
                     const cleanedText = applyPostGenerationText(outcome.finalText, isImpersonate, isContinue);
                     const finalReasoning = String(outcome.finalReasoning ?? '');
                     const slot = chat[placeholderId];
@@ -9543,6 +9694,11 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                 } catch (rollbackErr) {
                     console.error('[takeover] rollback failed', rollbackErr);
                 }
+                if (abortController !== myAbortController || isStaleEpoch()) {
+                    return Object.defineProperties(new String(''), {
+                        'fromTakeover': { value: true },
+                    });
+                }
                 try { await eventSource.emit(event_types.GENERATION_STOPPED); } catch { /* best-effort */ }
                 unblockGeneration(type);
                 return Object.defineProperties(new String(''), {
@@ -9553,16 +9709,36 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
 
         if (isStreamingEnabled() && type !== 'quiet') {
             continue_mag = promptReasoning.removePrefix(continue_mag);
-            streamingProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
+            const streamProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
+            streamingProcessor = streamProcessor;
+            const clearStreamingProcessorIfOwned = () => {
+                if (streamingProcessor === streamProcessor) {
+                    streamingProcessor = null;
+                }
+            };
             if (isContinue) {
                 // Save reply does add cycle text to the prompt, so it's not needed here
-                streamingProcessor.firstMessageText = '';
+                streamProcessor.firstMessageText = '';
             }
 
-            streamingProcessor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
+            streamProcessor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
+            if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                clearStreamingProcessorIfOwned();
+                return Object.defineProperties(new String(''), {
+                    'messageChunk': { value: '' },
+                    'fromStream': { value: true },
+                });
+            }
 
             hideSwipeButtons();
-            let getMessage = await streamingProcessor.generate();
+            let getMessage = await streamProcessor.generate();
+            if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                clearStreamingProcessorIfOwned();
+                return Object.defineProperties(new String(''), {
+                    'messageChunk': { value: '' },
+                    'fromStream': { value: true },
+                });
+            }
             let messageChunk = cleanUpMessage({
                 getMessage: getMessage,
                 isImpersonate: isImpersonate,
@@ -9574,19 +9750,40 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                 getMessage = continue_mag + getMessage;
             }
 
-            const isStreamFinished = streamingProcessor && !streamingProcessor.isStopped && streamingProcessor.isFinished;
-            const isStreamWithToolCalls = streamingProcessor && Array.isArray(streamingProcessor.toolCalls) && streamingProcessor.toolCalls.length;
+            const isStreamFinished = !streamProcessor.isStopped && streamProcessor.isFinished;
+            const isStreamWithToolCalls = Array.isArray(streamProcessor.toolCalls) && streamProcessor.toolCalls.length;
             if (canPerformToolCalls && isStreamFinished && isStreamWithToolCalls) {
                 const lastMessage = chat[chat.length - 1];
-                const hasToolCalls = ToolManager.hasToolCalls(streamingProcessor.toolCalls);
-                const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(lastMessage?.mes) && !lastMessage?.extra?.reasoning && ['', '...'].includes(streamingProcessor?.result);
+                const hasToolCalls = ToolManager.hasToolCalls(streamProcessor.toolCalls);
+                const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(lastMessage?.mes) && !lastMessage?.extra?.reasoning && ['', '...'].includes(streamProcessor.result);
                 hasToolCalls && shouldDeleteMessage && await deleteLastMessage();
-                if (hasToolCalls && !shouldDeleteMessage) {
-                    await streamingProcessor.finalizeIntermediaryMessage(streamingProcessor.messageId, getMessage, { unlockUI: false });
+                if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                    clearStreamingProcessorIfOwned();
+                    return Object.defineProperties(new String(''), {
+                        'messageChunk': { value: '' },
+                        'fromStream': { value: true },
+                    });
                 }
-                const invocationResult = await ToolManager.invokeFunctionTools(streamingProcessor.toolCalls, {
-                    reasoningText: streamingProcessor.reasoningHandler.reasoning,
+                if (hasToolCalls && !shouldDeleteMessage) {
+                    await streamProcessor.finalizeIntermediaryMessage(streamProcessor.messageId, getMessage, { unlockUI: false });
+                    if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                        clearStreamingProcessorIfOwned();
+                        return Object.defineProperties(new String(''), {
+                            'messageChunk': { value: '' },
+                            'fromStream': { value: true },
+                        });
+                    }
+                }
+                const invocationResult = await ToolManager.invokeFunctionTools(streamProcessor.toolCalls, {
+                    reasoningText: streamProcessor.reasoningHandler.reasoning,
                 });
+                if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                    clearStreamingProcessorIfOwned();
+                    return Object.defineProperties(new String(''), {
+                        'messageChunk': { value: '' },
+                        'fromStream': { value: true },
+                    });
+                }
                 const shouldStopGeneration = (!invocationResult.invocations.length && shouldDeleteMessage) || invocationResult.stealthCalls.length;
                 if (hasToolCalls) {
                     if (shouldStopGeneration) {
@@ -9594,19 +9791,25 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                             ToolManager.showToolCallError(invocationResult.errors);
                         }
                         unblockGeneration(type);
-                        streamingProcessor = null;
+                        clearStreamingProcessorIfOwned();
                         return;
                     }
 
-                    streamingProcessor = null;
+                    clearStreamingProcessorIfOwned();
                     depth = depth + 1;
                     await ToolManager.saveFunctionToolInvocations(invocationResult.invocations);
+                    if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                        return Object.defineProperties(new String(''), {
+                            'messageChunk': { value: '' },
+                            'fromStream': { value: true },
+                        });
+                    }
                     return Generate('normal', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth }, dryRun);
                 }
             }
 
             if (isStreamFinished) {
-                const streamFinishReason = streamingProcessor?.finishReason ?? null;
+                const streamFinishReason = streamProcessor.finishReason ?? null;
                 const willAutoContinue = shouldAutoContinueOnTruncated(streamFinishReason, isImpersonate);
                 if (willAutoContinue) {
                     // Middle round of an auto-continue-on-truncated chain.
@@ -9618,8 +9821,14 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     // to the same chat[i] via the existing continue path.
                     // Downstream extensions see one MESSAGE_RECEIVED for the
                     // merged final reply after the chain terminates.
-                    await streamingProcessor.onFinishStreaming(streamingProcessor.messageId, getMessage, { suppress: true });
-                    streamingProcessor = null;
+                    await streamProcessor.onFinishStreaming(streamProcessor.messageId, getMessage, { suppress: true });
+                    clearStreamingProcessorIfOwned();
+                    if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                        return Object.defineProperties(new String(''), {
+                            'messageChunk': { value: '' },
+                            'fromStream': { value: true },
+                        });
+                    }
                     // Re-check abort AFTER the suppress-finalize (which is
                     // async and can await through several ticks: reasoning
                     // finish, token count, DOM sync) and BEFORE the recursive
@@ -9636,6 +9845,12 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                         // the plain path where a stop mid-stream still fires
                         // MESSAGE_RECEIVED for the partial).
                         await eventSource.emit(event_types.MESSAGE_RECEIVED, chat.length - 1, type);
+                        if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                            return Object.defineProperties(new String(''), {
+                                'messageChunk': { value: '' },
+                                'fromStream': { value: true },
+                            });
+                        }
                         await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat.length - 1, type);
                         return Object.defineProperties(new String(getMessage), {
                             'messageChunk': { value: messageChunk },
@@ -9644,8 +9859,14 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     }
                     return Generate('continue', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth: depth + 1 }, dryRun);
                 }
-                await streamingProcessor.onFinishStreaming(streamingProcessor.messageId, getMessage);
-                streamingProcessor = null;
+                await streamProcessor.onFinishStreaming(streamProcessor.messageId, getMessage);
+                clearStreamingProcessorIfOwned();
+                if (isStaleEpoch() || streamProcessor.isStaleEpoch()) {
+                    return Object.defineProperties(new String(''), {
+                        'messageChunk': { value: '' },
+                        'fromStream': { value: true },
+                    });
+                }
                 triggerAutoContinue(messageChunk, isImpersonate);
                 return Object.defineProperties(new String(getMessage), {
                     'messageChunk': { value: messageChunk },
@@ -9661,7 +9882,7 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
         notifyMessageProgressStart(String(name2 || chat?.[chat.length - 1]?.name || ''));
     }
 
-    return finishGenerating().then(onSuccess, onError);
+    return await finishGenerating().then(onSuccess, onError);
 
     /**
      * Handles the successful response from the generation API.
@@ -9680,8 +9901,14 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
         // editor handle; the marker tells us not to re-run extraction +
         // saveReply (which would push a second, duplicate chat entry).
         if (data?.fromTakeover) {
-            unblockGeneration(type);
+            if (!isStaleEpoch()) {
+                unblockGeneration(type);
+            }
             return data;
+        }
+
+        if (isStaleEpoch()) {
+            return;
         }
 
         let messageChunk = '';
@@ -9742,10 +9969,15 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
         });
 
         if (isImpersonate) {
+            if (isStaleEpoch()) {
+                return;
+            }
             $('#send_textarea').val(getMessage)[0].dispatchEvent(new Event('input', { bubbles: true }));
             await eventSource.emit(event_types.IMPERSONATE_READY, getMessage);
         } else if (type == 'quiet') {
-            unblockGeneration(type);
+            if (!isStaleEpoch()) {
+                unblockGeneration(type);
+            }
             return getMessage;
         } else {
             // Auto-continue-on-truncated: decide BEFORE saveReply so we can
@@ -9765,6 +9997,9 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                 ({ type, getMessage } = await saveReply({ type, getMessage, title, swipes, reasoning, imageUrls, reasoningSignature, reasoningBlocks, reasoningDetails, suppressEmit: willAutoContinue, finishReason: stampedFinishReason }));
             } else {
                 ({ type, getMessage } = await saveReply({ type: 'appendFinal', getMessage, title, swipes, reasoning, imageUrls, reasoningSignature, reasoningBlocks, reasoningDetails, suppressEmit: willAutoContinue, finishReason: stampedFinishReason }));
+            }
+            if (isStaleEpoch()) {
+                return;
             }
 
             // This relies on `saveReply` having been called to add the message to the chat, so it must be last.
@@ -9792,8 +10027,13 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
                     // message (matching non-streaming abort semantics where
                     // the request-inflight abort still surfaces MESSAGE_RECEIVED).
                     await eventSource.emit(event_types.MESSAGE_RECEIVED, chat.length - 1, type);
+                    if (isStaleEpoch()) {
+                        return;
+                    }
                     await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat.length - 1, type);
-                    unblockGeneration(type);
+                    if (!isStaleEpoch()) {
+                        unblockGeneration(type);
+                    }
                     return;
                 }
                 return Generate('continue', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth: depth + 1 }, dryRun);
@@ -9804,7 +10044,13 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
             const hasToolCalls = ToolManager.hasToolCalls(data);
             const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(getMessage) && !reasoning;
             hasToolCalls && shouldDeleteMessage && await deleteLastMessage();
+            if (isStaleEpoch()) {
+                return;
+            }
             const invocationResult = await ToolManager.invokeFunctionTools(data, { reasoningText: reasoning });
+            if (isStaleEpoch()) {
+                return;
+            }
             const shouldStopGeneration = (!invocationResult.invocations.length && shouldDeleteMessage) || invocationResult.stealthCalls.length;
             if (hasToolCalls) {
                 if (shouldStopGeneration) {
@@ -9817,8 +10063,15 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
 
                 depth = depth + 1;
                 await ToolManager.saveFunctionToolInvocations(invocationResult.invocations);
+                if (isStaleEpoch()) {
+                    return;
+                }
                 return Generate('normal', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth }, dryRun);
             }
+        }
+
+        if (isStaleEpoch()) {
+            return;
         }
 
         if (type !== 'quiet') {
@@ -9856,11 +10109,14 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
             // Backend persisted the reply after ACK timeout; avoid writing it again on the client.
         } else if (canUseIncrementalAppend) {
             const appended = await appendChatMessages([chat[chat.length - 1]]);
-            if (!appended) {
+            if (!appended && !isStaleEpoch()) {
                 await saveChatConditional();
             }
         } else {
             await saveChatConditional();
+        }
+        if (isStaleEpoch()) {
+            return;
         }
         unblockGeneration(type);
         streamingProcessor = null;
@@ -9883,6 +10139,10 @@ async function generateInternal(type, { automatic_trigger, force_name2, quiet_pr
      * @throws {Error|object} Re-throws the exception
      */
     function onError(exception) {
+        if (isStaleEpoch()) {
+            console.log(exception);
+            throw exception;
+        }
         clearMessageProgressNotification();
 
         const isAbortedError = generationAbortController?.signal?.aborted
@@ -10678,8 +10938,13 @@ export async function sendStreamingRequest(type, data, options = {}) {
         throw new Error('Generation was aborted.');
     }
 
+    const processor = streamingProcessor;
+    const signal = processor?.abortController?.signal;
     const requestPayload = { type, data, options, mainApi: main_api, stream: true };
     await eventSource.emit(event_types.GENERATION_BEFORE_API_REQUEST, requestPayload);
+    if (!processor || streamingProcessor !== processor || processor.isStaleEpoch() || signal?.aborted || abortController?.signal?.aborted) {
+        throw new DOMException('Generation was aborted.', 'AbortError');
+    }
     data = requestPayload.data;
     options = requestPayload.options || options;
 
@@ -10709,13 +10974,13 @@ export async function sendStreamingRequest(type, data, options = {}) {
 
     switch (main_api) {
         case 'openai':
-            return await sendOpenAIRequest(type, data.prompt, streamingProcessor.abortController.signal, options);
+            return await sendOpenAIRequest(type, data.prompt, signal, options);
         case 'textgenerationwebui':
-            return await generateTextGenWithStreaming(data, streamingProcessor.abortController.signal, { onLukerMeta });
+            return await generateTextGenWithStreaming(data, signal, { onLukerMeta });
         case 'novel':
-            return await generateNovelWithStreaming(data, streamingProcessor.abortController.signal, { onLukerMeta });
+            return await generateNovelWithStreaming(data, signal, { onLukerMeta });
         case 'kobold':
-            return await generateKoboldWithStreaming(data, streamingProcessor.abortController.signal, { onLukerMeta });
+            return await generateKoboldWithStreaming(data, signal, { onLukerMeta });
         default:
             throw new Error('Streaming is enabled, but the current API does not support streaming.');
     }
@@ -11366,6 +11631,8 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
     // chain-final round only. Combines with fromStreaming for the same net
     // effect the streaming path already relies on.
     const shouldEmit = !fromStreaming && !suppressEmit;
+    const saveEpoch = getChatTransitionEpoch();
+    const isStaleEpoch = () => getChatTransitionEpoch() !== saveEpoch;
 
     const lastMessage = chat[chat.length - 1];
 
@@ -11420,7 +11687,12 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
             }
             const chat_id = (chat.length - 1);
             extractMessageById(chat_id);
-            shouldEmit && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+            if (shouldEmit) {
+                await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+                if (isStaleEpoch()) {
+                    return { type, getMessage };
+                }
+            }
             addOneMessage(chat[chat_id], { type: 'swipe' });
             shouldEmit && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
         } else {
@@ -11456,7 +11728,12 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         }
         const chat_id = (chat.length - 1);
         extractMessageById(chat_id);
-        shouldEmit && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+        if (shouldEmit) {
+            await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+            if (isStaleEpoch()) {
+                return { type, getMessage };
+            }
+        }
         addOneMessage(chat[chat_id], { type: 'swipe' });
         shouldEmit && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
     } else if (type === 'appendFinal') {
@@ -11489,7 +11766,12 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         }
         const chat_id = (chat.length - 1);
         extractMessageById(chat_id);
-        shouldEmit && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+        if (shouldEmit) {
+            await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+            if (isStaleEpoch()) {
+                return { type, getMessage };
+            }
+        }
         addOneMessage(chat[chat_id], { type: 'swipe' });
         shouldEmit && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
     } else {
@@ -11539,7 +11821,12 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         const chat_id = (chat.length - 1);
 
         extractMessageById(chat_id);
-        shouldEmit && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+        if (shouldEmit) {
+            await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
+            if (isStaleEpoch()) {
+                return { type, getMessage };
+            }
+        }
         addOneMessage(chat[chat_id]);
         shouldEmit && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
     }
@@ -12087,7 +12374,7 @@ async function performCharacterRename(characterId, newValue, { silent = false, r
     }
 
     // Select the character after the renaming
-    await selectCharacterById(newChId);
+    await selectCharacterById(newChId, { skipSwitchGuard: true });
 
     // Async delay to update UI
     await delay(1);
@@ -12983,6 +13270,11 @@ export function consumePendingForceOverwrite(target) {
     return null;
 }
 
+function hasPendingForceOverwrite(target) {
+    const key = getChatStateTargetKey(target);
+    return Boolean(key && pendingForceOverwriteTargets.has(key));
+}
+
 export function runSerializedChatWrite(task) {
     if (typeof task !== 'function') {
         return Promise.resolve(undefined);
@@ -13000,8 +13292,12 @@ function syncCurrentChatIntegrityFromMetadata(metadata = null) {
     if (!chat_metadata || typeof chat_metadata !== 'object') {
         return;
     }
-    // A late response cannot authorize a group cleared by a pending or failed load.
-    if (selected_group && !chat_metadata.integrity) {
+    // A late write acknowledgement or snapshot refresh must not re-authorize a
+    // half-open chat whose integrity was cleared by a pending or failed load.
+    const currentIntegrity = typeof chat_metadata.integrity === 'string'
+        ? chat_metadata.integrity.trim()
+        : '';
+    if (!currentIntegrity) {
         return;
     }
 
@@ -13009,10 +13305,11 @@ function syncCurrentChatIntegrityFromMetadata(metadata = null) {
         ? metadata.integrity.trim()
         : '';
 
+    // Rotate only when the server provides a non-empty token; never delete the
+    // live token because a snapshot omitted it, which would permanently trip
+    // the empty-integrity data-loss guard.
     if (nextIntegrity) {
         chat_metadata.integrity = nextIntegrity;
-    } else {
-        delete chat_metadata.integrity;
     }
 }
 
@@ -13045,7 +13342,8 @@ export function applyIntegrityFromWritePayloadToTarget(payload, target = null, m
 /**
  * Refreshes a queued write's token without replacing its captured metadata.
  * Group acknowledgements remain target-owned while live metadata is unloaded
- * or another chat is active. Solo writes retain their active-live token source.
+ * or another chat is active. Both solo and group writes preserve their captured
+ * token when live integrity is empty so server integrity checks are not bypassed.
  */
 export function refreshSnapshotIntegrityFromActiveLive(target, metadata) {
     if (!isPlainObject(metadata)) {
@@ -13067,17 +13365,15 @@ export function refreshSnapshotIntegrityFromActiveLive(target, metadata) {
     const liveIntegrity = typeof chat_metadata.integrity === 'string'
         ? chat_metadata.integrity.trim()
         : '';
-    if (target?.is_group && !liveIntegrity) {
+    // Keep the queued write's captured token when live integrity is empty so
+    // an unloaded/failed active state cannot strip it and bypass server checks.
+    if (!liveIntegrity) {
         return;
     }
-    if (liveIntegrity) {
-        metadata.integrity = liveIntegrity;
-    } else {
-        delete metadata.integrity;
-    }
+    metadata.integrity = liveIntegrity;
 }
 
-async function fetchCurrentServerChatSnapshot(target = resolveChatStateTarget()) {
+async function fetchCurrentServerChatSnapshot(target = resolveChatStateTarget(), { throwOnError = false } = {}) {
     const resolvedTarget = resolveChatStateTarget(target);
     if (!resolvedTarget) {
         return null;
@@ -13085,18 +13381,32 @@ async function fetchCurrentServerChatSnapshot(target = resolveChatStateTarget())
 
     if (resolvedTarget.is_group) {
         const payload = await loadGroupChat(resolvedTarget.id);
+        if (payload.length === 0) {
+            return {
+                target: resolvedTarget,
+                metadata: {},
+                messages: [],
+                existsOnServer: false,
+            };
+        }
         const hasHeader = Object.hasOwn(payload[0] ?? {}, 'chat_metadata');
         return {
             target: resolvedTarget,
             metadata: isPlainObject(payload[0]?.chat_metadata) ? cloneAsJsonWire(payload[0].chat_metadata) : {},
             // Snapshot guards use stored bytes, not rendering-time media migration.
             messages: hasHeader ? payload.slice(1) : payload,
+            existsOnServer: true,
         };
     }
 
     try {
         const charName = String(resolvedTarget.char_name || getCharacterName(characters[this_chid]) || '').trim();
         if (!charName) {
+            if (throwOnError) {
+                const error = new Error('Missing character name for server chat snapshot');
+                error.useGenericSaveToast = true;
+                throw error;
+            }
             return null;
         }
 
@@ -13112,16 +13422,54 @@ async function fetchCurrentServerChatSnapshot(target = resolveChatStateTarget())
         });
 
         if (!response.ok) {
+            if (throwOnError) {
+                const errorPayload = typeof response.json === 'function'
+                    ? await response.json().catch(() => null)
+                    : null;
+                const error = new Error(`HTTP ${response.status}`);
+                error.useGenericSaveToast = true;
+                if (errorPayload?.corrupted) {
+                    error.corrupted = true;
+                }
+                throw error;
+            }
             return null;
         }
 
-        const payload = await response.json().catch(() => null);
-        if (!Array.isArray(payload) || payload.length === 0) {
+        // Never swallow JSON parse failures: a truncated stream must fail rather
+        // than masquerade as an empty chat.
+        const payload = await response.json();
+
+        // /api/chats/get may return HTTP 200 { corrupted: true } for an unreadable file.
+        if (payload?.corrupted) {
+            console.warn('Server reported corrupted chat while fetching snapshot', resolvedTarget);
+            if (throwOnError) {
+                const error = new Error('Server reported corrupted chat');
+                error.corrupted = true;
+                throw error;
+            }
+            return null;
+        }
+
+        // Only an explicit { new_chat: true } means the chat does not exist on disk yet.
+        if (isPlainObject(payload) && payload.new_chat === true) {
             return {
                 target: resolvedTarget,
                 metadata: {},
                 messages: [],
+                existsOnServer: false,
             };
+        }
+
+        // An existing chat must return a non-empty array with a plain object header.
+        if (!Array.isArray(payload) || payload.length === 0 || !isPlainObject(payload[0])) {
+            console.warn('Unexpected server chat snapshot payload', resolvedTarget);
+            if (throwOnError) {
+                const error = new Error('Unexpected server chat snapshot payload');
+                error.useGenericSaveToast = true;
+                throw error;
+            }
+            return null;
         }
 
         const [header, ...rawMessages] = payload;
@@ -13138,27 +13486,79 @@ async function fetchCurrentServerChatSnapshot(target = resolveChatStateTarget())
             target: resolvedTarget,
             metadata,
             messages,
+            existsOnServer: true,
         };
     } catch (error) {
         console.warn('Failed to fetch current server chat snapshot', error);
+        if (throwOnError) {
+            if (error && typeof error === 'object' && !error.corrupted) {
+                error.useGenericSaveToast = true;
+            }
+            throw error;
+        }
         return null;
     }
 }
 
-export async function refreshChatWriteSnapshotsFromServer(target = resolveChatStateTarget()) {
-    const snapshot = await fetchCurrentServerChatSnapshot(target);
+function applyServerChatSnapshot(snapshot, metadataToSync = null) {
     if (!snapshot) {
         return null;
     }
 
+    // When the chat does not exist on the server yet ({ new_chat: true } or []),
+    // invalidate caches so the next write performs a full create-save without
+    // poisoning caches with [] or clearing in-memory integrity.
+    if (snapshot.existsOnServer === false) {
+        invalidateChatWriteSnapshot(snapshot.target);
+        return snapshot;
+    }
+
     rememberChatMetadataSnapshot(snapshot.target, snapshot.metadata);
     rememberChatMessageSnapshot(snapshot.target, snapshot.messages);
+
+    if (metadataToSync && typeof metadataToSync === 'object') {
+        const nextIntegrity = typeof snapshot.metadata?.integrity === 'string'
+            ? snapshot.metadata.integrity.trim()
+            : '';
+        if (nextIntegrity) {
+            metadataToSync.integrity = nextIntegrity;
+        }
+    }
 
     if (getChatStateTargetKey(snapshot.target) === getChatStateTargetKey(resolveChatStateTarget())) {
         syncCurrentChatIntegrityFromMetadata(snapshot.metadata);
     }
 
     return snapshot;
+}
+
+async function applyOrRefreshConflictSnapshot(target, conflictSnapshot, metadataToSync = null, { allowNonForcedReadFailure = false } = {}) {
+    // Reuse the single snapshot fetch already issued during conflict diagnostics
+    // to avoid back-to-back full chat fetches on 409 recovery.
+    if (conflictSnapshot?.attempted) {
+        if (conflictSnapshot.error) {
+            if (!allowNonForcedReadFailure || conflictSnapshot.corrupted || hasPendingForceOverwrite(target)) {
+                throw conflictSnapshot.error;
+            }
+            return null;
+        }
+        return applyServerChatSnapshot(conflictSnapshot.snapshot, metadataToSync);
+    }
+
+    try {
+        const refreshed = await fetchCurrentServerChatSnapshot(target, { throwOnError: true });
+        return applyServerChatSnapshot(refreshed, metadataToSync);
+    } catch (error) {
+        if (!allowNonForcedReadFailure || error?.corrupted || hasPendingForceOverwrite(target)) {
+            throw error;
+        }
+        return null;
+    }
+}
+
+export async function refreshChatWriteSnapshotsFromServer(target = resolveChatStateTarget()) {
+    const snapshot = await fetchCurrentServerChatSnapshot(target);
+    return applyServerChatSnapshot(snapshot);
 }
 
 /**
@@ -14296,9 +14696,16 @@ export async function resolveChatWriteConflictForTarget(response, target = null,
     const clientSnapshot = snapshotKey ? chatMessageSnapshotCache.get(snapshotKey) : null;
     let divergenceSummary = null;
     let divergenceDetails = null;
+    const onServerSnapshot = typeof requestContext?.onServerSnapshot === 'function'
+        ? requestContext.onServerSnapshot
+        : null;
+    let serverSnapshotCorrupted = false;
     if (Array.isArray(clientSnapshot)) {
         try {
-            const serverSnapshot = await fetchCurrentServerChatSnapshot(target);
+            const serverSnapshot = await fetchCurrentServerChatSnapshot(target, { throwOnError: true });
+            if (onServerSnapshot) {
+                onServerSnapshot({ snapshot: serverSnapshot, error: null, corrupted: false });
+            }
             if (Array.isArray(serverSnapshot?.messages)) {
                 const result = summarizeChatStateDivergence(clientSnapshot, serverSnapshot.messages);
                 if (result) {
@@ -14307,6 +14714,12 @@ export async function resolveChatWriteConflictForTarget(response, target = null,
                 }
             }
         } catch (error) {
+            if (error?.corrupted) {
+                serverSnapshotCorrupted = true;
+            }
+            if (onServerSnapshot) {
+                onServerSnapshot({ snapshot: null, error, corrupted: Boolean(error?.corrupted) });
+            }
             // Diagnostic refresh is best-effort; never fail conflict resolution because of it.
             console.warn('[ChatWriteConflict] server snapshot refresh failed', error);
         }
@@ -14320,7 +14733,7 @@ export async function resolveChatWriteConflictForTarget(response, target = null,
             if (isActiveChatStateTarget(target)) {
                 syncCurrentChatIntegrityFromMetadata({ integrity: currentIntegrity });
             }
-        } else {
+        } else if (!serverSnapshotCorrupted) {
             // Server has no current integrity to sync against. Do NOT delete
             // chat_metadata.integrity here — the empty-integrity data-loss
             // guard on saveChatInternal would then refuse every subsequent
@@ -14363,8 +14776,11 @@ export async function resolveChatWriteConflictForTarget(response, target = null,
     // on every 409, which is what the append/patch optimistic-snapshot vs
     // BE-normalization drift makes routinely common). The marker keeps
     // chat_metadata.integrity intact so the guard still blocks half-open
-    // writes, and signals the intended overwrite explicitly.
-    markTargetForForceOverwriteOnNextSave(target, 'snapshot-409-recovery');
+    // writes, and signals the intended overwrite explicitly. Never arm force
+    // overwrite when the server explicitly reported the file as corrupted.
+    if (!serverSnapshotCorrupted) {
+        markTargetForForceOverwriteOnNextSave(target, 'snapshot-409-recovery');
+    }
     notifyChatWriteConflict({
         kind: 'snapshot',
         errorType,
@@ -14457,7 +14873,13 @@ async function appendChatMessagesInternal(messages, retryCount = 0, context = nu
 
             if (response.ok) {
                 const payload = await response.json().catch(() => null);
-                const appendedCount = Number(payload?.appended || 0);
+                if (payload?.ok !== true || typeof payload.appended !== 'number' || !Number.isFinite(payload.appended)) {
+                    // Truncated or malformed 200 body: do not misinterpret as server dedup
+                    // and trigger a full snapshot fetch; drop optimistic snapshot so caller falls back.
+                    invalidateChatWriteSnapshot(target);
+                    return false;
+                }
+                const appendedCount = payload.appended;
                 const skippedCount = Number(payload?.skipped || 0);
                 console.debug('[ChatWrite]', {
                     phase: 'append_result',
@@ -14476,7 +14898,15 @@ async function appendChatMessagesInternal(messages, retryCount = 0, context = nu
                     // from server truth to realign before the next write builds
                     // diffs against a snapshot BE can't match.
                     const refreshed = await refreshChatWriteSnapshotsFromServer(target);
-                    return Boolean(refreshed && lodash.isEqual(refreshed.messages, context.messagesSnapshot));
+                    if (!refreshed) {
+                        invalidateChatWriteSnapshot(target);
+                        return false;
+                    }
+                    return Boolean(lodash.isEqual(refreshed.messages, context.messagesSnapshot));
+                }
+                if (typeof payload.integrity !== 'string' || !payload.integrity.trim()) {
+                    invalidateChatWriteSnapshot(target);
+                    return false;
                 }
                 applyIntegrityFromWritePayloadToTarget(payload, target, metadata);
                 // Snapshot already committed optimistically before the fetch.
@@ -14519,7 +14949,13 @@ async function appendChatMessagesInternal(messages, retryCount = 0, context = nu
 
         if (response.ok) {
             const payload = await response.json().catch(() => null);
-            const appendedCount = Number(payload?.appended || 0);
+            if (payload?.ok !== true || typeof payload.appended !== 'number' || !Number.isFinite(payload.appended)) {
+                // Truncated or malformed 200 body: do not misinterpret as server dedup
+                // and trigger a full snapshot fetch; drop optimistic snapshot so caller falls back.
+                invalidateChatWriteSnapshot(target);
+                return false;
+            }
+            const appendedCount = payload.appended;
             const skippedCount = Number(payload?.skipped || 0);
             console.debug('[ChatWrite]', {
                 phase: 'append_result',
@@ -14538,7 +14974,17 @@ async function appendChatMessagesInternal(messages, retryCount = 0, context = nu
                 // from server truth to realign before the next write builds
                 // diffs against a snapshot BE can't match.
                 const refreshed = await refreshChatWriteSnapshotsFromServer(target);
-                return Boolean(refreshed && lodash.isEqual(refreshed.messages, chat));
+                if (!refreshed) {
+                    // Drop the optimistic snapshot on refresh failure so the caller's
+                    // fallback does not compute an empty diff and skip persistence.
+                    invalidateChatWriteSnapshot(target);
+                    return false;
+                }
+                return Boolean(lodash.isEqual(refreshed.messages, chat));
+            }
+            if (typeof payload.integrity !== 'string' || !payload.integrity.trim()) {
+                invalidateChatWriteSnapshot(target);
+                return false;
             }
             applyIntegrityFromWritePayloadToTarget(payload, target, metadata);
             // Snapshot already committed optimistically before the fetch.
@@ -14658,6 +15104,10 @@ async function patchChatMessagesInternal(operations, retryCount = 0, context = n
 
             if (response.ok) {
                 const payload = await response.json().catch(() => null);
+                if (payload?.ok !== true || typeof payload.integrity !== 'string' || !payload.integrity.trim()) {
+                    invalidateChatWriteSnapshot(target);
+                    return false;
+                }
                 applyIntegrityFromWritePayloadToTarget(payload, target, metadata);
                 // Snapshot already committed optimistically before the fetch.
                 return true;
@@ -14699,6 +15149,10 @@ async function patchChatMessagesInternal(operations, retryCount = 0, context = n
 
         if (response.ok) {
             const payload = await response.json().catch(() => null);
+            if (payload?.ok !== true || typeof payload.integrity !== 'string' || !payload.integrity.trim()) {
+                invalidateChatWriteSnapshot(target);
+                return false;
+            }
             applyIntegrityFromWritePayloadToTarget(payload, target, metadata);
             // Snapshot already committed optimistically before the fetch.
             return true;
@@ -14849,6 +15303,10 @@ async function saveChatMetadataInternal(withMetadata = undefined, retryCount = 0
             console.debug('[ChatWrite] Metadata save dropped: no active chat target.');
             return false;
         }
+        const guardTarget = context?.target ?? resolveChatStateTarget();
+        if (guardTarget) {
+            consumePendingForceOverwrite(guardTarget);
+        }
         console.error('[ChatWrite] Metadata save refused: chat not fully loaded (integrity missing).');
         toastr.error(
             t`Refusing to save: chat is not fully loaded. Reload the page to prevent data loss.`,
@@ -14858,6 +15316,7 @@ async function saveChatMetadataInternal(withMetadata = undefined, retryCount = 0
         return false;
     }
 
+    let resolvedTarget = null;
     try {
         const saveContext = context ?? buildActiveChatSaveContext({ withMetadata });
         if (!saveContext?.target) {
@@ -14867,6 +15326,7 @@ async function saveChatMetadataInternal(withMetadata = undefined, retryCount = 0
             ? saveContext.metadataSnapshot
             : {};
         const target = saveContext.target;
+        resolvedTarget = target;
         // Consume the force-overwrite marker set by a prior 409 recovery so
         // this metadata save carries force:true. See saveChatInternal for
         // full rationale.
@@ -14901,18 +15361,43 @@ async function saveChatMetadataInternal(withMetadata = undefined, retryCount = 0
 
             if (response.ok) {
                 const payload = await response.json().catch(() => null);
+                if (payload?.ok !== true || typeof payload.integrity !== 'string' || !payload.integrity.trim()) {
+                    invalidateChatWriteSnapshot(target);
+                    return false;
+                }
                 applyIntegrityFromWritePayloadToTarget(payload, target, metadata);
                 rememberChatMetadataSnapshot(target, metadata);
                 return true;
             }
+            const conflictSnapshot = { attempted: false, snapshot: null, error: null, corrupted: false };
             const conflictResolution = await resolveChatWriteConflictForTarget(response, target, metadata, retryCount, {
                 endpoint: 'chats/group/meta/patch',
                 opSummary: summarizeJsonPatchOperations(operations),
                 sentIntegrity: metadata?.integrity,
+                onServerSnapshot: (result) => {
+                    conflictSnapshot.attempted = true;
+                    conflictSnapshot.snapshot = result?.snapshot ?? null;
+                    conflictSnapshot.error = result?.error ?? null;
+                    conflictSnapshot.corrupted = Boolean(result?.corrupted);
+                },
             });
             if (conflictResolution !== 'none') {
-                if (conflictResolution === 'integrity' || conflictResolution === 'snapshot') {
-                    await refreshChatWriteSnapshotsFromServer(target);
+                let appliedSnapshot = null;
+                if (conflictResolution === 'integrity') {
+                    appliedSnapshot = await applyOrRefreshConflictSnapshot(target, conflictSnapshot, metadata);
+                } else if (conflictResolution === 'snapshot' && conflictSnapshot.attempted) {
+                    if (conflictSnapshot.error) {
+                        throw conflictSnapshot.error;
+                    }
+                    if (conflictSnapshot.snapshot) {
+                        appliedSnapshot = applyServerChatSnapshot(conflictSnapshot.snapshot, metadata);
+                    }
+                }
+                if (appliedSnapshot?.existsOnServer === false) {
+                    // Chat does not exist on server yet; return false so callers fall
+                    // back to a full save instead of creating a header-only chat.
+                    consumePendingForceOverwrite(target);
+                    return false;
                 }
                 return await saveChatMetadataInternal(withMetadata, retryCount + 1, {
                     ...(saveContext ?? {}),
@@ -14941,18 +15426,43 @@ async function saveChatMetadataInternal(withMetadata = undefined, retryCount = 0
 
             if (response.ok) {
                 const payload = await response.json().catch(() => null);
+                if (payload?.ok !== true || typeof payload.integrity !== 'string' || !payload.integrity.trim()) {
+                    invalidateChatWriteSnapshot(target);
+                    return false;
+                }
                 applyIntegrityFromWritePayloadToTarget(payload, target, metadata);
                 rememberChatMetadataSnapshot(target, metadata);
                 return true;
             }
+            const conflictSnapshot = { attempted: false, snapshot: null, error: null, corrupted: false };
             const conflictResolution = await resolveChatWriteConflictForTarget(response, target, metadata, retryCount, {
                 endpoint: 'chats/meta/patch',
                 opSummary: summarizeJsonPatchOperations(operations),
                 sentIntegrity: metadata?.integrity,
+                onServerSnapshot: (result) => {
+                    conflictSnapshot.attempted = true;
+                    conflictSnapshot.snapshot = result?.snapshot ?? null;
+                    conflictSnapshot.error = result?.error ?? null;
+                    conflictSnapshot.corrupted = Boolean(result?.corrupted);
+                },
             });
             if (conflictResolution !== 'none') {
-                if (conflictResolution === 'integrity' || conflictResolution === 'snapshot') {
-                    await refreshChatWriteSnapshotsFromServer(target);
+                let appliedSnapshot = null;
+                if (conflictResolution === 'integrity') {
+                    appliedSnapshot = await applyOrRefreshConflictSnapshot(target, conflictSnapshot, metadata);
+                } else if (conflictResolution === 'snapshot' && conflictSnapshot.attempted) {
+                    if (conflictSnapshot.error) {
+                        throw conflictSnapshot.error;
+                    }
+                    if (conflictSnapshot.snapshot) {
+                        appliedSnapshot = applyServerChatSnapshot(conflictSnapshot.snapshot, metadata);
+                    }
+                }
+                if (appliedSnapshot?.existsOnServer === false) {
+                    // Chat does not exist on server yet; return false so callers fall
+                    // back to a full save instead of creating a header-only chat.
+                    consumePendingForceOverwrite(target);
+                    return false;
                 }
                 return await saveChatMetadataInternal(withMetadata, retryCount + 1, {
                     ...(saveContext ?? {}),
@@ -14963,6 +15473,12 @@ async function saveChatMetadataInternal(withMetadata = undefined, retryCount = 0
 
         return false;
     } catch (error) {
+        if (resolvedTarget) {
+            // Clear pending force-overwrite marker when conflict snapshot recovery fails
+            // so caller full-save fallbacks never carry a stale force:true.
+            invalidateChatWriteSnapshot(resolvedTarget);
+            consumePendingForceOverwrite(resolvedTarget);
+        }
         console.warn('Incremental chat metadata save failed', error);
         return false;
     }
@@ -15022,6 +15538,17 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
             console.debug('[ChatWrite] Save dropped: no active chat target.');
             return;
         }
+        const explicitChatName = typeof arguments?.[0] === 'string'
+            ? arguments[0].trim()
+            : String(arguments?.[0]?.chatName || '').trim();
+        const activeTarget = resolveChatStateTarget();
+        const guardTarget = arguments?.[0]?._context?.target
+            ?? (explicitChatName && activeTarget && !activeTarget.is_group
+                ? { ...activeTarget, file_name: explicitChatName }
+                : activeTarget);
+        if (guardTarget) {
+            consumePendingForceOverwrite(guardTarget);
+        }
         console.error('[ChatWrite] Save refused: chat not fully loaded (integrity missing).');
         toastr.error(
             t`Refusing to save: chat is not fully loaded. Reload the page to prevent data loss.`,
@@ -15035,6 +15562,7 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
     const target = saveContext?.target ?? resolveChatStateTarget();
 
     if (target?.is_group) {
+        consumePendingForceOverwrite(target);
         toastr.error(t`Operation was aborted to prevent data corruption.`, t`saveChat called for a group chat`);
         throw new Error('saveChat called for a group chat');
     }
@@ -15050,11 +15578,13 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
     const fileName = String(saveContext?.fileName ?? chatName ?? characters[this_chid]?.chat ?? '').trim();
 
     if (!fileName && name2 === neutralCharacterName) {
+        if (target) consumePendingForceOverwrite(target);
         // TODO: Do something for a temporary chat with no character.
         return;
     }
 
     if (!fileName) {
+        if (target) consumePendingForceOverwrite(target);
         console.warn('saveChat called without chat_name and no chat file found');
         return;
     }
@@ -15062,6 +15592,7 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
     const charName = String(saveContext?.charName || target?.char_name || getCharacterName(characters[this_chid]) || '').trim();
     const avatar = String(saveContext?.avatarUrl || target?.avatar_url || characters[this_chid]?.avatar || '').trim();
     if (!charName || !avatar) {
+        if (target) consumePendingForceOverwrite(target);
         console.warn('saveChat called without active character identity');
         return;
     }
@@ -15137,20 +15668,40 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
 
                 if (patchResult.ok) {
                     const payload = await patchResult.json().catch(() => null);
-                    applyIntegrityFromWritePayloadToTarget(payload, writeTarget, metadata);
-                    rememberChatMetadataSnapshot(writeTarget, metadata);
-                    return;
-                }
-
-                if (!effectiveForce) {
+                    if (payload?.ok === true && typeof payload.integrity === 'string' && payload.integrity.trim()) {
+                        applyIntegrityFromWritePayloadToTarget(payload, writeTarget, metadata);
+                        rememberChatMetadataSnapshot(writeTarget, metadata);
+                        return;
+                    }
+                    // Unverified patch acknowledgement (truncated 200 body or legacy no-op
+                    // patch with empty integrity): drop the optimistic snapshot and fall
+                    // through to full /api/chats/save instead of trusting the write.
+                    invalidateChatWriteSnapshot(writeTarget);
+                } else if (!effectiveForce) {
+                    const conflictSnapshot = { attempted: false, snapshot: null, error: null, corrupted: false };
                     const conflictResolution = await resolveChatWriteConflictForTarget(patchResult, writeTarget, metadata, _retryAttempt, {
                         endpoint: 'chats/patch (save-internal)',
                         opSummary: summarizeJsonPatchOperations(operations),
                         sentIntegrity: metadata?.integrity,
+                        onServerSnapshot: (result) => {
+                            conflictSnapshot.attempted = true;
+                            conflictSnapshot.snapshot = result?.snapshot ?? null;
+                            conflictSnapshot.error = result?.error ?? null;
+                            conflictSnapshot.corrupted = Boolean(result?.corrupted);
+                        },
                     });
                     if (conflictResolution !== 'none') {
-                        if (conflictResolution === 'integrity' || conflictResolution === 'snapshot') {
-                            await refreshChatWriteSnapshotsFromServer(writeTarget);
+                        if (conflictResolution === 'integrity') {
+                            await applyOrRefreshConflictSnapshot(writeTarget, conflictSnapshot, metadata, { allowNonForcedReadFailure: true });
+                        } else if (conflictResolution === 'snapshot' && conflictSnapshot.attempted) {
+                            if (conflictSnapshot.error) {
+                                throw conflictSnapshot.error;
+                            }
+                            if (conflictSnapshot.snapshot) {
+                                // Snapshot 409 already armed force:true for the retry full save;
+                                // reuse the diagnostic snapshot with zero extra fetches.
+                                applyServerChatSnapshot(conflictSnapshot.snapshot, metadata);
+                            }
                         }
                         await saveChatInternal({ chatName, withMetadata, mesId, force, _retryAttempt: _retryAttempt + 1, _context: { ...(saveContext ?? {}), metadataSnapshot: cloneAsJsonWire(metadata) ?? metadata, messagesSnapshot: cloneAsJsonWire(trimmedChat) ?? trimmedChat } });
                         return;
@@ -15184,20 +15735,41 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
 
         if (result.ok) {
             const payload = await result.json().catch(() => null);
-            applyIntegrityFromWritePayloadToTarget(payload, writeTarget, metadata);
-            rememberChatMetadataSnapshot(writeTarget, metadata);
-            return;
+            if (payload?.ok === true && typeof payload.integrity === 'string' && payload.integrity.trim()) {
+                applyIntegrityFromWritePayloadToTarget(payload, writeTarget, metadata);
+                rememberChatMetadataSnapshot(writeTarget, metadata);
+                return;
+            }
+            // Symmetric with saveGroupChatInternal: a truncated or integrity-less 200
+            // body is an unverified write; throw to invalidate snapshots and alert the user.
+            const ackError = new Error('Invalid chat write acknowledgement');
+            ackError.useGenericSaveToast = true;
+            throw ackError;
         }
 
         if (!effectiveForce) {
+            const conflictSnapshot = { attempted: false, snapshot: null, error: null, corrupted: false };
             const conflictResolution = await resolveChatWriteConflictForTarget(result, writeTarget, metadata, _retryAttempt, {
                 endpoint: 'chats/save (full)',
                 opSummary: `full ${Array.isArray(trimmedChat) ? trimmedChat.length : 0} msgs`,
                 sentIntegrity: metadata?.integrity,
+                onServerSnapshot: (snapshotResult) => {
+                    conflictSnapshot.attempted = true;
+                    conflictSnapshot.snapshot = snapshotResult?.snapshot ?? null;
+                    conflictSnapshot.error = snapshotResult?.error ?? null;
+                    conflictSnapshot.corrupted = Boolean(snapshotResult?.corrupted);
+                },
             });
             if (conflictResolution !== 'none') {
-                if (conflictResolution === 'integrity' || conflictResolution === 'snapshot') {
-                    await refreshChatWriteSnapshotsFromServer(writeTarget);
+                if (conflictResolution === 'integrity') {
+                    await applyOrRefreshConflictSnapshot(writeTarget, conflictSnapshot, metadata, { allowNonForcedReadFailure: true });
+                } else if (conflictResolution === 'snapshot' && conflictSnapshot.attempted) {
+                    if (conflictSnapshot.error) {
+                        throw conflictSnapshot.error;
+                    }
+                    if (conflictSnapshot.snapshot) {
+                        applyServerChatSnapshot(conflictSnapshot.snapshot, metadata);
+                    }
                 }
                 await saveChatInternal({ chatName, withMetadata, mesId, force, _retryAttempt: _retryAttempt + 1, _context: { ...(saveContext ?? {}), metadataSnapshot: cloneAsJsonWire(metadata) ?? metadata, messagesSnapshot: cloneAsJsonWire(trimmedChat) ?? trimmedChat } });
                 return;
@@ -15219,13 +15791,16 @@ async function saveChatInternal({ chatName, withMetadata, mesId, force = false, 
         throw new Error(serverError || result.statusText);
     } catch (error) {
         console.error(error);
-        const detail = error?.message ? String(error.message).trim() : '';
+        const detail = error?.corrupted
+            ? t`Chat data is corrupted. Reload the page to retry.`
+            : (!error?.useGenericSaveToast && error?.message ? String(error.message).trim() : '');
         toastr.error(detail || t`Check the server connection and reload the page to prevent data loss.`, t`Chat could not be saved`);
         // Fetch threw after the optimistic snapshot commit — drop the snapshot
         // so the next save re-syncs from BE. See appendChatMessagesInternal
         // for the full rationale.
         if (writeTarget) {
             invalidateChatWriteSnapshot(writeTarget);
+            consumePendingForceOverwrite(writeTarget);
         }
     }
 }
@@ -15390,6 +15965,74 @@ export async function unshallowCharacter(characterId) {
 }
 
 let chatTransitionInProgress = false;
+let chatTransitionEpoch = 0;
+
+export function getChatTransitionEpoch() {
+    return chatTransitionEpoch;
+}
+
+export function bumpChatTransitionEpoch() {
+    chatTransitionEpoch += 1;
+    return chatTransitionEpoch;
+}
+
+function hasActiveMessageEdit() {
+    return (typeof this_edit_mes_id === 'number' || (typeof this_edit_mes_id === 'string' && this_edit_mes_id.trim() !== ''))
+        && Number.isFinite(Number(this_edit_mes_id))
+        && Number(this_edit_mes_id) >= 0;
+}
+
+const runChatSwitchConfirm = createChatSwitchConfirmRunner({
+    getBlockingReasons: () => buildChatSwitchBlockingReasons({
+        activityLabels: getChatSwitchBlockingLabels(),
+        hasChatSwitchActivity: hasChatSwitchGuard(),
+        activityFallbackLabel: t`Background task`,
+        isGenerating: is_send_press || Boolean(streamingProcessor) || is_group_generating,
+        hasGenerationLease: hasActiveSource('core:generation') || hasActiveSource('core:group-generation'),
+        generationFallbackLabel: t`Message generation`,
+        hasUnsavedEdit: hasActiveMessageEdit(),
+        unsavedEditLabel: t`Unsaved message edit`,
+    }),
+    isGenerating: () => is_send_press || Boolean(streamingProcessor) || is_group_generating,
+    confirmDialog: async (reasons) => {
+        const listHtml = reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join('');
+        const html = `<p>${escapeHtml(t`Switching chats will interrupt the following in-progress work:`)}</p><ul>${listHtml}</ul>`;
+        const result = await Popup.show.confirm(t`Tasks still in progress`, html, {
+            okButton: t`Switch anyway`,
+            cancelButton: t`Cancel`,
+            defaultResult: POPUP_RESULT.NEGATIVE,
+        });
+        return Boolean(result);
+    },
+    onEpochBump: () => {
+        bumpChatTransitionEpoch();
+    },
+    onStopGeneration: () => {
+        const proc = streamingProcessor;
+        stopGeneration();
+        if (streamingProcessor === proc) {
+            streamingProcessor = null;
+        }
+    },
+    onCancelActivities: () => {
+        cancelChatSwitchActivities();
+        if (streamingProcessor?.abortController?.signal?.aborted) {
+            streamingProcessor = null;
+        }
+    },
+});
+
+/**
+ * Prompts for confirmation before switching chats when active chat-scoped work,
+ * generation, or an unsaved message edit is in progress.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.skipConfirmation=false] Skip modal dialog while still cancelling/fencing active work
+ * @returns {Promise<boolean>} True if safe to proceed, false if cancelled
+ */
+export async function confirmChatSwitchGuard({ skipConfirmation = false } = {}) {
+    return await runChatSwitchConfirm({ skipConfirmation });
+}
 
 /**
  * Marks a deliberate chat transition (delete / switch / new / close) whose
@@ -15399,6 +16042,7 @@ let chatTransitionInProgress = false;
  */
 function beginChatTransition() {
     chatTransitionInProgress = true;
+    bumpChatTransitionEpoch();
 }
 
 function endChatTransition() {
@@ -15438,14 +16082,20 @@ export async function getChat() {
         }
 
         if (Array.isArray(data) && data.length > 0) {
+            if (!isPlainObject(data[0])) {
+                throw new Error('Unexpected chat payload');
+            }
             /** @type {ChatHeader} */
             const chatHeader = data.shift();
-            chat_metadata = chatHeader?.chat_metadata ?? {};
+            chat_metadata = isPlainObject(chatHeader?.chat_metadata) ? chatHeader.chat_metadata : {};
             chat.splice(0, chat.length, ...data);
-        } else {
+        } else if (data?.new_chat === true || (Array.isArray(data) && data.length === 0)) {
             // New chat (data.new_chat === true) or legacy empty response
             chat.splice(0, chat.length);
             chat_metadata = {};
+        } else {
+            // Do not treat an unexpected 200 payload as an empty chat and overwrite server data.
+            throw new Error('Unexpected chat payload');
         }
         chat.forEach(ensureMessageMediaIsArray);
 
@@ -15453,6 +16103,7 @@ export async function getChat() {
             chat_metadata.integrity = uuidv4();
         }
         endChatTransition();
+        consumePendingForceOverwrite(resolveChatStateTarget());
         rememberChatMetadataSnapshot();
         rememberChatMessageSnapshot();
         await getChatResult();
@@ -15575,7 +16226,7 @@ export async function refreshFirstMessageOnEmptyCharacterChat() {
     return await regenerateFirstCharacterMessageIfNeeded();
 }
 
-export async function openCharacterChat(file_name) {
+export async function openCharacterChat(file_name, { skipSwitchGuard = false } = {}) {
     // API list endpoints return `file_name` with the `.jsonl` extension baked
     // in (see src/endpoints/chats.js:3999 etc). Historical callers passed that
     // raw string straight into here from DOM attributes on chat list rows and
@@ -15587,16 +16238,22 @@ export async function openCharacterChat(file_name) {
     // every caller (sidebar clicks, checkpoint links, branch snapshots,
     // Timelines ext, merge/split) writes a clean base name.
     file_name = String(file_name ?? '').replace(/\.jsonl$/i, '');
+    if (this_chid === undefined || !characters[this_chid]) {
+        return false;
+    }
+    if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+        return false;
+    }
     if (!await waitForChatSwitchAvailability()) {
-        return;
+        return false;
     }
     const chidSnapshot = this_chid;
     if (chidSnapshot === undefined || !characters[chidSnapshot]) {
-        return;
+        return false;
     }
     await clearChat({ clearData: true });
     if (this_chid !== chidSnapshot || !characters[chidSnapshot]) {
-        return;
+        return false;
     }
     characters[chidSnapshot].chat = file_name;
     beginChatTransition();
@@ -15604,6 +16261,7 @@ export async function openCharacterChat(file_name) {
     await getChat();
     $('#selected_chat_pole').val(file_name);
     await updateRemoteChatName(chidSnapshot, file_name);
+    return true;
 }
 
 ////////// OPTIMZED MAIN API CHANGE FUNCTION ////////////
@@ -19628,15 +20286,19 @@ async function importFromURL(items, files) {
     }
 }
 
-export async function doNewChat({ deleteCurrentChat = false } = {}) {
+export async function doNewChat({ deleteCurrentChat = false, skipSwitchGuard = false } = {}) {
     //Make a new chat for selected character
     if ((!selected_group && this_chid == undefined) || menu_type == 'create') {
-        return;
+        return false;
+    }
+
+    if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+        return false;
     }
 
     const actionContext = buildCurrentChatFileActionContext();
     if (!actionContext) {
-        return;
+        return false;
     }
     const deleteSaveContext = deleteCurrentChat ? buildActiveChatSaveContext() : null;
 
@@ -19644,7 +20306,7 @@ export async function doNewChat({ deleteCurrentChat = false } = {}) {
         ? await waitForChatSwitchAvailability({ requireCompletedSave: true })
         : await waitForChatSwitchAvailability();
     if (!canChangeChat) {
-        return;
+        return false;
     }
 
     // Make it easier to find in backups
@@ -19674,14 +20336,16 @@ export async function doNewChat({ deleteCurrentChat = false } = {}) {
     if (actionContext.kind === 'group') {
         await createNewGroupChatForContext(actionContext);
         if (deleteCurrentChat) {
-            await deleteGroupChat(actionContext.groupId, actionContext.chatFile, { jumpToNewChat: false });
+            await deleteGroupChat(actionContext.groupId, actionContext.chatFile, { jumpToNewChat: false, skipSwitchGuard: true });
         }
     } else {
         await createNewCharacterChatForContext(actionContext);
         if (deleteCurrentChat) {
-            await deleteCharacterChatByName(actionContext.characterId, actionContext.chatFile);
+            await deleteCharacterChatByName(actionContext.characterId, actionContext.chatFile, { skipSwitchGuard: true });
         }
     }
+
+    return true;
 }
 
 /**
@@ -19831,33 +20495,33 @@ export async function renameChat(oldFileName, newName) {
 
 /**
  * Closes the current chat, clearing all associated data and resetting the UI.
- * If a message generation is in progress, it prompts the user to stop it first.
+ * Prompts for confirmation if active chat-scoped work, generation, or edits are in progress.
+ * @param {object} [options]
+ * @param {boolean} [options.skipSwitchGuard=false] Skip modal confirmation while cancelling/fencing active work
  * @returns {Promise<boolean>} True if the chat was successfully closed, false otherwise.
  */
-export async function closeCurrentChat() {
-    if (is_send_press == false) {
-        if (!await waitForChatSwitchAvailability()) {
-            return false;
-        }
-        await clearChat({ clearData: true });
-        resetSelectedGroup();
-        setCharacterId(undefined);
-        setCharacterName('');
-        setActiveCharacter(null);
-        setActiveGroup(null);
-        this_edit_mes_id = undefined;
-        beginChatTransition();
-        chat_metadata = {};
-        selected_button = 'characters';
-        $('#rm_button_selected_ch').children('h2').text('');
-        select_rm_characters();
-        await settleChatChanged();
-        await eventSource.emit(event_types.CHAT_CHANGED, getCurrentChatId());
-        return true;
-    } else {
-        toastr.info(t`Please stop the message generation first.`);
+export async function closeCurrentChat({ skipSwitchGuard = false } = {}) {
+    if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
         return false;
     }
+    if (!await waitForChatSwitchAvailability()) {
+        return false;
+    }
+    await clearChat({ clearData: true });
+    resetSelectedGroup();
+    setCharacterId(undefined);
+    setCharacterName('');
+    setActiveCharacter(null);
+    setActiveGroup(null);
+    this_edit_mes_id = undefined;
+    beginChatTransition();
+    chat_metadata = {};
+    selected_button = 'characters';
+    $('#rm_button_selected_ch').children('h2').text('');
+    select_rm_characters();
+    await settleChatChanged();
+    await eventSource.emit(event_types.CHAT_CHANGED, getCurrentChatId());
+    return true;
 }
 
 /**
@@ -19930,6 +20594,12 @@ export async function deleteCharacter(characterKey, { deleteChats = true, mediaP
     const uniqueCharacterKeys = normalizedCharacterKeys.filter((key, index) => normalizedCharacterKeys.indexOf(key) === index);
 
     const inTempChat = this_chid === undefined && name2 === neutralCharacterName;
+    if (this_chid !== undefined || selected_group || inTempChat) {
+        if (!await confirmChatSwitchGuard()) {
+            return false;
+        }
+    }
+
     if (inTempChat) {
         const confirmClose = await Popup.show.confirm(
             t`You are currently in a temporary chat.`,
@@ -20020,9 +20690,9 @@ export async function deleteCharacter(characterKey, { deleteChats = true, mediaP
             }
         }
 
-        const closeChatResult = await closeCurrentChat();
+        const closeChatResult = await closeCurrentChat({ skipSwitchGuard: true });
         if (!closeChatResult) {
-            return;
+            return false;
         }
 
         const pendingCharacterUndoByAvatar = new Map(pendingCharacterUndos.map(snapshot => [snapshot.avatarUrl, snapshot]));
@@ -20190,18 +20860,35 @@ async function removeCharacterFromUI() {
  * Creates a new assistant chat.
  * @param {object} params - Parameters for the new assistant chat
  * @param {boolean} [params.temporary=false] I need a temporary secretary
- * @returns {Promise<void>} - A promise that resolves when the new assistant chat is created
+ * @param {boolean} [params.skipSwitchGuard=false] Skip modal confirmation while cancelling/fencing active work
+ * @returns {Promise<boolean>} - True when the assistant chat was opened, false if cancelled
  */
-export async function newAssistantChat({ temporary = false } = {}) {
-    await clearChat();
+export async function newAssistantChat({ temporary = false, skipSwitchGuard = false } = {}) {
+    const inTempChat = !selected_group && this_chid === undefined && name2 === neutralCharacterName;
+    if (this_chid !== undefined || selected_group || inTempChat) {
+        if (!await confirmChatSwitchGuard({ skipConfirmation: skipSwitchGuard })) {
+            return false;
+        }
+    }
+
     if (!temporary) {
-        return openPermanentAssistantChat();
+        const opened = await openPermanentAssistantChat({ skipSwitchGuard: true });
+        return opened !== false;
+    }
+
+    await clearChat();
+    if (this_chid !== undefined || selected_group) {
+        resetSelectedGroup();
+        setCharacterId(undefined);
+        setActiveCharacter(null);
+        setActiveGroup(null);
     }
     chat.splice(0, chat.length);
     beginChatTransition();
     chat_metadata = {};
     setCharacterName(neutralCharacterName);
     sendSystemMessage(system_message_types.ASSISTANT_NOTE);
+    return true;
 }
 
 /**
@@ -20371,6 +21058,75 @@ function restoreCharacterSearchVisibility() {
     const isVisible = accountStorage.getItem(CHARACTER_SEARCH_VISIBILITY_STORAGE_KEY) === 'true';
     searchForm.toggle(isVisible);
     searchButton.toggleClass('active', isVisible);
+}
+
+/**
+ * Evaluates whether leaving or reloading the page would lose active work.
+ * @param {boolean} [debouncePending=false] Whether a debounced chat save was pending prior to flush
+ * @returns {boolean}
+ */
+export function shouldWarnBeforeUnload(debouncePending = false) {
+    if (hasUnloadGuard()) {
+        return true;
+    }
+    if (is_send_press || Boolean(streamingProcessor) || is_group_generating) {
+        return true;
+    }
+    if (hasActiveMessageEdit()) {
+        return true;
+    }
+    if (String($('#send_textarea').val() ?? '').trim().length > 0) {
+        return true;
+    }
+    const hasPendingSaveTimeout = chatSaveTimeout !== null && chatSaveTimeout !== undefined;
+    if (isChatSaving || debouncePending || hasPendingSaveTimeout) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Handles window beforeunload: flushes synchronous state, preserves recoverable
+ * streams, and prompts only when active work or unsaved input would be lost.
+ * @param {BeforeUnloadEvent} e
+ */
+export function handleBeforeUnload(e) {
+    cancelTtsPlay();
+    // Only abort the in-flight stream when the reply is NOT recoverable
+    // server-side. For a recoverable generation (normal / regenerate on a
+    // server-persistence API) the job survives the disconnect by design:
+    // aborting here would fire the ws-delivery abort notification
+    // (/api/generation/:id/abort), kill the upstream fetch mid-stream
+    // and leave nothing to recover for the reopened tab.
+    const isRecoverableGeneration = Boolean(streamingProcessor)
+        && shouldUseLukerServerPersistenceForType(streamingProcessor.type)
+        && supportsLukerServerPersistence(main_api);
+    if (streamingProcessor && !isRecoverableGeneration) {
+        console.log('Page reloaded. Aborting streaming...');
+        streamingProcessor.onStopStreaming();
+    }
+
+    // Fire-and-forget: flush queues an IDB transaction synchronously,
+    // commit happens off-main-thread before the page tears down.
+    try { flushTokenCacheSave(); } catch { /* best-effort */ }
+    try { flushItemizedPromptsSave(); } catch { /* best-effort */ }
+
+    // If a debounced chat save is pending, capture that before calling
+    // saveChatConditional() (which synchronously cancels chatSaveTimeout) and
+    // dispatch the fetch immediately with `keepalive: true`.
+    const debouncePending = chatSaveTimeout !== null && chatSaveTimeout !== undefined;
+    if (debouncePending) {
+        try { saveChatConditional(); } catch { /* best-effort */ }
+    }
+
+    if (!shouldWarnBeforeUnload(debouncePending)) {
+        return;
+    }
+
+    e?.preventDefault?.();
+    if (e) {
+        e.returnValue = '';
+    }
 }
 
 // MARK: DOM Handlers Start
@@ -20585,6 +21341,14 @@ jQuery(async function () {
      * @returns {Promise<void>}
      */
     async function handleDeleteChat(chatFile, group, fromSlashCommand = false) {
+        const normalizedTarget = String(chatFile || '').replace(/\.jsonl$/i, '');
+        const isDeletingCurrentChat = group
+            ? (selected_group === group && String(groups.find(x => x.id === group)?.chat_id || '').replace(/\.jsonl$/i, '') === normalizedTarget)
+            : (!selected_group && this_chid !== undefined && String(characters[this_chid]?.chat || '').replace(/\.jsonl$/i, '') === normalizedTarget);
+        if (isDeletingCurrentChat && !await confirmChatSwitchGuard()) {
+            return;
+        }
+
         await maybeDeleteChatBoundLorebook(chatFile, group);
 
         // Close past chat popup.
@@ -20599,9 +21363,9 @@ jQuery(async function () {
 
         try {
             if (group) {
-                await deleteGroupChat(group, chatFile);
+                await deleteGroupChat(group, chatFile, { skipSwitchGuard: true });
             } else {
-                await delChat(`${String(chatFile).replace(/\.jsonl$/i, '')}.jsonl`);
+                await delChat(`${normalizedTarget}.jsonl`, { skipSwitchGuard: true });
             }
         } catch (error) {
             loaderHandle.hide();
@@ -21818,7 +22582,10 @@ jQuery(async function () {
                 }
             }
         } else if (id == 'option_start_new_chat') {
-            if ((selected_group || this_chid !== undefined) && !is_send_press) {
+            if (selected_group || this_chid !== undefined) {
+                if (!await confirmChatSwitchGuard()) {
+                    return;
+                }
                 let deleteCurrentChat = false;
                 const result = await Popup.show.confirm(t`Start new chat?`, await renderTemplateAsync('newChatConfirm'), {
                     onClose: () => { deleteCurrentChat = !!$('#del_chat_checkbox').prop('checked'); },
@@ -21827,9 +22594,8 @@ jQuery(async function () {
                     return;
                 }
 
-                await doNewChat({ deleteCurrentChat: deleteCurrentChat });
-            }
-            if (!selected_group && this_chid === undefined && !is_send_press) {
+                await doNewChat({ deleteCurrentChat: deleteCurrentChat, skipSwitchGuard: true });
+            } else {
                 const alreadyInTempChat = this_chid === undefined && name2 === neutralCharacterName;
                 await newAssistantChat({ temporary: alreadyInTempChat });
             }
@@ -21879,7 +22645,9 @@ jQuery(async function () {
     });
 
     $('#newChatFromManageScreenButton').on('click', async function () {
-        await doNewChat({ deleteCurrentChat: false });
+        if (!await doNewChat({ deleteCurrentChat: false })) {
+            return;
+        }
         $('#select_chat_cross').trigger('click');
     });
 
@@ -22734,7 +23502,7 @@ jQuery(async function () {
                 const currentChatFile = characters[this_chid].chat;
                 async function postReplace() {
                     const chatFile = String(characters[this_chid]?.chat || currentChatFile || '');
-                    await openCharacterChat(chatFile);
+                    await openCharacterChat(chatFile, { skipSwitchGuard: true });
                 }
 
                 // The import keeps the old avatar filename so chats survive.
@@ -22832,58 +23600,7 @@ jQuery(async function () {
         $('#char-management-dropdown').prop('selectedIndex', 0);
     });
 
-    function shouldWarnBeforeUnload() {
-        const mode = String(power_user.before_unload_guard_mode || 'smart').trim().toLowerCase();
-        if (mode === 'off') {
-            return false;
-        }
-        if (mode === 'always') {
-            return true;
-        }
-
-        // Smart mode: only warn when there's obvious risk of data loss.
-        if (is_send_press || streamingProcessor) {
-            return true;
-        }
-        if (this_edit_mes_id >= 0) {
-            return true;
-        }
-        if (String($('#send_textarea').val() ?? '').trim().length > 0) {
-            return true;
-        }
-        return false;
-    }
-
-    $(window).on('beforeunload', (event) => {
-        cancelTtsPlay();
-        // Only abort the in-flight stream when the reply is NOT recoverable
-        // server-side. For a recoverable generation (normal / regenerate on a
-        // server-persistence API) the job survives the disconnect by design:
-        // aborting here would fire the ws-delivery abort notification
-        // (/api/generation/:id/abort), kill the upstream fetch mid-stream
-        // (inspector shows 'The operation was aborted' / status 'aborted')
-        // and leave nothing to recover for the reopened tab.
-        const isRecoverableGeneration = Boolean(streamingProcessor)
-            && shouldUseLukerServerPersistenceForType(streamingProcessor.type)
-            && supportsLukerServerPersistence(main_api);
-        if (streamingProcessor && !isRecoverableGeneration) {
-            console.log('Page reloaded. Aborting streaming...');
-            streamingProcessor.onStopStreaming();
-        }
-
-        if (!shouldWarnBeforeUnload()) {
-            return;
-        }
-
-        const nativeEvent = event?.originalEvent ?? event;
-        if (nativeEvent) {
-            nativeEvent.returnValue = '';
-        }
-        if (typeof event?.preventDefault === 'function') {
-            event.preventDefault();
-        }
-        return '';
-    });
+    window.addEventListener('beforeunload', handleBeforeUnload);
 
 
     var isManualInput = false;
@@ -23006,26 +23723,4 @@ jQuery(async function () {
 
     // Added here to prevent execution before script.js is loaded and get rid of quirky timeouts
     await firstLoadInit();
-
-    window.addEventListener('beforeunload', (e) => {
-        // Fire-and-forget: flush queues an IDB transaction synchronously,
-        // commit happens off-main-thread before the page tears down.
-        try { flushTokenCacheSave(); } catch { /* best-effort */ }
-        try { flushItemizedPromptsSave(); } catch { /* best-effort */ }
-        // If a debounced chat save is pending OR a save is in flight OR an
-        // edit is open, force the chat write to fire NOW so the user does
-        // not lose their last action by closing the tab inside the 1s
-        // debounce window. saveChatConditional() returns a Promise; we do
-        // not await it (beforeunload is sync), but its fetch is dispatched
-        // synchronously with `keepalive: true` so the browser commits it
-        // even as the page tears down.
-        const debouncePending = chatSaveTimeout !== null && chatSaveTimeout !== undefined;
-        if (debouncePending) {
-            try { saveChatConditional(); } catch { /* best-effort */ }
-        }
-        if (isChatSaving || this_edit_mes_id >= 0 || debouncePending) {
-            e.preventDefault();
-            e.returnValue = true;
-        }
-    });
 });

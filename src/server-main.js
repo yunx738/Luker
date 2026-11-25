@@ -170,6 +170,7 @@ import { createDeliveryServer } from './ws-delivery.js';
 import { diskCache } from './endpoints/characters.js';
 import { migrateFlatSecrets } from './endpoints/secrets.js';
 import { migrateGroupChatsMetadataFormat } from './endpoints/groups.js';
+import { migrateLegacyThemesForAllUsers } from './themes/theme-migration.js';
 import { initializeAllUserMetadata } from './endpoints/image-metadata.js';
 import { applyPendingSafeMode } from './safe-mode.js';
 
@@ -282,12 +283,13 @@ if (cliArgs.listen) {
     app.use(accessLoggerMiddleware());
 }
 
+const cookieSecret = getCookieSecret(globalThis.DATA_ROOT);
 app.use(cookieSession({
-    name: getCookieSessionName(),
+    name: getCookieSessionName(cookieSecret),
     sameSite: 'lax',
     httpOnly: true,
     maxAge: getSessionCookieAge(),
-    secret: getCookieSecret(globalThis.DATA_ROOT),
+    secret: cookieSecret,
 }));
 
 app.use(setUserDataMiddleware);
@@ -697,6 +699,7 @@ async function preSetupTasks() {
     // Content seeding can add new characters/worlds; finish before the
     // metadata/cache stages scan those directories.
     await checkForNewContent(directories);
+    await migrateLegacyThemesForAllUsers(directories);
 
     migrateFlatSecrets(directories);
     cleanUploads();

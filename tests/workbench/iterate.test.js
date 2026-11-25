@@ -1487,4 +1487,212 @@ describe('workbench iterate page (scopes, controls, preview, runId isolation)', 
 
         wb.close();
     });
+
+    test('lazy-loads sessions only when AI iteration is opened, skipping reads while collapsed or on another tab', async () => {
+        const sessions = createMemorySessionStore();
+        await sessions.create({
+            kind: 'iterate',
+            ws: 'card',
+            scope: 'character',
+            title: 'Saved Card Session',
+            turns: [{ role: 'user', text: 'Q', at: 1 }, { role: 'ai', text: 'A', at: 2 }],
+        }, { scope: 'character', avatar: 'alice.png' });
+        sessions.list.mockClear();
+        sessions.get.mockClear();
+
+        const registry = createWorkbenchRegistry();
+        const listeners = new Set();
+        let activeChar = { avatar: 'alice.png', name: 'Alice' };
+
+        registry.registerIterateTarget({
+            id: 'card',
+            label: 'Character card',
+            tone: 'card',
+            scopes: async () => ({ character: Boolean(activeChar) }),
+            load: async () => ({ live: { description: 'Init' }, target: { scope: 'character', avatar: activeChar.avatar }, title: activeChar.name }),
+            prompt: async () => 'sys',
+            tools: async () => [],
+            isRead: () => true,
+            runRead: async () => ({}),
+            runEdit: async (_c, l) => l,
+            units: () => new Map(),
+            rebuild: (_b, a) => a,
+            commit: async () => ({ applied: [], skipped: [], failure: '' }),
+        });
+
+        const source = {
+            readSettings: () => ({ builtinPrompt: false, reviewChanges: true, pill: true }),
+            writeSettings: () => {},
+            loadSnapshot: async () => ({
+                chat: activeChar ? { label: 'Chat 1', character: activeChar } : null,
+                card: activeChar,
+            }),
+            subscribe: (fn) => {
+                listeners.add(fn);
+                return () => listeners.delete(fn);
+            },
+            createSessions: () => sessions,
+            historyStorage: () => null,
+            runRules: () => [],
+            lastReply: async () => '',
+            aiRequest: jest.fn(async () => ({ text: 'ok', calls: [] })),
+        };
+
+        // Mounted collapsed (startup pill mode) -> must NOT read sessions on mount or snapshot events
+        const wb = mountWorkbench({ source, registry, startCollapsed: true });
+        await flushMicrotasks();
+        await flushMicrotasks();
+        expect(sessions.list).not.toHaveBeenCalled();
+        expect(sessions.get).not.toHaveBeenCalled();
+
+        for (const fn of listeners) fn();
+        await flushMicrotasks();
+        await flushMicrotasks();
+        expect(sessions.list).not.toHaveBeenCalled();
+
+        // Opening Overview tab still must NOT read AI iteration sessions
+        await wb.open({ page: 'home' });
+        await flushMicrotasks();
+        await flushMicrotasks();
+        expect(sessions.list).not.toHaveBeenCalled();
+
+        // Switching to AI iteration lazily reads session index (not body)
+        await wb.open({ page: 'ai', ws: 'card' });
+        await flushMicrotasks();
+        await flushMicrotasks();
+        expect(sessions.list).toHaveBeenCalledTimes(1);
+        expect(sessions.get).not.toHaveBeenCalled();
+        expect(document.body.textContent).toContain('Saved Card Session');
+
+        // Clicking the session lazily fetches its body
+        const openBtn = [...document.querySelectorAll('.wb-sess-item')].find(b => b.textContent.includes('Saved Card Session'));
+        openBtn.click();
+        await flushMicrotasks();
+        expect(sessions.get).toHaveBeenCalledTimes(1);
+        expect(document.body.textContent).toContain('A');
+
+        wb.close();
+    });
+
+    test('deletes single sessions (aborting in-flight runs without resurrection) and clears only current target conversations', async () => {
+        const sessions = createMemorySessionStore();
+        sessions.removeMany = jest.fn(async (ids, opts = {}) => {
+            for (const id of ids) await sessions.remove(id, opts);
+            return { removed: ids };
+        });
+        const cardA = await sessions.create({
+            kind: 'iterate',
+            ws: 'card',
+            scope: 'character',
+            title: 'Card Alpha',
+            turns: [{ role: 'user', text: 'Q A', at: 1 }, { role: 'ai', text: 'Reply Alpha', at: 2 }],
+        }, { scope: 'character', avatar: 'alice.png' });
+        const cardB = await sessions.create({
+            kind: 'iterate',
+            ws: 'card',
+            scope: 'character',
+            title: 'Card Beta',
+            turns: [{ role: 'user', text: 'Q B', at: 1 }, { role: 'ai', text: 'Reply Beta', at: 2 }],
+        }, { scope: 'character', avatar: 'alice.png' });
+        const otherTarget = await sessions.create({
+            kind: 'iterate',
+            ws: 'world',
+            scope: 'character',
+            title: 'World Keep',
+            turns: [{ role: 'user', text: 'Q W', at: 1 }, { role: 'ai', text: 'Reply World', at: 2 }],
+        }, { scope: 'character', avatar: 'alice.png' });
+
+        let abortSignalObserved = null;
+        let resolveAi;
+        const cardTarget = {
+            id: 'card',
+            label: 'Character card',
+            tone: 'card',
+            scopes: async () => ({ character: true }),
+            load: async () => ({ live: { description: 'Init' }, target: { scope: 'character', avatar: 'alice.png' }, title: 'Alice' }),
+            prompt: async () => 'sys',
+            tools: async () => [{ type: 'function', function: { name: 'noop' } }],
+            isRead: () => true,
+            runRead: async () => ({}),
+            runEdit: async (_c, l) => l,
+            units: () => new Map(),
+            rebuild: (_b, a) => a,
+            commit: async () => ({ applied: [], skipped: [], failure: '' }),
+        };
+
+        const app = {
+            sessions,
+            layer: document.body,
+            iterateTargets: () => [cardTarget],
+            snapshot: () => ({ chat: { character: { avatar: 'alice.png', name: 'Alice' } }, card: { name: 'Alice', avatar: 'alice.png' } }),
+            settings: () => ({ builtinPrompt: false, reviewChanges: true }),
+            history: { record: jest.fn(), canUndo: () => false, undo: jest.fn() },
+            toast: jest.fn(),
+            reload: jest.fn(),
+            refreshBadges: jest.fn(),
+            source: {
+                aiRequest: jest.fn((_ws, { signal }) => {
+                    abortSignalObserved = signal;
+                    return new Promise((r) => { resolveAi = r; });
+                }),
+            },
+        };
+
+        const page = createIteratePage(app);
+        document.body.appendChild(page.el);
+        await page.show({ ws: 'card', scope: 'character' });
+        await flushMicrotasks();
+
+        // Open Card Alpha and start an in-flight AI turn
+        const openAlpha = [...page.el.querySelectorAll('.wb-sess-item')].find(b => b.textContent.includes('Card Alpha'));
+        openAlpha.click();
+        await flushMicrotasks();
+        const textarea = page.el.querySelector('textarea.wb-input');
+        const sendBtn = page.el.querySelector('button.wb-send');
+        textarea.value = 'In-flight edit';
+        sendBtn.click();
+        await flushMicrotasks();
+        expect(abortSignalObserved).not.toBeNull();
+        expect(abortSignalObserved.aborted).toBe(false);
+
+        // 1) Click delete on Card Alpha -> cancel confirmation keeps session and run intact
+        const delAlphaBtn = page.el.querySelector(`.wb-sess-row[data-session-id="${cardA.id}"] .wb-sess-del`);
+        delAlphaBtn.click();
+        await flushMicrotasks();
+        document.body.querySelector('.lw-dialog-foot .lw-btn.is-ghost').click();
+        await flushMicrotasks();
+        expect(sessions.remove).not.toHaveBeenCalled();
+        expect(abortSignalObserved.aborted).toBe(false);
+
+        // 2) Click delete on Card Alpha -> confirm aborts run, removes session, resets open view, and settling AI never resurrects it
+        delAlphaBtn.click();
+        await flushMicrotasks();
+        document.body.querySelector('.lw-dialog-foot .lw-btn.is-danger').click();
+        await flushMicrotasks();
+        await flushMicrotasks();
+
+        expect(abortSignalObserved.aborted).toBe(true);
+        expect(sessions.remove).toHaveBeenCalledWith(cardA.id, { scope: 'character', avatar: 'alice.png' });
+        expect(page.el.querySelector(`.wb-sess-row[data-session-id="${cardA.id}"]`)).toBeNull();
+        expect(page.el.textContent).not.toContain('Reply Alpha');
+
+        resolveAi({ text: 'Late reply after delete', calls: [] });
+        await flushMicrotasks();
+        await flushMicrotasks();
+        expect(await sessions.get(cardA.id, { scope: 'character', avatar: 'alice.png' })).toBeNull();
+
+        // 3) Clear conversations removes remaining Card Beta via removeMany without touching World Keep in same character scope
+        const clearBtn = page.el.querySelector('.wb-sess-clear');
+        expect(clearBtn).not.toBeNull();
+        clearBtn.click();
+        await flushMicrotasks();
+        document.body.querySelector('.lw-dialog-foot .lw-btn.is-danger').click();
+        await flushMicrotasks();
+        await flushMicrotasks();
+
+        expect(sessions.removeMany).toHaveBeenCalledWith([cardB.id], { scope: 'character', avatar: 'alice.png' });
+        expect(page.el.querySelectorAll('.wb-sess-row')).toHaveLength(0);
+        expect(await sessions.get(cardB.id, { scope: 'character', avatar: 'alice.png' })).toBeNull();
+        expect(await sessions.get(otherTarget.id, { scope: 'character', avatar: 'alice.png' })).not.toBeNull();
+    });
 });
