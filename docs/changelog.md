@@ -57,6 +57,7 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Fixed <span v-pre>`{{each}}`</span> rendering nothing for an inline JSON literal that contains <span v-pre>`}}`</span> or ends right before the closing braces, such as <span v-pre>`{{each::{"a":1,"b":2}}}`</span>.
 - Fixed scoped regex persistence silently swallowing write failures or removing the source entry before the target scope save succeeded.
 - Fixed missing content in long mobile extension settings drawers and skipped empty blur layers when Blur Strength is set to zero.
+- Fixed post-update changelog notices displaying raw formatting tags around macro examples.
 
 ### Workbench
 
@@ -160,6 +161,10 @@ This changelog covers every Luker release, from v1.0.0 to the current developmen
 - Fixed the first save in the Skill Manager file editor overwriting a file that was changed elsewhere after the editor opened it.
 - Fixed "+ New file" in the Skill Manager file editor emptying an existing file when its path was entered.
 - Fixed opening the Skill Manager replacing some Chinese translations elsewhere in the UI with its own wording.
+
+### Client Apps
+
+- Split Android builds into per-architecture and universal APKs, matched the in-app updater to the device architecture, compressed the bundled Android runtime archive, and trimmed duplicate and test files from mobile runtime packages.
 
 ## v2.9.0-rc.5 (2026-11-25)
 

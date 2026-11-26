@@ -13,6 +13,12 @@ val availableNodeAbis = jniLibsDir
     ?.map { it.name }
     ?.toSet()
     ?: emptySet()
+val targetNodeAbis = if (availableNodeAbis.isNotEmpty()) {
+    availableNodeAbis.sorted()
+} else {
+    // Safe default for most real devices when libnode ABI set has not been prepared yet.
+    listOf("arm64-v8a")
+}
 val packageJsonFile = File(projectRootDir, "package.json")
 
 fun parseAppVersionName(packageJson: File): String {
@@ -56,6 +62,7 @@ val prepareNodeProject by tasks.registering(Exec::class) {
     val outAssetsDir = generatedNodeProjectDir.get().asFile
     val outStagingDir = stagingNodeProjectDir.get().asFile
     val tarFile = File(outAssetsDir, "runtime-bundle.tar")
+    val tarSizeFile = File(outAssetsDir, "runtime-bundle-size.txt")
     val versionFile = File(outAssetsDir, "runtime-tree-version.txt")
     val bootstrapFile = file("src/main/assets/nodejs-project/bootstrap.js")
 
@@ -75,6 +82,8 @@ val prepareNodeProject by tasks.registering(Exec::class) {
         bootstrapFile.absolutePath,
         "--tar",
         tarFile.absolutePath,
+        "--tar-size-file",
+        tarSizeFile.absolutePath,
         "--version-file",
         versionFile.absolutePath,
     )
@@ -89,6 +98,7 @@ val prepareNodeProject by tasks.registering(Exec::class) {
     inputs.dir(File(projectRootDir, "src"))
     inputs.dir(File(projectRootDir, "dist/_webpack"))
     outputs.file(tarFile)
+    outputs.file(tarSizeFile)
     outputs.file(versionFile)
 }
 
@@ -110,14 +120,14 @@ android {
                 arguments += listOf("-DANDROID_STL=c++_shared")
             }
         }
+    }
 
-        ndk {
-            if (availableNodeAbis.isNotEmpty()) {
-                abiFilters += availableNodeAbis
-            } else {
-                // Safe default for most real devices when libnode ABI set has not been prepared yet.
-                abiFilters += "arm64-v8a"
-            }
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include(*targetNodeAbis.toTypedArray())
+            isUniversalApk = true
         }
     }
 
@@ -199,7 +209,6 @@ android {
         // underscore-prefixed directories from APK assets. Node packages keep
         // runtime modules in such directories, so requiring them fails on device.
         ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~"
-        noCompress += "tar"
     }
 
     packaging {
