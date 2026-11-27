@@ -28,6 +28,7 @@ import {
     parseProtocolResponse,
     resolveWireProtocol,
 } from '../../public/scripts/lib/protocol-parser/index.js';
+import { normalizeStreamingToolReplyConfig } from '../../public/scripts/lib/streaming-tool-reply.js';
 import { createDispatchContext } from './context.js';
 import {
     applyPlainTextResultToResponseParts,
@@ -103,6 +104,16 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
     const headerId = String(request.headers?.['x-luker-request-id'] || '').trim();
     const requestId = bodyJobId || headerId || randomUUID();
 
+    // Extract and strip internal streaming tool-reply preview config before
+    // plain-text preparation or provider selection so it can never leak upstream.
+    const rawIncomingBody = request.body && typeof request.body === 'object' ? request.body : {};
+    const streamingToolReply = normalizeStreamingToolReplyConfig(rawIncomingBody.luker_streaming_tool_reply);
+    if (Object.hasOwn(rawIncomingBody, 'luker_streaming_tool_reply')) {
+        const sanitizedBody = { ...rawIncomingBody };
+        delete sanitizedBody.luker_streaming_tool_reply;
+        request.body = sanitizedBody;
+    }
+
     // Prepare backend-owned plain-text function calling orchestration before
     // selecting the provider so `luker_plain_text_tools` and native
     // `tools`/`tool_choice` are stripped before upstream dispatch and invalid
@@ -160,6 +171,7 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
         job = createGenerationJob(request, {
             job_id: requestId,
             persist_target: persistTarget,
+            streaming_tool_reply: streamingToolReply,
         });
     } catch (error) {
         response.status(error.status || 500).json({ error: error.message, code: error.code });
@@ -319,10 +331,12 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
         let initialPlainTextMetaEmitted = false;
         const plainTextStreamDetector = plainTextSession.active ? plainTextSession.createDetector() : null;
         let lastDetectedJobTextLen = 0;
+        let plainTextVisibleText = '';
         let livePlainTextParsingNotified = false;
         const ctx = createDispatchContext({
             request, abortController,
             onCloseHandlers,
+            streamingToolReply,
             onStreamMode: (streamMode) => {
                 effectiveIsStream = Boolean(streamMode);
                 job._isStream = effectiveIsStream;
@@ -416,12 +430,25 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                         const textDelta = job.text.slice(lastDetectedJobTextLen);
                         lastDetectedJobTextLen = job.text.length;
                         const processed = plainTextStreamDetector.processTextDelta(textDelta);
-                        if (processed.detected && !livePlainTextParsingNotified) {
-                            livePlainTextParsingNotified = true;
-                            updateInspectionPlainTextState(request, {
-                                status: 'parsing',
-                                triggerSignal: plainTextSession.config.triggerSignal,
-                            });
+                        if (processed.visibleText) {
+                            plainTextVisibleText += processed.visibleText;
+                        }
+                        if (processed.detected) {
+                            job._plainTextMaskActive = true;
+                            job._plainTextVisibleText = plainTextVisibleText;
+                            if (streamingToolReply) {
+                                job._toolCallPreview = plainTextStreamDetector.getToolCallPreview(
+                                    streamingToolReply.name,
+                                    streamingToolReply.argument,
+                                ) || '';
+                            }
+                            if (!livePlainTextParsingNotified) {
+                                livePlainTextParsingNotified = true;
+                                updateInspectionPlainTextState(request, {
+                                    status: 'parsing',
+                                    triggerSignal: plainTextSession.config.triggerSignal,
+                                });
+                            }
                         }
                     }
                     // Throttled status push so a reconnecting client's
@@ -432,14 +459,10 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                     if (bytes && typeof bytes === 'string') {
                         text = bytes;
                     } else if (bytes && (bytes instanceof Uint8Array || Buffer.isBuffer(bytes))) {
-                        try {
-                            const buf = Buffer.isBuffer(bytes)
-                                ? bytes
-                                : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-                            text = inspectionDecoder.write(buf);
-                        } catch {
-                            text = '';
-                        }
+                        const buf = Buffer.isBuffer(bytes)
+                            ? bytes
+                            : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+                        text = inspectionDecoder.write(buf);
                     }
                     if (!text) return;
                     if (effectiveIsStream) {
@@ -550,6 +573,7 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                             parsedRawNonStreamPayload = JSON.parse(rawBody);
                             const turn = parseProtocolResponse(protocol, parsedRawNonStreamPayload);
                             job.parsedTurn = turn;
+                            job._parsedRawNonStreamPayload = parsedRawNonStreamPayload;
                             if (typeof turn.text === 'string') {
                                 job.text = turn.text;
                             }
@@ -579,18 +603,23 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                 // native`, emit the original upstream bytes verbatim.
                 if (bufferedNonStreamChunks.length > 0) {
                     if (isSuccessStatus && !isAborted && !job.parseError && job.parsedTurn) {
-                        let rawPayload = parsedRawNonStreamPayload;
-                        if (rawPayload === null) {
-                            try {
-                                rawPayload = JSON.parse(inspectionEvents.join(''));
-                            } catch {
-                                rawPayload = null;
-                            }
-                        }
+                        const rawPayload = parsedRawNonStreamPayload ?? job._parsedRawNonStreamPayload ?? null;
                         if (rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)) {
                             const compatBody = buildCompatChatCompletionPayload(job.parsedTurn, rawPayload);
                             flushBufferedNonStreamChunks(new TextEncoder().encode(JSON.stringify(compatBody)));
                         } else {
+                            const protocol = resolveWireProtocol(request.body?.chat_completion_source) || 'unknown';
+                            const parseErr = new ProtocolParseError({
+                                protocol,
+                                stage: 'json',
+                                location: 'body',
+                                message: 'Parsed non-streaming payload is missing its raw JSON object for compat framing',
+                                rawDiagnostic: inspectionEvents.join(''),
+                            });
+                            console.error('[Runner] Missing raw non-stream payload for compat framing:', parseErr.message);
+                            job.parsedTurn = null;
+                            job.text = '';
+                            job.parseError = parseErr.toDiagnostic();
                             flushBufferedNonStreamChunks(null);
                         }
                     } else {
@@ -676,7 +705,7 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                                 initialPtResult: attempt1Result,
                                 config: plainTextSession.config,
                             });
-                            finalTurn = retryOutcome.turn || finalTurn;
+                            finalTurn = retryOutcome.turn;
                             finalResult = retryOutcome.ptResult;
                             finalAttempt = retryOutcome.attempt;
                             finalRetryOf = retryOutcome.retryOf;
@@ -684,6 +713,9 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                             finalEntryId = retryOutcome.inspectorEntryId || finalEntryId;
                         }
 
+                        job._plainTextMaskActive = false;
+                        job._plainTextVisibleText = '';
+                        job._toolCallPreview = '';
                         if (finalResult.status === 'parsed') {
                             job.text = finalResult.displayText;
                             const baseTurn = finalAttempt > 1 ? finalTurn : (job.parsedTurn || finalTurn);
@@ -700,8 +732,9 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                                 job.parsedTurn = finalTurn;
                             }
                         } else if (finalResult.status === 'parse_failed' || finalResult.status === 'network_error' || finalResult.status === 'aborted') {
-                            // Never persist broken XML call markup into chat history.
+                            // Never persist broken call markup or stale parsed turns into chat history.
                             job.text = '';
+                            job.parsedTurn = null;
                         }
 
                         clientPlainTextMeta = buildClientPlainTextMeta(finalResult, {
@@ -712,7 +745,7 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                             retryOf: finalRetryOf,
                             originalError: finalOriginalError,
                             inspectorEntryId: finalEntryId,
-                            replacedTurn: finalAttempt > 1 ? finalTurn : null,
+                            replacedTurn: finalAttempt > 1 && (finalResult.status === 'parsed' || finalResult.status === 'none') ? finalTurn : null,
                         });
                     }
                 }
@@ -724,6 +757,11 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                 // entering `awaiting_ack` with an auto-persist grace timer.
                 const protocolParseError = job.parseError || findEntry(request)?.parseError || null;
                 const abortedNow = isAborted || abortController.signal.aborted || job.status === 'cancelled';
+                const plainTextFailed = clientPlainTextMeta && (
+                    clientPlainTextMeta.status === 'parse_failed'
+                    || clientPlainTextMeta.status === 'network_error'
+                    || clientPlainTextMeta.status === 'aborted'
+                );
                 try {
                     if (abortedNow || job.status === 'failed') {
                         if (job.status !== 'cancelled' && job.status !== 'failed') {
@@ -734,6 +772,8 @@ export async function runLukerDispatch(request, response, { endpoint, select, po
                         failGenerationJob(job, `Upstream returned HTTP ${upstreamHeadStatus}`);
                     } else if (protocolParseError) {
                         failGenerationJob(job, protocolParseError.message || 'Upstream protocol parse error');
+                    } else if (plainTextFailed) {
+                        failGenerationJob(job, clientPlainTextMeta.error || 'Plain-text function call parsing failed.');
                     } else {
                         await completeGenerationJobFromText(request, job, job.text || '', request.body?.model || '');
                     }

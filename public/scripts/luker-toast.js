@@ -236,19 +236,15 @@ export function createToastEngine() {
                 if (typeof localized === 'string' && localized.length > 0) {
                     return localized;
                 }
-            } catch {
-                // Fall back to English key if translator throws.
+            } catch (err) {
+                console.error('[luker-toast] Custom translator threw an error:', err);
             }
         }
         const ctxTranslate = globalThis.Luker?.getContext?.()?.translate;
         if (typeof ctxTranslate === 'function') {
-            try {
-                const localized = ctxTranslate(key);
-                if (typeof localized === 'string' && localized.length > 0) {
-                    return localized;
-                }
-            } catch {
-                // Ignore context translator errors before boot.
+            const localized = ctxTranslate(key);
+            if (typeof localized === 'string' && localized.length > 0) {
+                return localized;
             }
         }
         return String(key);
@@ -396,11 +392,24 @@ export function createToastEngine() {
     }
 
     function measureDockedHeight(entry) {
+        const el = entry.el;
         const surfaceHeight = entry.surfaceEl?.offsetHeight || 0;
-        if (surfaceHeight > 0) {
-            return surfaceHeight;
+        const cs = typeof globalThis.getComputedStyle === 'function' ? globalThis.getComputedStyle(el) : null;
+        const borderY = cs ? ((parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0)) : 0;
+        const padY = cs ? ((parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)) : 0;
+        if (el.classList.contains('luker-toast-deck-clipped')) {
+            const scrollH = el.scrollHeight || 0;
+            const fromScroll = scrollH > 0 ? Math.ceil(scrollH + borderY) : 0;
+            const fromSurface = surfaceHeight > 0 ? Math.ceil(surfaceHeight + padY + borderY) : 0;
+            if (fromScroll > 0 || fromSurface > 0) {
+                return Math.max(fromScroll, fromSurface);
+            }
         }
-        return measureElementSize(entry.el, false).height;
+        const elHeight = measureElementSize(el, false).height;
+        if (surfaceHeight > 0) {
+            return Math.max(elHeight, Math.ceil(surfaceHeight + padY + borderY));
+        }
+        return elHeight;
     }
 
     function isTouchHoverSuppressed() {
@@ -721,6 +730,11 @@ export function createToastEngine() {
             el.style.zIndex = String(spec.zIndex);
             el.style.opacity = String(spec.opacity);
             el.style.pointerEvents = spec.pointerEvents;
+            if (spec.opacity === 0) {
+                el.setAttribute('data-stack-hidden', 'true');
+            } else {
+                el.removeAttribute('data-stack-hidden');
+            }
             el.style.setProperty('--toast-index', String(spec.index));
             el.style.setProperty('--toast-offset-y', `${spec.offsetY}px`);
             el.style.setProperty('--toast-scale', String(spec.scale));
@@ -849,6 +863,7 @@ export function createToastEngine() {
         el.style.removeProperty('--toast-clip-height');
         el.classList.remove('luker-toast-deck-clipped');
         el.removeAttribute('data-stack-index');
+        el.removeAttribute('data-stack-hidden');
         el.style.zIndex = String(FLOATING_BASE_Z_INDEX + entry.zOrder);
     }
 
@@ -879,6 +894,7 @@ export function createToastEngine() {
         el.style.removeProperty('--toast-clip-height');
         el.classList.remove('luker-toast-deck-clipped');
         el.removeAttribute('data-stack-index');
+        el.removeAttribute('data-stack-hidden');
 
         if (prevState === 'detached' && anchorRect) {
             entry.hasCustomPosition = true;
@@ -1726,7 +1742,6 @@ export const toastr = defaultEngine.toastr;
 export const setToastTranslator = defaultEngine.setTranslator;
 export const refreshToastLayout = defaultEngine.refreshLayout;
 export const syncToastContainerForDialogs = defaultEngine.syncContainerForDialogs;
-export const resetToastEngineForTests = defaultEngine.reset;
 
 globalThis.toastr = toastr;
 

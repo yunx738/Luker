@@ -8,6 +8,7 @@ import {
     normalizeOpenAIChatUsage,
 } from '../protocol.js';
 import { cloneValue, coerceToolArgs, parseSseJsonFrame } from './common.js';
+import { createJsonToolPreviewTracker } from './json-argument-preview.js';
 
 const PROTOCOL = WIRE_PROTOCOLS.OPENAI_CHAT;
 
@@ -367,6 +368,7 @@ export function createOpenAIChatStreamParser() {
     const toolCallsByIndex = new Map();
     /** @type {number[]} */
     const toolOrder = [];
+    const previewTracker = createJsonToolPreviewTracker();
     let usage = null;
     let finishReason = null;
     let nativeFinishReason = null;
@@ -396,21 +398,41 @@ export function createOpenAIChatStreamParser() {
         return lastIdx;
     }
 
+    function isCompleteToolArgsJson(argsStr) {
+        const trimmed = typeof argsStr === 'string' ? argsStr.trim() : '';
+        if (!trimmed) return false;
+        try {
+            JSON.parse(trimmed);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     function materializeToolCalls() {
-        return toolOrder.map((idx) => {
-            const slot = toolCallsByIndex.get(idx);
-            const sig = slot.signature || (slot.id && toolSignatures[slot.id]) || undefined;
-            return {
-                id: slot.id,
-                type: 'function',
-                function: {
-                    name: slot.name,
-                    arguments: slot.argsStr,
-                },
-                ...(sig ? { signature: sig } : {}),
-                ...(slot.extra_content ? { extra_content: cloneValue(slot.extra_content) } : {}),
-            };
-        });
+        const isLengthTruncated = finishReason === 'length';
+        return toolOrder
+            .map(idx => toolCallsByIndex.get(idx))
+            .filter((slot) => {
+                if (!slot || !slot.name) return false;
+                if (isLengthTruncated) {
+                    return isCompleteToolArgsJson(slot.argsStr);
+                }
+                return sawTerminal || isCompleteToolArgsJson(slot.argsStr);
+            })
+            .map((slot) => {
+                const sig = slot.signature || (slot.id && toolSignatures[slot.id]) || undefined;
+                return {
+                    id: slot.id,
+                    type: 'function',
+                    function: {
+                        name: slot.name,
+                        arguments: slot.argsStr,
+                    },
+                    ...(sig ? { signature: sig } : {}),
+                    ...(slot.extra_content ? { extra_content: cloneValue(slot.extra_content) } : {}),
+                };
+            });
     }
 
     function getSnapshot() {
@@ -676,14 +698,6 @@ export function createOpenAIChatStreamParser() {
     }
 
     function finish() {
-        if (sawFrames && !sawTerminal) {
-            throw new ProtocolParseError({
-                protocol: PROTOCOL,
-                stage: 'eof',
-                location: 'eof',
-                message: 'OpenAI Chat SSE stream ended prematurely without finish_reason or [DONE].',
-            });
-        }
         for (const idx of toolOrder) {
             const slot = toolCallsByIndex.get(idx);
             if (slot && !slot.name) {
@@ -695,9 +709,40 @@ export function createOpenAIChatStreamParser() {
                     rawDiagnostic: slot,
                 });
             }
+            if (slot && !sawTerminal && slot.argsStr) {
+                try {
+                    JSON.parse(slot.argsStr);
+                } catch {
+                    throw new ProtocolParseError({
+                        protocol: PROTOCOL,
+                        stage: 'tool_correlation',
+                        location: `tool_calls[${idx}].function.arguments`,
+                        message: `OpenAI Chat tool call at index ${idx} has truncated JSON arguments at EOF.`,
+                        rawDiagnostic: slot,
+                    });
+                }
+            }
+        }
+        if (sawFrames && !sawTerminal) {
+            throw new ProtocolParseError({
+                protocol: PROTOCOL,
+                stage: 'eof',
+                location: 'eof',
+                message: 'OpenAI Chat SSE stream ended prematurely without finish_reason or [DONE].',
+            });
         }
         return getSnapshot();
     }
 
-    return { feedFrame, finish, getSnapshot };
+    function getToolCallPreview(name, argument) {
+        for (let i = toolOrder.length - 1; i >= 0; i -= 1) {
+            const slot = toolCallsByIndex.get(toolOrder[i]);
+            if (slot && slot.name === name) {
+                return previewTracker.getPreview(slot, slot.argsStr, argument);
+            }
+        }
+        return '';
+    }
+
+    return { feedFrame, finish, getSnapshot, getToolCallPreview };
 }

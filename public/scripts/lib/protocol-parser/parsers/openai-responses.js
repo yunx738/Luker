@@ -7,6 +7,7 @@ import {
     normalizeOpenAIResponsesUsage,
 } from '../protocol.js';
 import { cloneValue, coerceToolArgs, parseSseJsonFrame } from './common.js';
+import { createJsonToolPreviewTracker } from './json-argument-preview.js';
 
 const PROTOCOL = WIRE_PROTOCOLS.OPENAI_RESPONSES;
 
@@ -230,10 +231,11 @@ export function createOpenAIResponsesStreamParser() {
     const orderedParts = [];
     let pendingText = '';
     let pendingReasoning = '';
-    /** @type {Map<number, { id: string, name: string, argsStr: string, emittedPart: boolean }>} */
+    /** @type {Map<number, { id: string, name: string, argsStr: string, closed: boolean, emittedPart: boolean, jsonParseError: ProtocolParseError|null }>} */
     const toolCallsByOutputIndex = new Map();
     /** @type {number[]} */
     const toolOrder = [];
+    const previewTracker = createJsonToolPreviewTracker();
     /** @type {Map<number, object>} */
     const doneItemsByIndex = new Map();
     /** @type {object[]} */
@@ -280,7 +282,7 @@ export function createOpenAIResponsesStreamParser() {
         const toolCalls = [];
         for (const idx of toolOrder) {
             const tc = toolCallsByOutputIndex.get(idx);
-            if (!tc) continue;
+            if (!tc || !tc.closed || !tc.name) continue;
             toolCalls.push({
                 id: tc.id,
                 type: 'function',
@@ -404,7 +406,9 @@ export function createOpenAIResponsesStreamParser() {
                     id: String(item.call_id || item.id || ''),
                     name: String(item.name || ''),
                     argsStr: typeof item.arguments === 'string' ? item.arguments : '',
+                    closed: false,
                     emittedPart: false,
+                    jsonParseError: null,
                 });
                 hasMetadataUpdate = true;
             }
@@ -438,13 +442,36 @@ export function createOpenAIResponsesStreamParser() {
             if (typeof parsed.arguments === 'string' && !slot.argsStr) {
                 slot.argsStr = parsed.arguments;
             }
+            if (typeof parsed.name === 'string' && !slot.name) {
+                slot.name = parsed.name;
+            }
+            const rawArgs = slot.argsStr.trim();
+            if (rawArgs.length > 0) {
+                try {
+                    JSON.parse(rawArgs);
+                    if (slot.name) {
+                        slot.closed = true;
+                    }
+                } catch (cause) {
+                    slot.jsonParseError = new ProtocolParseError({
+                        protocol: PROTOCOL,
+                        stage: 'tool_correlation',
+                        location,
+                        message: `Malformed tool arguments JSON on OpenAI Responses output_index ${idx} ("${slot.name}"): ${cause.message}`,
+                        cause,
+                        rawDiagnostic: parsed,
+                    });
+                }
+            } else if (slot.name) {
+                slot.closed = true;
+            }
             hasMetadataUpdate = true;
         } else if (type === 'response.output_item.done') {
             if (parsed.item && typeof parsed.item === 'object') {
                 const idx = Number.isInteger(parsed.output_index) ? parsed.output_index : doneItemsByIndex.size;
-                doneItemsByIndex.set(idx, cloneValue(parsed.item));
                 hasMetadataUpdate = true;
                 if (parsed.item.type === 'message' && Array.isArray(parsed.item.content)) {
+                    doneItemsByIndex.set(idx, cloneValue(parsed.item));
                     for (const part of parsed.item.content) {
                         if (part?.type === 'output_text' && Array.isArray(part.annotations)) {
                             extractResponsesAnnotations(part.annotations, citations, citationKeys);
@@ -460,21 +487,63 @@ export function createOpenAIResponsesStreamParser() {
                             id: String(parsed.item.call_id || parsed.item.id || ''),
                             name: String(parsed.item.name || ''),
                             argsStr: typeof parsed.item.arguments === 'string' ? parsed.item.arguments : '',
+                            closed: false,
                             emittedPart: false,
+                            jsonParseError: null,
                         };
                         toolCallsByOutputIndex.set(idx, slot);
-                    } else if (typeof parsed.item.arguments === 'string' && !slot.argsStr) {
-                        slot.argsStr = parsed.item.arguments;
+                    } else {
+                        if (!slot.id) {
+                            slot.id = String(parsed.item.call_id || parsed.item.id || '');
+                        }
+                        if (!slot.name && typeof parsed.item.name === 'string') {
+                            slot.name = parsed.item.name;
+                        }
+                        if (typeof parsed.item.arguments === 'string' && !slot.argsStr) {
+                            slot.argsStr = parsed.item.arguments;
+                        }
                     }
-                    if (!slot.emittedPart) {
-                        slot.emittedPart = true;
-                        orderedParts.push({
-                            type: 'tool_call',
-                            id: slot.id,
-                            name: slot.name,
-                            args: coerceToolArgs(slot.argsStr),
+                    if (!slot.name) {
+                        throw new ProtocolParseError({
+                            protocol: PROTOCOL,
+                            stage: 'tool_correlation',
+                            location,
+                            message: `OpenAI Responses tool call at output_index ${idx} is missing function name.`,
+                            rawDiagnostic: parsed,
                         });
                     }
+                    const rawArgs = slot.argsStr.trim();
+                    let argsValid = true;
+                    if (rawArgs.length > 0) {
+                        try {
+                            JSON.parse(rawArgs);
+                        } catch (cause) {
+                            argsValid = false;
+                            slot.jsonParseError = new ProtocolParseError({
+                                protocol: PROTOCOL,
+                                stage: 'tool_correlation',
+                                location,
+                                message: `Malformed tool arguments JSON on OpenAI Responses output_index ${idx} ("${slot.name}"): ${cause.message}`,
+                                cause,
+                                rawDiagnostic: parsed,
+                            });
+                        }
+                    }
+                    if (argsValid && parsed.item.status !== 'incomplete') {
+                        doneItemsByIndex.set(idx, cloneValue(parsed.item));
+                        slot.closed = true;
+                        if (!slot.emittedPart) {
+                            slot.emittedPart = true;
+                            orderedParts.push({
+                                type: 'tool_call',
+                                id: slot.id,
+                                name: slot.name,
+                                args: coerceToolArgs(slot.argsStr),
+                            });
+                        }
+                    }
+                } else {
+                    doneItemsByIndex.set(idx, cloneValue(parsed.item));
                 }
             }
         } else if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.cancelled') {
@@ -493,7 +562,22 @@ export function createOpenAIResponsesStreamParser() {
                 }
             }
             if (Array.isArray(resp.output) && resp.output.length > 0) {
-                terminalOutputItems = resp.output.map(cloneValue);
+                const filteredOutput = type === 'response.incomplete'
+                    ? resp.output.filter((item) => {
+                        if (!item || typeof item !== 'object') return false;
+                        if (item.type !== 'function_call') return true;
+                        if (item.status === 'incomplete') return false;
+                        const argText = typeof item.arguments === 'string' ? item.arguments.trim() : '';
+                        if (!argText) return false;
+                        try {
+                            JSON.parse(argText);
+                            return true;
+                        } catch {
+                            return false;
+                        }
+                    })
+                    : resp.output;
+                terminalOutputItems = filteredOutput.length > 0 ? filteredOutput.map(cloneValue) : null;
                 for (const item of resp.output) {
                     if (item?.type === 'message' && Array.isArray(item.content)) {
                         for (const part of item.content) {
@@ -519,7 +603,46 @@ export function createOpenAIResponsesStreamParser() {
     }
 
     function finish() {
-        if (sawFrames && !sawTerminal) {
+        const isPrematureEof = sawFrames && !sawTerminal;
+        const isLengthTruncated = !isPrematureEof && status === 'incomplete' && incompleteReason !== 'content_filter';
+        for (const idx of toolOrder) {
+            const slot = toolCallsByOutputIndex.get(idx);
+            if (!slot) continue;
+            if (!slot.name) {
+                throw new ProtocolParseError({
+                    protocol: PROTOCOL,
+                    stage: 'tool_correlation',
+                    location: `output[${idx}]`,
+                    message: `OpenAI Responses tool call at output_index ${idx} is missing function name.`,
+                    rawDiagnostic: slot,
+                });
+            }
+            if (slot.closed) continue;
+            if (slot.jsonParseError) {
+                if (isLengthTruncated) continue;
+                throw slot.jsonParseError;
+            }
+            const rawArgs = slot.argsStr.trim();
+            if (rawArgs.length > 0) {
+                try {
+                    JSON.parse(rawArgs);
+                    slot.closed = true;
+                } catch (cause) {
+                    if (isLengthTruncated) continue;
+                    throw new ProtocolParseError({
+                        protocol: PROTOCOL,
+                        stage: 'tool_correlation',
+                        location: `output[${idx}].arguments`,
+                        message: `OpenAI Responses tool call at output_index ${idx} has truncated JSON arguments at EOF.`,
+                        cause,
+                        rawDiagnostic: slot,
+                    });
+                }
+            } else if (!isPrematureEof && !isLengthTruncated) {
+                slot.closed = true;
+            }
+        }
+        if (isPrematureEof) {
             throw new ProtocolParseError({
                 protocol: PROTOCOL,
                 stage: 'eof',
@@ -530,5 +653,15 @@ export function createOpenAIResponsesStreamParser() {
         return getSnapshot();
     }
 
-    return { feedFrame, finish, getSnapshot };
+    function getToolCallPreview(name, argument) {
+        for (let i = toolOrder.length - 1; i >= 0; i -= 1) {
+            const slot = toolCallsByOutputIndex.get(toolOrder[i]);
+            if (slot && slot.name === name) {
+                return previewTracker.getPreview(slot, slot.argsStr, argument);
+            }
+        }
+        return '';
+    }
+
+    return { feedFrame, finish, getSnapshot, getToolCallPreview };
 }

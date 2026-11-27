@@ -25,15 +25,17 @@ import {
 import { groups, selected_group } from './group-chats.js';
 import { t } from './i18n.js';
 import { instruct_presets } from './instruct-mode.js';
-import { kai_settings } from './kai-settings.js';
-import { convertNovelPreset } from './nai-settings.js';
-import { applyPresetBodyChangesToSettings, captureCharacterBoundSettingsSave, persistCapturedCharacterBoundSettings, getActiveCardBoundGhostSnapshot, getChatCompletionPreset, getPresetApplicationPromise, maybeApplyCharacterBoundPreset, oai_settings, openai_setting_names, openai_settings } from './openai.js';
+import { ensureKoboldPresetHydrated, kai_settings } from './kai-settings.js';
+import { convertNovelPreset, ensureNovelPresetHydrated } from './nai-settings.js';
+import { applyPresetBodyChangesToSettings, captureCharacterBoundSettingsSave, ensureOpenAIPresetHydrated, persistCapturedCharacterBoundSettings, getActiveCardBoundGhostSnapshot, getChatCompletionPreset, getPresetApplicationPromise, maybeApplyCharacterBoundPreset, oai_settings, openai_setting_names, openai_settings } from './openai.js';
 import { decodeCardBoundOptionValue } from './lib/preset-ref-codec.js';
 import { readCharacterBoundStateRaw, renameCharacterBoundPreset } from './character/presets.js';
 import { createPresetLineage } from './character/preset-mutation.js';
 import { getContext } from './st-context.js';
 import { persistPreset } from './preset-persistence.js';
 import { readPresetDocument } from './named-resource-read.js';
+import { BULK_RESOURCE_READ_CONCURRENCY, mapWithConcurrency } from './util/concurrent-map.js';
+import { synthesizeCardBoundPresetList } from './util/preset-hydration.js';
 import { POPUP_RESULT, POPUP_TYPE, Popup } from './popup.js';
 import { context_presets, getContextSettings, power_user } from './power-user.js';
 import { reasoning_templates } from './reasoning.js';
@@ -45,6 +47,7 @@ import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
 import { checkForSystemPromptInInstructTemplate, system_prompts } from './sysprompt.js';
 import { renderTemplateAsync } from './templates.js';
 import {
+    ensureTextGenPresetHydrated,
     textgenerationwebui_settings as textgen_settings,
     textgenerationwebui_preset_names,
     textgenerationwebui_presets,
@@ -852,9 +855,9 @@ class PresetManager {
      * The selected ghost body is the live object exposed by
      * `getPresetList()`, so identity is the reliable signal for "this is the
      * active card-bound preset". A detached body under the same name is
-     * treated as the global path, which preserves the documented
-     * yield-to-global collision behavior and makes `savePreset(name, copy)`
-     * usable for creating a global preset with that name. Non-selected card
+     * treated as the global path, which makes `savePreset(name, copy)`
+     * usable for creating or updating a global preset with that name even when
+     * an active card-bound preset shares the name. Non-selected card
      * slots also stay on the global path; promoting a slot to the global
      * library is a legitimate operation, so a name alone cannot imply a card
      * write.
@@ -898,7 +901,7 @@ class PresetManager {
      * it, the body is written to the character card instead of the global
      * preset library. Passing the live body from `getPresetList()` (or
      * omitting `settings`) targets the card; a detached body targets the
-     * global path, which preserves same-name collision semantics.
+     * global path.
      *
      * @param {string} name Name of the preset to save
      * @param {object} [settings] Settings to save as the preset. If not provided, uses the current preset settings.
@@ -1080,17 +1083,14 @@ class PresetManager {
      *
      * Semantics:
      *   - Only applies to `openai` — no other API has ghost options.
-     *   - Same-name collision (a global preset already carries this
-     *     name) yields to the global entry so writes going through
-     *     the global `updateList` / `savePreset` path still target
-     *     the same array slot. Card-bound writes go through
-     *     `savePreset` (live-body identity) or
-     *     `writePresetExtensionField` → card sync at
-     *     `syncCharacterBoundOpenAIPresetExtensionField`, so this
-     *     bias is safe. Third-party consumers that read the
-     *     collided global body will see the source they bound
-     *     from — acceptable because card-body edits stay in sync
-     *     with the global via existing iter-studio propagation.
+     *   - Same-name collision (a global preset already carries this name)
+     *     always prefers the active card-bound `ghost.body` at that index
+     *     in the returned shallow copy, whether the global slot is `null`
+     *     or already hydrated. Callers reading the active preset therefore
+     *     receive the active card-bound preset consistently before and
+     *     after background preload, while internal global writers keep
+     *     using `getPresetListRaw()` and detached `savePreset(name, copy)`
+     *     still targets the global preset store.
      *   - Returned `presets` array and `preset_names` object are
      *     fresh shallow copies (only when synthesis occurs) so adding
      *     or replacing entries cannot mutate the upstream
@@ -1105,15 +1105,7 @@ class PresetManager {
         const resolvedApi = api === undefined ? this.apiId : api;
 
         if (resolvedApi === 'openai') {
-            const ghost = getActiveCardBoundGhostSnapshot();
-            if (ghost?.name && ghost?.body && raw.preset_names && !(ghost.name in raw.preset_names)) {
-                const synthIndex = raw.presets.length;
-                return {
-                    presets: [...raw.presets, ghost.body],
-                    preset_names: { ...raw.preset_names, [ghost.name]: synthIndex },
-                    settings: raw.settings,
-                };
-            }
+            return synthesizeCardBoundPresetList(raw, getActiveCardBoundGhostSnapshot());
         }
 
         return raw;
@@ -1312,6 +1304,94 @@ class PresetManager {
     }
 
     /**
+     * Ensures a single preset's full body is hydrated in memory, fetching only
+     * that preset from disk on demand when its slot is still `null` or a lazy
+     * summary placeholder (`_summary: true`).
+     *
+     * @param {string} name Preset name
+     * @param {{ signal?: AbortSignal }} [options]
+     * @returns {Promise<any>} Hydrated preset body, or null if not found
+     */
+    async ensurePresetHydrated(name, { signal } = {}) {
+        const resolvedName = this.resolvePresetName(name);
+        if (!resolvedName) {
+            return null;
+        }
+
+        if (this.apiId === 'openai') {
+            const ghost = getActiveCardBoundGhostSnapshot();
+            if (ghost?.name && ghost?.body && areLookupNamesEqual(ghost.name, resolvedName)) {
+                return ghost.body;
+            }
+            const raw = this.getPresetListRaw('openai');
+            if (!Object.prototype.hasOwnProperty.call(raw.preset_names || {}, resolvedName)) {
+                return null;
+            }
+            return await ensureOpenAIPresetHydrated(resolvedName, { signal });
+        }
+
+        if (this.apiId === 'kobold' || this.apiId === 'koboldhorde') {
+            if (resolvedName === 'gui') {
+                return null;
+            }
+            const raw = this.getPresetListRaw('kobold');
+            if (!Object.prototype.hasOwnProperty.call(raw.preset_names || {}, resolvedName)) {
+                return null;
+            }
+            return await ensureKoboldPresetHydrated(resolvedName, { signal });
+        }
+
+        if (this.apiId === 'novel') {
+            const raw = this.getPresetListRaw('novel');
+            if (!Object.prototype.hasOwnProperty.call(raw.preset_names || {}, resolvedName)) {
+                return null;
+            }
+            return await ensureNovelPresetHydrated(resolvedName, { signal });
+        }
+
+        if (this.apiId === 'textgenerationwebui') {
+            const raw = this.getPresetListRaw('textgenerationwebui');
+            if (!Array.isArray(raw.preset_names) || !raw.preset_names.includes(resolvedName)) {
+                return null;
+            }
+            return await ensureTextGenPresetHydrated(resolvedName, { signal });
+        }
+
+        const raw = this.getPresetListRaw();
+        if (!Array.isArray(raw.preset_names)) {
+            return null;
+        }
+        const index = raw.preset_names.indexOf(resolvedName);
+        if (index === -1) {
+            return null;
+        }
+        const existing = raw.presets[index];
+        if (existing && typeof existing === 'object' && existing._summary !== true) {
+            return existing;
+        }
+
+        const fetched = await readPresetDocument(this.apiId, resolvedName, { signal });
+        if (!fetched || typeof fetched !== 'object' || Array.isArray(fetched)) {
+            throw new Error(`Preset "${this.apiId}/${resolvedName}" payload is not a JSON object`);
+        }
+        const stamped = typeof fetched.name === 'string' && fetched.name
+            ? fetched
+            : { ...fetched, name: resolvedName };
+        const latestRaw = this.getPresetListRaw();
+        const latestIndex = Array.isArray(latestRaw.preset_names)
+            ? latestRaw.preset_names.indexOf(resolvedName)
+            : -1;
+        if (latestIndex !== -1) {
+            const latestEntry = latestRaw.presets[latestIndex];
+            if (!latestEntry || latestEntry._summary === true) {
+                latestRaw.presets[latestIndex] = stamped;
+            }
+            return latestRaw.presets[latestIndex];
+        }
+        return stamped;
+    }
+
+    /**
      * Retrieves a completion preset by name.
      * @param {string} name Name of the preset to retrieve
      * @returns {any} Preset object if found, otherwise undefined
@@ -1373,9 +1453,19 @@ class PresetManager {
         const files = [];
         const missing = [];
 
+        await mapWithConcurrency(uniqueNames, BULK_RESOURCE_READ_CONCURRENCY, async (name) => {
+            try {
+                await this.ensurePresetHydrated(name);
+            } catch (error) {
+                if (error?.status !== 404) {
+                    throw error;
+                }
+            }
+        }, { abortOnError: true });
+
         for (const name of uniqueNames) {
             const preset = this.getStoredPreset(name);
-            if (!preset) {
+            if (!preset || preset._summary === true) {
                 missing.push(name);
                 continue;
             }
@@ -1471,6 +1561,11 @@ class PresetManager {
             return false;
         }
 
+        try {
+            await this.ensurePresetHydrated(resolvedName);
+        } catch (error) {
+            console.warn(`Could not hydrate preset "${resolvedName}" before delete`, error);
+        }
         const presetSnapshot = this.getStoredPreset(resolvedName);
         const extensions = this.readPresetExtensionField({ name: resolvedName, path: '' });
         const result = await this.deletePreset(resolvedName);
@@ -1535,6 +1630,11 @@ class PresetManager {
         /** @type {string[]} */
         const failedNames = [];
         for (const resolvedName of resolvedNames) {
+            try {
+                await this.ensurePresetHydrated(resolvedName);
+            } catch (error) {
+                console.warn(`Could not hydrate preset "${resolvedName}" before delete`, error);
+            }
             const presetSnapshot = this.getStoredPreset(resolvedName);
             const extensions = this.readPresetExtensionField({ name: resolvedName, path: '' });
             let result = false;
@@ -1687,12 +1787,15 @@ class PresetManager {
         let currentPresets = presets;
         let index = !target ? (Array.isArray(preset_names) ? preset_names.indexOf(presetName) : preset_names?.[presetName]) : -1;
         let hasIndex = !target && (Array.isArray(preset_names) ? index !== -1 : index !== undefined);
-        if (hasIndex && !currentPresets[index]) {
+        const isPresetUnhydrated = (entry) => !entry || entry._summary === true;
+        if (hasIndex && isPresetUnhydrated(currentPresets[index])) {
             let fetched = null;
+            let hydrationError = null;
             try {
                 fetched = await readPresetDocument(this.apiId, presetName);
             } catch (error) {
-                console.warn(`[PresetManager] Failed to hydrate preset "${presetName}" before extension write:`, error);
+                hydrationError = error;
+                console.error(`[PresetManager] Failed to hydrate preset "${presetName}" before extension write:`, error);
             }
             // Always re-read live preset arrays after yielding so a concurrent
             // background preload (warmPreloadFullSettings) is observed even if
@@ -1705,11 +1808,17 @@ class PresetManager {
             currentPresets = latestRaw.presets;
             index = latestIndex;
             hasIndex = latestHasIndex;
-            if (hasIndex && !currentPresets[index] && fetched && typeof fetched === 'object' && !Array.isArray(fetched)) {
-                currentPresets[index] = structuredClone(fetched);
+            if (hasIndex && isPresetUnhydrated(currentPresets[index]) && fetched && typeof fetched === 'object' && !Array.isArray(fetched)) {
+                const stamped = this.isKeyedApi() && !(typeof fetched.name === 'string' && fetched.name)
+                    ? { ...structuredClone(fetched), name: presetName }
+                    : structuredClone(fetched);
+                currentPresets[index] = stamped;
+            }
+            if (hasIndex && isPresetUnhydrated(currentPresets[index]) && hydrationError) {
+                throw hydrationError;
             }
         }
-        const hasPreset = hasIndex && Boolean(currentPresets[index]);
+        const hasPreset = hasIndex && !isPresetUnhydrated(currentPresets[index]);
         const invokedPreset = hasPreset ? currentPresets[index] : null;
         const invokedIdentity = invokedPreset ? presetExtensionLineage.capture(invokedPreset) : null;
         let settingsSaved = false;

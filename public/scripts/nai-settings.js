@@ -1,6 +1,5 @@
 import {
     abortStatusCheck,
-    ensureFullSettingsLoaded,
     event_types,
     eventSource,
     getRequestHeaders,
@@ -12,9 +11,11 @@ import {
     startStatusLoading,
 } from '../script.js';
 import { MAX_CONTEXT_DEFAULT, MAX_RESPONSE_DEFAULT, power_user } from './power-user.js';
+import { readPresetDocument } from './named-resource-read.js';
 import { getTextTokens, tokenizers } from './tokenizers.js';
 import { getEventSourceStream } from './sse-stream.js';
 import { onLukerResponseMeta } from './ws-delivery.js';
+import { attachStreamingResponseMeta } from './lib/response-meta-subscription.js';
 import { hydrateIndexedPresetEntries } from './util/preset-hydration.js';
 import {
     getSortableDelay,
@@ -228,6 +229,32 @@ export function hydrateNovelPresetData(data = {}, options = {}) {
     });
     novelai_setting_names = hydrated.names;
     novelai_settings = hydrated.bodies;
+}
+
+export async function ensureNovelPresetHydrated(name, { signal } = {}) {
+    const presetName = String(name ?? '').trim();
+    if (!presetName) {
+        return null;
+    }
+    const existingIdx = novelai_setting_names?.[presetName];
+    const existing = Number.isInteger(existingIdx) ? novelai_settings?.[existingIdx] : null;
+    if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+        return existing;
+    }
+
+    const fetched = await readPresetDocument('novel', presetName, { signal });
+    if (!fetched || typeof fetched !== 'object' || Array.isArray(fetched)) {
+        throw new Error(`NovelAI preset "${presetName}" payload is not a JSON object`);
+    }
+    const idx = novelai_setting_names?.[presetName];
+    if (Number.isInteger(idx)) {
+        const current = novelai_settings?.[idx];
+        if (!current || typeof current !== 'object' || Array.isArray(current)) {
+            novelai_settings[idx] = fetched;
+        }
+        return novelai_settings[idx];
+    }
+    return fetched;
 }
 
 export function loadNovelSettings(data, settings) {
@@ -775,62 +802,23 @@ export async function generateNovelWithStreaming(generate_data, signal, { onLuke
         },
     });
 
-    const expectedGenerationId = typeof generate_data?.luker_generation?.job_id === 'string'
-        ? generate_data.luker_generation.job_id
-        : '';
-    const generationId = response.headers.get('x-luker-generation-id') || '';
-    const hasMismatchedGenerationIdHeader = Boolean(
-        expectedGenerationId && generationId && generationId !== expectedGenerationId,
-    );
-    let trackedGenerationId = expectedGenerationId || generationId;
-    if (!hasMismatchedGenerationIdHeader && generationId && typeof onLukerMeta === 'function') {
-        onLukerMeta({ generationId });
-    }
-    const persistedHeader = response.headers.get('x-luker-server-persisted');
-    if (!hasMismatchedGenerationIdHeader && (persistedHeader === '0' || persistedHeader === '1') && typeof onLukerMeta === 'function') {
-        onLukerMeta({ persisted: persistedHeader === '1' });
-    }
-    let disposeLukerMeta = null;
-    const cleanupLukerMeta = () => {
-        signal?.removeEventListener?.('abort', cleanupLukerMeta);
-        if (!disposeLukerMeta) return;
-        const dispose = disposeLukerMeta;
-        disposeLukerMeta = null;
-        dispose();
-    };
-    if (!hasMismatchedGenerationIdHeader && typeof onLukerMeta === 'function') {
-        disposeLukerMeta = onLukerResponseMeta(response, (meta) => {
-            const metaGenerationId = typeof meta?.generation_id === 'string' ? meta.generation_id : '';
-            if (metaGenerationId && trackedGenerationId && metaGenerationId !== trackedGenerationId) {
-                return;
-            }
-            if (metaGenerationId && !trackedGenerationId) {
-                trackedGenerationId = metaGenerationId;
-            }
-            if (metaGenerationId) {
-                onLukerMeta({ generationId: metaGenerationId });
-            }
-            if (typeof meta?.persisted === 'boolean') {
-                onLukerMeta({ persisted: meta.persisted });
-            }
-        });
-        if (typeof onLukerMetaDisposer === 'function') {
-            onLukerMetaDisposer(cleanupLukerMeta);
-        }
-    }
+    const { cleanup: cleanupLukerMeta, armAbortCleanup } = attachStreamingResponseMeta({
+        response,
+        expectedGenerationId: typeof generate_data?.luker_generation?.job_id === 'string'
+            ? generate_data.luker_generation.job_id
+            : '',
+        signal,
+        onLukerResponseMeta,
+        onLukerMeta,
+        onLukerMetaDisposer,
+    });
 
     if (!response.ok) {
         cleanupLukerMeta();
         tryParseStreamingError(response, await response.text());
         throw new Error(`Got response status ${response.status}`);
     }
-    if (signal && disposeLukerMeta) {
-        if (signal.aborted) {
-            cleanupLukerMeta();
-        } else {
-            signal.addEventListener('abort', cleanupLukerMeta, { once: true });
-        }
-    }
+    armAbortCleanup();
     let reader;
     try {
         const eventStream = getEventSourceStream();
@@ -978,18 +966,27 @@ export function initNovelAISettings() {
     });
 
     $('#settings_preset_novel').on('change', async function () {
-        nai_settings.preset_settings_novel = $('#settings_preset_novel').find(':selected').text();
-        let preset = novelai_settings[novelai_setting_names[nai_settings.preset_settings_novel]];
+        const selectedName = $('#settings_preset_novel').find(':selected').text();
+        nai_settings.preset_settings_novel = selectedName;
+        let preset = novelai_settings[novelai_setting_names[selectedName]];
         if (!preset) {
-            await ensureFullSettingsLoaded();
-            preset = novelai_settings[novelai_setting_names[nai_settings.preset_settings_novel]];
+            try {
+                preset = await ensureNovelPresetHydrated(selectedName);
+            } catch (error) {
+                console.error(`Failed to load NovelAI preset "${selectedName}"`, error);
+                toastr.error(t`Failed to load preset.`);
+                return;
+            }
+            if ($('#settings_preset_novel').find(':selected').text() !== selectedName) {
+                return;
+            }
         }
         if (!preset) {
             return;
         }
         loadNovelPreset(preset);
         saveSettingsDebounced();
-        await eventSource.emit(event_types.PRESET_CHANGED, { apiId: 'novel', name: nai_settings.preset_settings_novel });
+        await eventSource.emit(event_types.PRESET_CHANGED, { apiId: 'novel', name: selectedName });
     });
 
     $('#streaming_novel').on('input', function () {

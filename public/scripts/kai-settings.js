@@ -1,5 +1,4 @@
 import {
-    ensureFullSettingsLoaded,
     getRequestHeaders,
     saveSettingsDebounced,
     getStoppingStrings,
@@ -17,12 +16,14 @@ import {
 import { t } from './i18n.js';
 import { autoSelectInstructPreset } from './instruct-mode.js';
 import { withProfileRetry } from './extensions/connection-manager/profile-retry.js';
+import { readPresetDocument } from './named-resource-read.js';
 
 import {
     power_user,
 } from './power-user.js';
 import { getEventSourceStream } from './sse-stream.js';
 import { onLukerResponseMeta } from './ws-delivery.js';
+import { attachStreamingResponseMeta } from './lib/response-meta-subscription.js';
 import { hydrateIndexedPresetEntries } from './util/preset-hydration.js';
 import { getOrderedPresetNames, getSortableDelay, versionCompare } from './utils.js';
 import { unescapeMacroBracesInRequestData } from './macros/util/escape.js';
@@ -109,6 +110,32 @@ export function hydrateKoboldPresetData(data = {}, options = {}) {
     });
     koboldai_setting_names = hydrated.names;
     koboldai_settings = hydrated.bodies;
+}
+
+export async function ensureKoboldPresetHydrated(name, { signal } = {}) {
+    const presetName = String(name ?? '').trim();
+    if (!presetName || presetName === 'gui') {
+        return null;
+    }
+    const existingIdx = koboldai_setting_names?.[presetName];
+    const existing = Number.isInteger(existingIdx) ? koboldai_settings?.[existingIdx] : null;
+    if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+        return existing;
+    }
+
+    const fetched = await readPresetDocument('kobold', presetName, { signal });
+    if (!fetched || typeof fetched !== 'object' || Array.isArray(fetched)) {
+        throw new Error(`Kobold preset "${presetName}" payload is not a JSON object`);
+    }
+    const idx = koboldai_setting_names?.[presetName];
+    if (Number.isInteger(idx)) {
+        const current = koboldai_settings?.[idx];
+        if (!current || typeof current !== 'object' || Array.isArray(current)) {
+            koboldai_settings[idx] = fetched;
+        }
+        return koboldai_settings[idx];
+    }
+    return fetched;
 }
 
 export function loadKoboldSettings(data, preset, settings) {
@@ -257,62 +284,23 @@ export async function generateKoboldWithStreaming(generate_data, signal, { onLuk
         },
     });
 
-    const expectedGenerationId = typeof generate_data?.luker_generation?.job_id === 'string'
-        ? generate_data.luker_generation.job_id
-        : '';
-    const generationId = response.headers.get('x-luker-generation-id') || '';
-    const hasMismatchedGenerationIdHeader = Boolean(
-        expectedGenerationId && generationId && generationId !== expectedGenerationId,
-    );
-    let trackedGenerationId = expectedGenerationId || generationId;
-    if (!hasMismatchedGenerationIdHeader && generationId && typeof onLukerMeta === 'function') {
-        onLukerMeta({ generationId });
-    }
-    const persistedHeader = response.headers.get('x-luker-server-persisted');
-    if (!hasMismatchedGenerationIdHeader && (persistedHeader === '0' || persistedHeader === '1') && typeof onLukerMeta === 'function') {
-        onLukerMeta({ persisted: persistedHeader === '1' });
-    }
-    let disposeLukerMeta = null;
-    const cleanupLukerMeta = () => {
-        signal?.removeEventListener?.('abort', cleanupLukerMeta);
-        if (!disposeLukerMeta) return;
-        const dispose = disposeLukerMeta;
-        disposeLukerMeta = null;
-        dispose();
-    };
-    if (!hasMismatchedGenerationIdHeader && typeof onLukerMeta === 'function') {
-        disposeLukerMeta = onLukerResponseMeta(response, (meta) => {
-            const metaGenerationId = typeof meta?.generation_id === 'string' ? meta.generation_id : '';
-            if (metaGenerationId && trackedGenerationId && metaGenerationId !== trackedGenerationId) {
-                return;
-            }
-            if (metaGenerationId && !trackedGenerationId) {
-                trackedGenerationId = metaGenerationId;
-            }
-            if (metaGenerationId) {
-                onLukerMeta({ generationId: metaGenerationId });
-            }
-            if (typeof meta?.persisted === 'boolean') {
-                onLukerMeta({ persisted: meta.persisted });
-            }
-        });
-        if (typeof onLukerMetaDisposer === 'function') {
-            onLukerMetaDisposer(cleanupLukerMeta);
-        }
-    }
+    const { cleanup: cleanupLukerMeta, armAbortCleanup } = attachStreamingResponseMeta({
+        response,
+        expectedGenerationId: typeof generate_data?.luker_generation?.job_id === 'string'
+            ? generate_data.luker_generation.job_id
+            : '',
+        signal,
+        onLukerResponseMeta,
+        onLukerMeta,
+        onLukerMetaDisposer,
+    });
 
     if (!response.ok) {
         cleanupLukerMeta();
         tryParseStreamingError(response, await response.text());
         throw new Error(`Got response status ${response.status}`);
     }
-    if (signal && disposeLukerMeta) {
-        if (signal.aborted) {
-            cleanupLukerMeta();
-        } else {
-            signal.addEventListener('abort', cleanupLukerMeta, { once: true });
-        }
-    }
+    armAbortCleanup();
     let reader;
     try {
         const eventStream = getEventSourceStream();
@@ -597,11 +585,20 @@ export function initKoboldSettings() {
 
     $('#settings_preset').on('change', async function () {
         if ($('#settings_preset').find(':selected').val() != 'gui') {
-            kai_settings.preset_settings = $('#settings_preset').find(':selected').text();
-            let preset = koboldai_settings[koboldai_setting_names[kai_settings.preset_settings]];
+            const selectedName = $('#settings_preset').find(':selected').text();
+            kai_settings.preset_settings = selectedName;
+            let preset = koboldai_settings[koboldai_setting_names[selectedName]];
             if (!preset) {
-                await ensureFullSettingsLoaded();
-                preset = koboldai_settings[koboldai_setting_names[kai_settings.preset_settings]];
+                try {
+                    preset = await ensureKoboldPresetHydrated(selectedName);
+                } catch (error) {
+                    console.error(`Failed to load Kobold preset "${selectedName}"`, error);
+                    toastr.error(t`Failed to load preset.`);
+                    return;
+                }
+                if ($('#settings_preset').find(':selected').text() !== selectedName) {
+                    return;
+                }
             }
             if (!preset) {
                 return;

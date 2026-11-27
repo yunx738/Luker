@@ -1,6 +1,5 @@
 import {
     abortStatusCheck,
-    ensureFullSettingsLoaded,
     eventSource,
     event_types,
     getRequestHeaders,
@@ -15,6 +14,7 @@ import {
     startStatusLoading,
     substituteParams,
 } from '../script.js';
+import { readPresetDocument } from './named-resource-read.js';
 import { deriveTemplatesFromChatTemplate } from './chat-templates.js';
 import { t } from './i18n.js';
 import { autoSelectInstructPreset, selectContextPreset, selectInstructPreset } from './instruct-mode.js';
@@ -28,6 +28,7 @@ import { getActiveManualApiSamplers, loadApiSelectedSamplers, isSamplerManualPri
 import { SECRET_KEYS, writeSecret } from './secrets.js';
 import { getEventSourceStream } from './sse-stream.js';
 import { onLukerResponseMeta } from './ws-delivery.js';
+import { attachStreamingResponseMeta } from './lib/response-meta-subscription.js';
 import { getCurrentDreamGenModelTokenizer, getCurrentOpenRouterModelTokenizer, loadAphroditeModels, loadDreamGenModels, loadFeatherlessModels, loadGenericModels, loadInfermaticAIModels, loadLlamaCppModels, loadMancerModels, loadOllamaModels, loadOpenRouterModels, loadTabbyModels, loadTogetherAIModels, loadVllmModels, updateOpenRouterProvidersWarning } from './textgen-models.js';
 import { TOKENIZER_SUPPORTED_KEY, getEncodingTokenizerType, getTextTokens, getTokenizerBestMatch, tokenizers } from './tokenizers.js';
 import { AbortReason } from './util/AbortReason.js';
@@ -386,12 +387,53 @@ export function getTextGenServer(type = null) {
     }
 }
 
+let textGenPresetSelectionToken = 0;
+
+export async function ensureTextGenPresetHydrated(name, { signal } = {}) {
+    const presetName = String(name ?? '').trim();
+    if (!presetName) {
+        return null;
+    }
+    const existingIdx = Array.isArray(textgenerationwebui_preset_names)
+        ? textgenerationwebui_preset_names.indexOf(presetName)
+        : -1;
+    const existing = existingIdx !== -1 ? textgenerationwebui_presets?.[existingIdx] : null;
+    if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+        return existing;
+    }
+
+    const fetched = await readPresetDocument('textgenerationwebui', presetName, { signal });
+    if (!fetched || typeof fetched !== 'object' || Array.isArray(fetched)) {
+        throw new Error(`TextGen preset "${presetName}" payload is not a JSON object`);
+    }
+    const idx = Array.isArray(textgenerationwebui_preset_names)
+        ? textgenerationwebui_preset_names.indexOf(presetName)
+        : -1;
+    if (idx !== -1) {
+        const current = textgenerationwebui_presets?.[idx];
+        if (!current || typeof current !== 'object' || Array.isArray(current)) {
+            textgenerationwebui_presets[idx] = fetched;
+        }
+        return textgenerationwebui_presets[idx];
+    }
+    return fetched;
+}
+
 async function selectPreset(name) {
+    const selectionToken = ++textGenPresetSelectionToken;
     let preset = textgenerationwebui_presets[textgenerationwebui_preset_names.indexOf(name)];
 
     if (!preset) {
-        await ensureFullSettingsLoaded();
-        preset = textgenerationwebui_presets[textgenerationwebui_preset_names.indexOf(name)];
+        try {
+            preset = await ensureTextGenPresetHydrated(name);
+        } catch (error) {
+            console.error(`Failed to load TextGen preset "${name}"`, error);
+            toastr.error(t`Failed to load preset.`);
+            return;
+        }
+        if (selectionToken !== textGenPresetSelectionToken) {
+            return;
+        }
     }
 
     if (!preset) {
@@ -754,7 +796,7 @@ async function getStatusTextgen() {
         power_user.chat_template_hash = '';
 
         // Determine instruct mode preset
-        const autoSelected = autoSelectInstructPreset(online_status);
+        const autoSelected = await autoSelectInstructPreset(online_status);
 
         const supportsTokenization = response.headers.get('x-supports-tokenization') === 'true';
         supportsTokenization ? sessionStorage.setItem(TOKENIZER_SUPPORTED_KEY, 'true') : sessionStorage.removeItem(TOKENIZER_SUPPORTED_KEY);
@@ -1353,62 +1395,23 @@ export async function generateTextGenWithStreaming(generate_data, signal, { onLu
         },
     });
 
-    const expectedGenerationId = typeof generate_data?.luker_generation?.job_id === 'string'
-        ? generate_data.luker_generation.job_id
-        : '';
-    const generationId = response.headers.get('x-luker-generation-id') || '';
-    const hasMismatchedGenerationIdHeader = Boolean(
-        expectedGenerationId && generationId && generationId !== expectedGenerationId,
-    );
-    let trackedGenerationId = expectedGenerationId || generationId;
-    if (!hasMismatchedGenerationIdHeader && generationId && typeof onLukerMeta === 'function') {
-        onLukerMeta({ generationId });
-    }
-    const persistedHeader = response.headers.get('x-luker-server-persisted');
-    if (!hasMismatchedGenerationIdHeader && (persistedHeader === '0' || persistedHeader === '1') && typeof onLukerMeta === 'function') {
-        onLukerMeta({ persisted: persistedHeader === '1' });
-    }
-    let disposeLukerMeta = null;
-    const cleanupLukerMeta = () => {
-        signal?.removeEventListener?.('abort', cleanupLukerMeta);
-        if (!disposeLukerMeta) return;
-        const dispose = disposeLukerMeta;
-        disposeLukerMeta = null;
-        dispose();
-    };
-    if (!hasMismatchedGenerationIdHeader && typeof onLukerMeta === 'function') {
-        disposeLukerMeta = onLukerResponseMeta(response, (meta) => {
-            const metaGenerationId = typeof meta?.generation_id === 'string' ? meta.generation_id : '';
-            if (metaGenerationId && trackedGenerationId && metaGenerationId !== trackedGenerationId) {
-                return;
-            }
-            if (metaGenerationId && !trackedGenerationId) {
-                trackedGenerationId = metaGenerationId;
-            }
-            if (metaGenerationId) {
-                onLukerMeta({ generationId: metaGenerationId });
-            }
-            if (typeof meta?.persisted === 'boolean') {
-                onLukerMeta({ persisted: meta.persisted });
-            }
-        });
-        if (typeof onLukerMetaDisposer === 'function') {
-            onLukerMetaDisposer(cleanupLukerMeta);
-        }
-    }
+    const { cleanup: cleanupLukerMeta, armAbortCleanup } = attachStreamingResponseMeta({
+        response,
+        expectedGenerationId: typeof generate_data?.luker_generation?.job_id === 'string'
+            ? generate_data.luker_generation.job_id
+            : '',
+        signal,
+        onLukerResponseMeta,
+        onLukerMeta,
+        onLukerMetaDisposer,
+    });
 
     if (!response.ok) {
         cleanupLukerMeta();
         tryParseStreamingError(response, await response.text());
         throw new Error(`Got response status ${response.status}`);
     }
-    if (signal && disposeLukerMeta) {
-        if (signal.aborted) {
-            cleanupLukerMeta();
-        } else {
-            signal.addEventListener('abort', cleanupLukerMeta, { once: true });
-        }
-    }
+    armAbortCleanup();
 
     let reader;
     try {

@@ -5,7 +5,7 @@
 // and advanced schema fields (including primaryKeyColumns and compression tuning).
 // Saving shows a change summary first and offers undo afterwards.
 
-import { h, clear, put } from '../../../../lens-shared/util.js';
+import { h, clear, put, prefersReducedMotion, scrollChildIntoView } from '../../../../lens-shared/util.js';
 import { createBehaviorSummary } from '../../../../lens-shared/behavior-summary.js';
 import { icon } from '../icons.js';
 import { i18n, i18nFormat } from '../i18n.js';
@@ -90,8 +90,11 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
                 recallMethod: String(latest?.values?.recallMethod || 'llm'),
                 ragDefaultPerTypeK: Math.max(0, Math.floor(Number(latest?.values?.ragDefaultPerTypeK) || 0)),
             };
-        } catch {
-            // Keep existing globalSettings if settings read is unavailable.
+        } catch (err) {
+            console.error('[memory-graph/schema] Failed to read global settings:', err);
+            if (typeof app.showToast === 'function') {
+                app.showToast(String(err?.message || err || i18n('Failed to read advanced settings.')), { error: true, duration: 3500 });
+            }
         }
     }
 
@@ -331,7 +334,7 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
         typeSummary.bindScope(editorInner);
         typeSummary.update();
         editor.scrollTop = scroll;
-        if (draft.isNew && !draft.name) requestAnimationFrame(() => nameInput.focus());
+        if (draft.isNew && !draft.name) requestAnimationFrame(() => nameInput.focus({ preventScroll: true }));
     }
 
     function advancedSection(draft) {
@@ -451,7 +454,7 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
                 if (openItems.has(column.uid)) openItems.delete(column.uid);
                 else openItems.add(column.uid);
                 paintEditor();
-                if (openItems.has(column.uid)) requestAnimationFrame(() => editor.querySelector(`[data-uid="${column.uid}"] .ml-schema-itemhint`)?.focus());
+                if (openItems.has(column.uid)) requestAnimationFrame(() => editor.querySelector(`[data-uid="${column.uid}"] .ml-schema-itemhint`)?.focus({ preventScroll: true }));
             },
         },
         h('span', { class: 'ml-schema-ai-mark', title: i18n('Prompt for the AI'), 'aria-label': i18n('Prompt for the AI') }, icon('sparkle', { size: 11 })),
@@ -557,8 +560,8 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
         touched();
         requestAnimationFrame(() => {
             const input = editor.querySelector(`[data-uid="${column.uid}"] .ml-schema-itemname`);
-            input?.focus();
-            input?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            input?.focus({ preventScroll: true });
+            scrollChildIntoView(editor, input, { block: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
         });
     }
 
@@ -578,7 +581,7 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
         draft.columns.splice(next, 0, column);
         paintEditor();
         touched();
-        if (keepFocus) requestAnimationFrame(() => editor.querySelector(`[data-uid="${column.uid}"] .ml-schema-grip`)?.focus());
+        if (keepFocus) requestAnimationFrame(() => editor.querySelector(`[data-uid="${column.uid}"] .ml-schema-grip`)?.focus({ preventScroll: true }));
     }
 
     function startDrag(event, row, draft) {
@@ -783,7 +786,7 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
             if (first) selectedUid = first.uid;
             pane = 'editor';
             paint();
-            requestAnimationFrame(() => editor.querySelector('[aria-invalid="true"]')?.focus());
+            requestAnimationFrame(() => editor.querySelector('[aria-invalid="true"]')?.focus({ preventScroll: true }));
             return;
         }
         const changes = describeChanges(base, drafts, app.model()?.typeCounts || new Map());
@@ -900,7 +903,7 @@ export function createSchemaView(app, source, { onDirtyChange = null } = {}) {
             },
         }, panel);
         app.root.appendChild(modal);
-        requestAnimationFrame(() => (focus || ok).focus());
+        requestAnimationFrame(() => (focus || ok).focus({ preventScroll: true }));
     }
 
     function closeModal() {

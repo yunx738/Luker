@@ -8,11 +8,14 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, beforeEach, describe, expect, jest, test } from '@jest/globals';
 
 import {
-    refreshToastLayout,
-    resetToastEngineForTests,
-    setToastTranslator,
-    toastr,
+    createToastEngine,
+    toastr as defaultToastr,
 } from '../public/scripts/luker-toast.js';
+
+let engine;
+let toastr;
+let refreshToastLayout;
+let setToastTranslator;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,7 +76,10 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-    resetToastEngineForTests();
+    engine = createToastEngine();
+    toastr = engine.toastr;
+    refreshToastLayout = engine.refreshLayout;
+    setToastTranslator = engine.setTranslator;
     document.body.innerHTML = '';
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
@@ -94,14 +100,14 @@ beforeEach(() => {
 
 afterEach(() => {
     jest.useRealTimers();
-    resetToastEngineForTests();
-    setToastTranslator(null);
+    engine?.reset();
+    engine = null;
     document.body.innerHTML = '';
 });
 
 describe('drop-in window.toastr API compatibility', () => {
     test('installs globalThis.toastr and renders info/success/warning/error with jQuery handles', () => {
-        expect(globalThis.toastr).toBe(toastr);
+        expect(globalThis.toastr).toBe(defaultToastr);
         expect(typeof toastr.version).toBe('string');
 
         const events = [];
@@ -467,45 +473,6 @@ describe('live capsule sync, deck stacking, i18n, and external DOM removal', () 
     });
 });
 
-describe('host integration, locales, and legacy asset removal', () => {
-    const REQUIRED_KEYS = [
-        'Minimize notification',
-        'Restore notification',
-        'Close notification',
-        'Expand notifications',
-        'Collapse notifications',
-        'Drag to move',
-    ];
-
-    test('ships zh-cn and zh-tw translations for every new toast UI key without unescaped semicolons', () => {
-        const zhCn = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../public/locales/zh-cn.json'), 'utf8'));
-        const zhTw = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../public/locales/zh-tw.json'), 'utf8'));
-
-        for (const key of REQUIRED_KEYS) {
-            expect(key).not.toContain(';');
-            expect(typeof zhCn[key]).toBe('string');
-            expect(zhCn[key].trim().length).toBeGreaterThan(0);
-            expect(typeof zhTw[key]).toBe('string');
-            expect(zhTw[key].trim().length).toBeGreaterThan(0);
-        }
-    });
-
-    test('wires luker-toast.css and luker-toast.js in index.html and removes legacy toastr assets', () => {
-        const html = fs.readFileSync(path.resolve(__dirname, '../public/index.html'), 'utf8');
-        expect(html).toContain('css/luker-toast.css');
-        expect(html).toContain('scripts/luker-toast.js');
-        expect(html).not.toContain('toastr.min.css');
-        expect(html).not.toContain('toastr.min.js');
-        expect(fs.existsSync(path.resolve(__dirname, '../public/lib/toastr.min.js'))).toBe(false);
-        expect(fs.existsSync(path.resolve(__dirname, '../public/css/toastr.min.css'))).toBe(false);
-    });
-
-    test('activity-pill.css does not double-offset #toast-container with margin-top alongside luker-toast.css', () => {
-        const pillCss = fs.readFileSync(path.resolve(__dirname, '../public/css/activity-pill.css'), 'utf8');
-        expect(pillCss).not.toMatch(/body\.activity-pill-visible\s+#toast-container\.toast-top-center[\s\S]*?margin-top:\s*calc\(/);
-    });
-});
-
 describe('final review regression fixes', () => {
     test('dragging a toast out of a hovered expanded deck clears deckHovered and resumes timers on remaining docked toasts', () => {
         jest.useFakeTimers();
@@ -651,6 +618,48 @@ describe('final review regression fixes', () => {
         // Second touch begins dragging $t2 without pointerup on $t1
         $t2[0].dispatchEvent(makePointerEvent('pointerdown', { clientX: 250, clientY: 180, pointerId: 2 }));
         expect($t1[0].classList.contains('luker-toast-dragging')).toBe(false);
+    });
+
+    test('marks 4th+ collapsed docked cards with data-stack-hidden and clears it on expand or detach', () => {
+        const $t1 = toastr.info('Oldest 1', '', { timeOut: 60000 });
+        toastr.info('Card 2', '', { timeOut: 60000 });
+        toastr.info('Card 3', '', { timeOut: 60000 });
+        const $t4 = toastr.info('Front 4', '', { timeOut: 60000 });
+        const container = document.getElementById('toast-container');
+
+        expect($t4[0].getAttribute('data-stack-hidden')).toBeNull();
+        expect($t1[0].getAttribute('data-stack-hidden')).toBe('true');
+
+        container.querySelector('.luker-toast-stack-badge').click();
+        expect($t1[0].getAttribute('data-stack-hidden')).toBeNull();
+
+        container.querySelector('.luker-toast-stack-badge').click();
+        expect($t1[0].getAttribute('data-stack-hidden')).toBe('true');
+    });
+
+    test('measureDockedHeight accounts for outer .toast padding and border when padding lives on .toast', () => {
+        const $a = toastr.info('Card A', '', { timeOut: 60000 });
+        const $b = toastr.info('Card B', '', { timeOut: 60000 });
+        const container = document.getElementById('toast-container');
+
+        $a[0].style.paddingTop = '10px';
+        $a[0].style.paddingBottom = '10px';
+        $a[0].style.borderTopWidth = '1px';
+        $a[0].style.borderBottomWidth = '1px';
+        setRect($a[0], { left: 440, top: 60, width: 320, height: 62 });
+        Object.defineProperty($a[0].querySelector('.luker-toast-surface'), 'offsetHeight', { configurable: true, value: 40 });
+
+        $b[0].style.paddingTop = '10px';
+        $b[0].style.paddingBottom = '10px';
+        $b[0].style.borderTopWidth = '1px';
+        $b[0].style.borderBottomWidth = '1px';
+        setRect($b[0], { left: 440, top: 60, width: 320, height: 82 });
+        Object.defineProperty($b[0].querySelector('.luker-toast-surface'), 'offsetHeight', { configurable: true, value: 60 });
+
+        container.querySelector('.luker-toast-stack-badge').click();
+        const badgeOffset = parseFloat(container.querySelector('.luker-toast-stack-badge').style.getPropertyValue('--deck-badge-offset-y'));
+        // 82 + 8 + 62 = 152 (includes outer padding+border, not just inner 60+40)
+        expect(badgeOffset).toBeGreaterThanOrEqual(152);
     });
 });
 

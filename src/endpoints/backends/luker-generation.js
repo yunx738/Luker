@@ -17,6 +17,7 @@ import {
     parseProtocolResponse,
     resolveWireProtocol,
 } from '../../../public/scripts/lib/protocol-parser/index.js';
+import { normalizeStreamingToolReplyConfig } from '../../../public/scripts/lib/streaming-tool-reply.js';
 import {
     getRequestTransientSession,
     getTransientSessionForUser,
@@ -94,6 +95,38 @@ function isSseFramedText(text) {
     return /^(?:data:|event:|id:|retry:|:)/.test(trimmed);
 }
 
+export function getJobDisplayText(job) {
+    if (!job || typeof job !== 'object') {
+        return '';
+    }
+    if (job._plainTextMaskActive) {
+        const visible = String(job._plainTextVisibleText || '');
+        if (visible.trim().length > 0) {
+            return visible;
+        }
+        return typeof job._toolCallPreview === 'string' ? job._toolCallPreview : '';
+    }
+    const committed = String(job.text || '');
+    if (committed.trim().length > 0) {
+        return committed;
+    }
+    const hasCompletedToolCalls = Array.isArray(job.parsedTurn?.toolCalls) && job.parsedTurn.toolCalls.length > 0;
+    if (!hasCompletedToolCalls && typeof job._toolCallPreview === 'string' && job._toolCallPreview.length > 0) {
+        return job._toolCallPreview;
+    }
+    return committed;
+}
+
+function updateJobProtocolToolCallPreview(job) {
+    if (!job || !job._streamingToolReply || !job._protocolParser) {
+        return;
+    }
+    job._toolCallPreview = job._protocolParser.getToolCallPreview?.(
+        job._streamingToolReply.name,
+        job._streamingToolReply.argument,
+    ) || '';
+}
+
 function feedJobStreamFrame(job, protocol, rawData, eventName = '') {
     if (!rawData || job.parseError) return;
     if (!job._protocolParser) {
@@ -104,6 +137,7 @@ function feedJobStreamFrame(job, protocol, rawData, eventName = '') {
         if (delta.textDelta) {
             job.text = String(job.text || '') + delta.textDelta;
         }
+        updateJobProtocolToolCallPreview(job);
     } catch (err) {
         if (err instanceof ProtocolParseError) {
             job.parseError = err.toDiagnostic();
@@ -112,6 +146,13 @@ function feedJobStreamFrame(job, protocol, rawData, eventName = '') {
             }
         } else {
             console.error('[LukerGeneration] Unexpected error while parsing stream frame:', err);
+            job.parseError = new ProtocolParseError({
+                protocol,
+                stage: 'unexpected',
+                location: 'stream',
+                message: `Unexpected error while parsing stream frame: ${err?.message || err}`,
+                cause: err,
+            }).toDiagnostic();
         }
     }
 }
@@ -158,10 +199,12 @@ export function finalizeJobProtocolStream(job) {
         try {
             const turn = job._protocolParser.finish();
             applyParsedTurnToJob(job, turn);
+            updateJobProtocolToolCallPreview(job);
         } catch (err) {
             if (err instanceof ProtocolParseError) {
                 if (err.stage === 'eof') {
                     const partial = job._protocolParser.getSnapshot();
+                    updateJobProtocolToolCallPreview(job);
                     if (!isParsedTurnEmpty(partial) || Boolean(job.text)) {
                         console.warn('[LukerGeneration] Stream closed without terminal marker; preserving received content:', err.message);
                         applyParsedTurnToJob(job, partial);
@@ -173,6 +216,13 @@ export function finalizeJobProtocolStream(job) {
                 }
             } else {
                 console.error('[LukerGeneration] Unexpected error while finalizing stream parser:', err);
+                job.parseError = new ProtocolParseError({
+                    protocol,
+                    stage: 'unexpected',
+                    location: 'eof',
+                    message: `Unexpected error while finalizing stream parser: ${err?.message || err}`,
+                    cause: err,
+                }).toDiagnostic();
             }
         }
     }
@@ -184,6 +234,7 @@ export function finalizeJobProtocolStream(job) {
                 const parsed = JSON.parse(remaining);
                 const turn = parseProtocolResponse(protocol, parsed);
                 applyParsedTurnToJob(job, turn);
+                job._parsedRawNonStreamPayload = parsed;
                 job._streamMode = 'json';
             } catch (err) {
                 if (err instanceof ProtocolParseError) {
@@ -220,17 +271,13 @@ export function accumulateChunkTextIntoJob(job, chunkBytes) {
     if (typeof chunkBytes === 'string') {
         text = chunkBytes;
     } else if (chunkBytes instanceof Uint8Array || Buffer.isBuffer(chunkBytes)) {
-        try {
-            if (!job._utf8Decoder) {
-                job._utf8Decoder = new StringDecoder('utf8');
-            }
-            const buf = Buffer.isBuffer(chunkBytes)
-                ? chunkBytes
-                : Buffer.from(chunkBytes.buffer, chunkBytes.byteOffset, chunkBytes.byteLength);
-            text = job._utf8Decoder.write(buf);
-        } catch {
-            return;
+        if (!job._utf8Decoder) {
+            job._utf8Decoder = new StringDecoder('utf8');
         }
+        const buf = Buffer.isBuffer(chunkBytes)
+            ? chunkBytes
+            : Buffer.from(chunkBytes.buffer, chunkBytes.byteOffset, chunkBytes.byteLength);
+        text = job._utf8Decoder.write(buf);
     } else {
         return;
     }
@@ -291,11 +338,22 @@ export function accumulateChunkTextIntoJob(job, chunkBytes) {
                 const parsed = JSON.parse(trimmed);
                 const turn = parseProtocolResponse(protocol, parsed);
                 applyParsedTurnToJob(job, turn);
+                job._parsedRawNonStreamPayload = parsed;
                 job._sseBuffer = '';
                 job._streamMode = 'json';
             } catch (err) {
                 if (err instanceof ProtocolParseError) {
                     job.parseError = err.toDiagnostic();
+                    job._sseBuffer = '';
+                } else if (!(err instanceof SyntaxError)) {
+                    console.error('[LukerGeneration] Unexpected error while parsing non-stream response:', err);
+                    job.parseError = new ProtocolParseError({
+                        protocol,
+                        stage: 'unexpected',
+                        location: 'body',
+                        message: `Unexpected error while parsing response: ${err?.message || err}`,
+                        cause: err,
+                    }).toDiagnostic();
                     job._sseBuffer = '';
                 }
                 // SyntaxError from partial JSON chunk keeps buffering.
@@ -319,10 +377,21 @@ export function accumulateChunkTextIntoJob(job, chunkBytes) {
             const parsed = JSON.parse(trimmed);
             const turn = parseProtocolResponse(protocol, parsed);
             applyParsedTurnToJob(job, turn);
+            job._parsedRawNonStreamPayload = parsed;
             job._sseBuffer = '';
         } catch (err) {
             if (err instanceof ProtocolParseError) {
                 job.parseError = err.toDiagnostic();
+                job._sseBuffer = '';
+            } else if (!(err instanceof SyntaxError)) {
+                console.error('[LukerGeneration] Unexpected error while parsing buffered response:', err);
+                job.parseError = new ProtocolParseError({
+                    protocol,
+                    stage: 'unexpected',
+                    location: 'body',
+                    message: `Unexpected error while parsing response: ${err?.message || err}`,
+                    cause: err,
+                }).toDiagnostic();
                 job._sseBuffer = '';
             }
         }
@@ -388,8 +457,9 @@ export function notifyJobTextProgress(job) {
     if (!job || String(job.status || '') !== 'running') {
         return;
     }
-    const textLen = String(job.text || '').length;
-    if (!textLen || textLen === Number(job._lastNotifiedTextLen || 0)) {
+    const displayText = getJobDisplayText(job);
+    const textLen = displayText.length;
+    if (!textLen || displayText === String(job._lastNotifiedDisplayText || '')) {
         return;
     }
     const now = Date.now();
@@ -401,6 +471,7 @@ export function notifyJobTextProgress(job) {
         }
         job._lastTextNotifyAt = now;
         job._lastNotifiedTextLen = textLen;
+        job._lastNotifiedDisplayText = displayText;
         notifyJobStatus(job);
         return;
     }
@@ -412,12 +483,14 @@ export function notifyJobTextProgress(job) {
         if (String(job.status || '') !== 'running') {
             return;
         }
-        const lenNow = String(job.text || '').length;
-        if (!lenNow || lenNow === Number(job._lastNotifiedTextLen || 0)) {
+        const textNow = getJobDisplayText(job);
+        const lenNow = textNow.length;
+        if (!lenNow || textNow === String(job._lastNotifiedDisplayText || '')) {
             return;
         }
         job._lastTextNotifyAt = Date.now();
         job._lastNotifiedTextLen = lenNow;
+        job._lastNotifiedDisplayText = textNow;
         notifyJobStatus(job);
     }, LUKER_GENERATION_TEXT_PROGRESS_NOTIFY_MS - elapsed);
 }
@@ -511,6 +584,12 @@ export function createGenerationJob(request, options) {
         persistenceInFlight: false,
         requestMeta: null,
         modelName: '',
+        _parsedRawNonStreamPayload: null,
+        _streamingToolReply: null,
+        _toolCallPreview: '',
+        _plainTextMaskActive: false,
+        _plainTextVisibleText: '',
+        _lastNotifiedDisplayText: '',
         ...(session ? { transientSessionId: session.id } : {}),
     };
 
@@ -534,10 +613,16 @@ export function createGenerationJob(request, options) {
         job._streamMode = null;
         job._utf8Decoder = null;
         job._lastNotifiedTextLen = 0;
+        job._lastNotifiedDisplayText = '';
         job._lastTextNotifyAt = 0;
+        job._parsedRawNonStreamPayload = null;
+        job._toolCallPreview = '';
+        job._plainTextMaskActive = false;
+        job._plainTextVisibleText = '';
     }
 
     clearGenerationJobPersistenceTimer(job);
+    job._streamingToolReply = normalizeStreamingToolReplyConfig(options.streaming_tool_reply);
     job.status = 'running';
     job.updatedAt = now;
     job.error = '';
@@ -666,7 +751,7 @@ function notifyJobStatus(job) {
     notifyJobSubscribers(job, {
         type: 'status',
         status: job.status,
-        text: job.text,
+        text: getJobDisplayText(job),
         last_seq: job.lastSeq,
         error: job.error || '',
         finished_at: job.finishedAt || null,
@@ -1101,7 +1186,7 @@ export function getActiveGenerationJobsForRequest(request, persistTarget) {
         .map(job => ({
             id: job.id,
             status: job.status,
-            text: job.text,
+            text: getJobDisplayText(job),
             last_seq: job.lastSeq,
             created_at: job.createdAt,
             updated_at: job.updatedAt,
